@@ -78,8 +78,8 @@ class ListMLELoss(nn.Module):
                 If False, sorts documents by label values. Defaults to True.
 
         References:
-            - Learning to Rank: From Pairwise Approach to Listwise Approach: https://www.microsoft.com/en-us/research/publication/learning-to-rank-from-pairwise-approach-to-listwise-approach/
-            - Position-Aware ListMLE: A Sequential Learning Process for Ranking: https://proceedings.mlr.press/v30/Lan13.html
+            - Listwise approach to learning to rank: theory and algorithm: https://dl.acm.org/doi/abs/10.1145/1390156.1390306
+            - Position-Aware ListMLE: A Sequential Learning Process for Ranking: https://auai.org/uai2014/proceedings/individuals/164.pdf
             - `Cross Encoder > Training Examples > MS MARCO <../../../examples/cross_encoder/training/ms_marco/README.html>`_
 
         Requirements:
@@ -269,11 +269,19 @@ class ListMLELoss(nn.Module):
     @property
     def citation(self) -> str:
         return """
-@inproceedings{lan2013position,
-    title={Position-aware ListMLE: a sequential learning process for ranking},
-    author={Lan, Yanyan and Guo, Jiafeng and Cheng, Xueqi and Liu, Tie-Yan},
-    booktitle={Proceedings of the Twenty-Ninth Conference on Uncertainty in Artificial Intelligence},
-    pages={333--342},
-    year={2013}
+@inproceedings{xia2008listwise,
+  title={Listwise approach to learning to rank: theory and algorithm},
+  author={Xia, Fen and Liu, Tie-Yan and Wang, Jue and Zhang, Wensheng and Li, Hang},
+  booktitle={Proceedings of the 25th international conference on Machine learning},
+  pages={1192--1199},
+  year={2008}
+},
+@inproceedings{lan2014position,
+  title={Position-Aware ListMLE: A Sequential Learning Process for Ranking.},
+  author={Lan, Yanyan and Zhu, Yadong and Guo, Jiafeng and Niu, Shuzi and Cheng, Xueqi},
+  booktitle={UAI},
+  volume={14},
+  pages={449--458},
+  year={2014}
 }
 """
