@@ -32,11 +32,11 @@ class ListMLELambdaWeight(nn.Module):
         Returns:
             Tensor: Weights for each position [batch_size, list_size]
         """
-        if self.rank_discount_fn is None:
-            # Default rank discount: 2^(list_size - rank) - 1
-            return torch.pow(2.0, list_size - ranks) - 1.0
-        else:
+        if self.rank_discount_fn is not None:
             return self.rank_discount_fn(ranks)
+
+        # Default rank discount: 2^(list_size - rank) - 1
+        return torch.pow(2.0, list_size - ranks) - 1.0
 
 
 class ListMLELoss(nn.Module):
