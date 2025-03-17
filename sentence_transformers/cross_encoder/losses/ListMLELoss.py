@@ -218,50 +218,39 @@ class ListMLELoss(nn.Module):
         labels_matrix = torch.full_like(logits_matrix, -float("inf"))
         labels_matrix[batch_indices, doc_indices] = torch.cat(labels, dim=0).float()
         
-        # Compute ListMLE loss
-        per_list_losses = []
-        
-        for i in range(batch_size):
-            valid_mask = mask[i]
-            if not torch.any(valid_mask):
-                continue
-                
-            # Get valid labels and logits for this list
-            list_labels = labels_matrix[i, valid_mask]
-            list_logits = logits_matrix[i, valid_mask]
-            
-            # Get list size for current query
-            curr_list_size = valid_mask.sum()
-            
-            if not self.respect_input_order:
-                # Sort by labels in descending order if not respecting input order. 
-                # If labels are same, they will be sorted in arbitrary order as PyTorch's sort is not stable.
-                _, indices = list_labels.sort(descending=True)
-                # Sort logits according to label order
-                sorted_logits = list_logits[indices]
-            else:
-                # Use the original input order, assuming it's already ordered by relevance
-                sorted_logits = list_logits
-            
-            # Compute log-likelihood using Plackett-Luce model
-            scores = sorted_logits.exp()
-            cumsum_scores = torch.flip(torch.cumsum(torch.flip(scores, [0]), 0), [0])
-            log_probs = sorted_logits - torch.log(cumsum_scores + self.eps)
-            
-            # Apply position-aware lambda weights if specified
-            if self.lambda_weight is not None:
-                ranks = torch.arange(1, curr_list_size + 1, device=self.model.device)
-                position_weights = self.lambda_weight(ranks, curr_list_size)
-                log_probs = log_probs * position_weights
-            
-            # Sum the log probabilities
-            per_list_losses.append(torch.sum(-log_probs))
-        
-        if not per_list_losses:
+        if not torch.any(mask):
+            return torch.tensor(0.0, device=self.model.device, requires_grad=True)
+
+        if not self.respect_input_order:
+            # Sort by labels in descending order if not respecting input order.
+            sorted_labels, indices = labels_matrix.sort(descending=True, dim=1)
+            sorted_logits = torch.gather(logits_matrix, 1, indices)
+        else:
+            # Use the original input order, assuming it's already ordered by relevance
+            sorted_logits = logits_matrix
+
+        # Compute log-likelihood using Plackett-Luce model
+        scores = sorted_logits.exp()
+        cumsum_scores = torch.flip(torch.cumsum(torch.flip(scores, [1]), 1), [1])
+        log_probs = sorted_logits - torch.log(cumsum_scores + self.eps)
+
+        # Apply position-aware lambda weights if specified
+        if self.lambda_weight is not None:
+            position_weights = torch.zeros_like(log_probs)
+            for i, query_mask in enumerate(mask):
+                list_size = query_mask.sum()
+                ranks = torch.arange(1, list_size + 1, device=self.model.device)
+                position_weights[i, :list_size] = self.lambda_weight(ranks, list_size)
+            log_probs = log_probs * position_weights
+
+        # Sum the log probabilities for each list and mask invalid entries
+        per_query_losses = -torch.sum(log_probs, dim=1)
+
+        if not torch.any(per_query_losses):
             return torch.tensor(0.0, device=self.model.device, requires_grad=True)
             
         # Average loss over all lists
-        return torch.mean(torch.stack(per_list_losses))
+        return torch.mean(per_query_losses)
 
     def get_config_dict(self) -> dict[str, float | int | str | None]:
         """
