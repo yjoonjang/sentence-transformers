@@ -12,6 +12,8 @@ from .LambdaLoss import (
     NoWeightingScheme,
 )
 from .ListNetLoss import ListNetLoss
+from .ListMLELoss import ListMLELoss
+from .ListMLELoss import ListMLELambdaWeight
 from .MarginMSELoss import MarginMSELoss
 from .MSELoss import MSELoss
 from .MultipleNegativesRankingLoss import MultipleNegativesRankingLoss
@@ -24,6 +26,8 @@ __all__ = [
     "MarginMSELoss",
     "MSELoss",
     "ListNetLoss",
+    "ListMLELoss",
+    "ListMLELambdaWeight",
     "LambdaLoss",
     "NoWeightingScheme",
     "NDCGLoss1Scheme",
