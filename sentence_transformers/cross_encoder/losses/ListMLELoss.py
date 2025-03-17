@@ -271,7 +271,7 @@ class ListMLELoss(nn.Module):
             Dictionary containing the configuration parameters
         """
         return {
-            "lambda_weight": None if self.lambda_weight is None else "ListMLELambdaWeight",
+            "lambda_weight": None if self.lambda_weight is None else fullname(self.lambda_weight),
             "activation_fct": fullname(self.activation_fct),
             "mini_batch_size": self.mini_batch_size,
             "respect_input_order": self.respect_input_order,
