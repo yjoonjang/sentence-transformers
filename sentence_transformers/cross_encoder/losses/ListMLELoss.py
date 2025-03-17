@@ -288,26 +288,3 @@ class ListMLELoss(nn.Module):
     year={2013}
 }
 """
-
-
-def create_p_list_mle_lambda_weight(list_size=None):
-    """
-    Creates a ListMLELambdaWeight with the formulation from Position-Aware ListMLE paper.
-    
-    This implements the weighting scheme from the "Position-Aware ListMLE" paper (Lan et al.).
-    The weight for each position is 2^(list_size - rank) - 1, giving higher weight to higher positions.
-    
-    Args:
-        list_size (int, optional): Size of the input list. If None, dynamically determined at runtime.
-        
-    Returns:
-        A ListMLELambdaWeight for Position-Aware ListMLE.
-    """
-    def rank_discount_fn(ranks):
-        if list_size is None:
-            curr_list_size = len(ranks)
-        else:
-            curr_list_size = list_size
-        return torch.pow(2., curr_list_size - ranks) - 1.
-        
-    return ListMLELambdaWeight(rank_discount_fn=rank_discount_fn)
