@@ -211,7 +211,7 @@ class ListMLELoss(nn.Module):
         logits_matrix[batch_indices, doc_indices] = logits
 
         # Create a mask for valid entries
-        mask = torch.zeros((batch_size, max_docs), dtype=torch.bool, device=self.model.device)
+        mask = torch.zeros_like(logits_matrix, dtype=torch.bool)
         mask[batch_indices, doc_indices] = True
 
         # Convert labels to tensor matrix
