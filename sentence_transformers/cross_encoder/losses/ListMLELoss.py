@@ -46,7 +46,7 @@ class ListMLELoss(nn.Module):
         lambda_weight: ListMLELambdaWeight | None = None,
         activation_fct: nn.Module | None = nn.Identity(),
         mini_batch_size: int | None = None,
-        shuffle_ties: bool = True,
+        respect_input_order: bool = True,
     ) -> None:
         """
         ListMLE loss for learning to rank with position-aware weighting. This loss function implements 
@@ -73,8 +73,9 @@ class ListMLELoss(nn.Module):
                 - If ``mini_batch_size`` is <= 0, the entire batch is processed at once.
 
                 Defaults to None.
-            shuffle_ties (bool): Whether to randomly shuffle items with the same relevance scores
-                when sorting. This can help with convergence during training. Defaults to True.
+            respect_input_order (bool): Whether to respect the original input order of documents.
+                If True, assumes the input documents are already ordered by relevance (most relevant first).
+                If False, sorts documents by label values. Defaults to True.
 
         References:
             - Learning to Rank: From Pairwise Approach to Listwise Approach: https://www.microsoft.com/en-us/research/publication/learning-to-rank-from-pairwise-approach-to-listwise-approach/
@@ -108,7 +109,7 @@ class ListMLELoss(nn.Module):
                     "labels": [[1, 0], [1, 1, 0]],
                 })
                 
-                # Standard ListMLE loss
+                # Standard ListMLE loss respecting input order
                 loss = losses.ListMLELoss(model)
                 
                 # Position-Aware ListMLE with default weighting
@@ -116,7 +117,7 @@ class ListMLELoss(nn.Module):
                 loss = losses.ListMLELoss(model, lambda_weight=lambda_weight)
                 
                 # Position-Aware ListMLE with custom weighting function
-                def custom_discount(ranks):
+                def custom_discount(ranks): # e.g. ranks: [1, 2, 3, 4, 5]
                     return 1.0 / torch.log1p(ranks)
                 lambda_weight = losses.ListMLELambdaWeight(rank_discount_fn=custom_discount)
                 loss = losses.ListMLELoss(model, lambda_weight=lambda_weight)
@@ -133,7 +134,7 @@ class ListMLELoss(nn.Module):
         self.lambda_weight = lambda_weight
         self.activation_fct = activation_fct or nn.Identity()
         self.mini_batch_size = mini_batch_size
-        self.shuffle_ties = shuffle_ties
+        self.respect_input_order = respect_input_order
         self.eps = 1e-10
 
         if self.model.num_labels != 1:
@@ -232,16 +233,15 @@ class ListMLELoss(nn.Module):
             # Get list size for current query
             curr_list_size = valid_mask.sum()
             
-            # Sort by labels in descending order
-            if self.shuffle_ties:
-                # Add small random noise to break ties randomly
-                random_noise = torch.rand_like(list_labels) * 1e-6
-                _, indices = (list_labels + random_noise).sort(descending=True)
-            else:
+            if not self.respect_input_order:
+                # Sort by labels in descending order if not respecting input order. 
+                # If labels are same, they will be sorted in arbitrary order as PyTorch's sort is not stable.
                 _, indices = list_labels.sort(descending=True)
-            
-            # Sort logits according to label order
-            sorted_logits = list_logits[indices]
+                # Sort logits according to label order
+                sorted_logits = list_logits[indices]
+            else:
+                # Use the original input order, assuming it's already ordered by relevance
+                sorted_logits = list_logits
             
             # Compute log-likelihood using Plackett-Luce model
             scores = sorted_logits.exp()
@@ -274,20 +274,12 @@ class ListMLELoss(nn.Module):
             "lambda_weight": None if self.lambda_weight is None else "ListMLELambdaWeight",
             "activation_fct": fullname(self.activation_fct),
             "mini_batch_size": self.mini_batch_size,
-            "shuffle_ties": self.shuffle_ties,
+            "respect_input_order": self.respect_input_order,
         }
 
     @property
     def citation(self) -> str:
         return """
-@inproceedings{cao2007learning,
-    title={Learning to rank: from pairwise approach to listwise approach},
-    author={Cao, Zhe and Qin, Tao and Liu, Tie-Yan and Tsai, Ming-Feng and Li, Hang},
-    booktitle={Proceedings of the 24th international conference on Machine learning},
-    pages={129--136},
-    year={2007}
-}
-
 @inproceedings{lan2013position,
     title={Position-aware ListMLE: a sequential learning process for ranking},
     author={Lan, Yanyan and Guo, Jiafeng and Cheng, Xueqi and Liu, Tie-Yan},
