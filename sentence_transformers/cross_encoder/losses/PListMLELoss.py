@@ -16,27 +16,30 @@ class PListMLELambdaWeight(nn.Module):
 
         Args:
             rank_discount_fn: Function that computes a discount for each rank position.
-                              If None, uses default discount of 2^(list_size - rank) - 1.
+                              If None, uses default discount of 2^(num_docs - rank) - 1.
         """
         super().__init__()
         self.rank_discount_fn = rank_discount_fn
 
-    def forward(self, ranks: Tensor, list_size: int) -> Tensor:
+    def forward(self, mask: Tensor) -> Tensor:
         """
         Calculate position-aware weights for the PListMLE loss.
 
         Args:
-            ranks: A tensor of rank positions [batch_size, list_size]
-            list_size: Size of the list
+            mask: A boolean mask indicating valid positions [batch_size, num_docs]
 
         Returns:
-            Tensor: Weights for each position [batch_size, list_size]
+            Tensor: Weights for each position [batch_size, num_docs]
         """
         if self.rank_discount_fn is not None:
-            return self.rank_discount_fn(ranks)
+            return self.rank_discount_fn(mask)
 
-        # Default rank discount: 2^(list_size - rank) - 1
-        return torch.pow(2.0, list_size - ranks) - 1.0
+        # Apply default rank discount: 2^(num_docs - rank) - 1
+        num_docs_per_query = mask.sum(dim=1, keepdim=True)
+        ranks = torch.arange(1, mask.size(1) + 1, device=mask.device).expand_as(mask)
+        weights = torch.pow(2.0, num_docs_per_query - ranks) - 1.0
+        weights = weights * mask
+        return weights
 
 
 class PListMLELoss(nn.Module):
@@ -53,6 +56,8 @@ class PListMLELoss(nn.Module):
         the ListMLE ranking algorithm which uses a list-wise approach based on maximum likelihood
         estimation of permutations. It maximizes the likelihood of the permutation induced by the
         ground truth labels with position-aware weighting.
+
+        This loss is also known as Position-Aware ListMLE or p-ListMLE.
 
         .. note::
 
@@ -243,14 +248,10 @@ class PListMLELoss(nn.Module):
         cumsum_scores = torch.flip(torch.cumsum(torch.flip(scores, [1]), 1), [1])
         log_probs = sorted_logits - torch.log(cumsum_scores + self.eps)
 
-        # Apply position-aware lambda weights if specified
+        # Apply position-aware lambda weights if specified. If None, then this loss
+        # is just ListMLE.
         if self.lambda_weight is not None:
-            position_weights = torch.zeros_like(log_probs)
-            for i, query_mask in enumerate(mask):
-                list_size = query_mask.sum()
-                ranks = torch.arange(1, list_size + 1, device=self.model.device)
-                position_weights[i, :list_size] = self.lambda_weight(ranks, list_size)
-            log_probs = log_probs * position_weights
+            log_probs = log_probs * self.lambda_weight(mask)
 
         # Sum the log probabilities for each list and mask padded entries
         log_probs[~mask] = 0.0
