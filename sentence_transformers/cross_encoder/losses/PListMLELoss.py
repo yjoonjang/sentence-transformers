@@ -240,7 +240,8 @@ class PListMLELoss(nn.Module):
                 position_weights[i, :list_size] = self.lambda_weight(ranks, list_size)
             log_probs = log_probs * position_weights
 
-        # Sum the log probabilities for each list and mask invalid entries
+        # Sum the log probabilities for each list and mask padded entries
+        log_probs[~mask] = 0.0
         per_query_losses = -torch.sum(log_probs, dim=1)
 
         if not torch.any(per_query_losses):
