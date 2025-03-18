@@ -2,7 +2,6 @@ import logging
 import traceback
 
 from datasets import load_dataset
-import torch
 
 from sentence_transformers.cross_encoder import CrossEncoder
 from sentence_transformers.cross_encoder.evaluation import CrossEncoderNanoBEIREvaluator

@@ -11,9 +11,8 @@ from .LambdaLoss import (
     NDCGLoss2Scheme,
     NoWeightingScheme,
 )
+from .ListMLELoss import ListMLELambdaWeight, ListMLELoss
 from .ListNetLoss import ListNetLoss
-from .ListMLELoss import ListMLELoss
-from .ListMLELoss import ListMLELambdaWeight
 from .MarginMSELoss import MarginMSELoss
 from .MSELoss import MSELoss
 from .MultipleNegativesRankingLoss import MultipleNegativesRankingLoss

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import torch
 from torch import nn
+
 from sentence_transformers.cross_encoder import CrossEncoder
 from sentence_transformers.cross_encoder.losses.PListMLELoss import PListMLELoss
 
@@ -16,9 +16,9 @@ class ListMLELoss(PListMLELoss):
         respect_input_order: bool = True,
     ) -> None:
         """
-        ListMLE loss for learning to rank with position-aware weighting. This loss function implements 
-        the ListMLE ranking algorithm which uses a list-wise approach based on maximum likelihood 
-        estimation of permutations. It maximizes the likelihood of the permutation induced by the 
+        ListMLE loss for learning to rank with position-aware weighting. This loss function implements
+        the ListMLE ranking algorithm which uses a list-wise approach based on maximum likelihood
+        estimation of permutations. It maximizes the likelihood of the permutation induced by the
         ground truth labels with optional position-aware weighting.
 
         .. note::
@@ -28,7 +28,7 @@ class ListMLELoss(PListMLELoss):
         Args:
             model (CrossEncoder): CrossEncoder model to be trained
             lambda_weight (ListMLELambdaWeight, optional): Weighting scheme to use. When specified,
-                implements Position-Aware ListMLE which applies different weights to different rank 
+                implements Position-Aware ListMLE which applies different weights to different rank
                 positions. Default is None (standard ListMLE).
             activation_fct (:class:`~torch.nn.Module`): Activation function applied to the logits before computing the
                 loss. Defaults to :class:`~torch.nn.Identity`.
@@ -75,7 +75,7 @@ class ListMLELoss(PListMLELoss):
                     ],
                     "labels": [[1, 0], [1, 1, 0]],
                 })
-                
+
                 # Standard ListMLE loss respecting input order
                 loss = losses.ListMLELoss(model)
 

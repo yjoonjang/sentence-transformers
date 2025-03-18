@@ -49,9 +49,9 @@ class PListMLELoss(nn.Module):
         respect_input_order: bool = True,
     ) -> None:
         """
-        PListMLE loss for learning to rank with position-aware weighting. This loss function implements 
-        the PListMLE ranking algorithm which uses a list-wise approach based on maximum likelihood 
-        estimation of permutations. It maximizes the likelihood of the permutation induced by the 
+        PListMLE loss for learning to rank with position-aware weighting. This loss function implements
+        the PListMLE ranking algorithm which uses a list-wise approach based on maximum likelihood
+        estimation of permutations. It maximizes the likelihood of the permutation induced by the
         ground truth labels with optional position-aware weighting.
 
         .. note::
@@ -61,7 +61,7 @@ class PListMLELoss(nn.Module):
         Args:
             model (CrossEncoder): CrossEncoder model to be trained
             lambda_weight (PListMLELambdaWeight, optional): Weighting scheme to use. When specified,
-                implements Position-Aware ListMLE which applies different weights to different rank 
+                implements Position-Aware ListMLE which applies different weights to different rank
                 positions. Default is None (standard PListMLE).
             activation_fct (:class:`~torch.nn.Module`): Activation function applied to the logits before computing the
                 loss. Defaults to :class:`~torch.nn.Identity`.
@@ -108,11 +108,11 @@ class PListMLELoss(nn.Module):
                     ],
                     "labels": [[1, 0], [1, 1, 0]],
                 })
-                
+
                 # Position-Aware ListMLE with default weighting
                 lambda_weight = losses.PListMLELambdaWeight()
                 loss = losses.PListMLELoss(model, lambda_weight=lambda_weight)
-                
+
                 # Position-Aware ListMLE with custom weighting function
                 def custom_discount(ranks): # e.g. ranks: [1, 2, 3, 4, 5]
                     return 1.0 / torch.log1p(ranks)
@@ -214,7 +214,7 @@ class PListMLELoss(nn.Module):
         # Convert labels to tensor matrix
         labels_matrix = torch.full_like(logits_matrix, -float("inf"))
         labels_matrix[batch_indices, doc_indices] = torch.cat(labels, dim=0).float()
-        
+
         if not torch.any(mask):
             return torch.tensor(0.0, device=self.model.device, requires_grad=True)
 
@@ -245,7 +245,7 @@ class PListMLELoss(nn.Module):
 
         if not torch.any(per_query_losses):
             return torch.tensor(0.0, device=self.model.device, requires_grad=True)
-            
+
         # Average loss over all lists
         return torch.mean(per_query_losses)
 

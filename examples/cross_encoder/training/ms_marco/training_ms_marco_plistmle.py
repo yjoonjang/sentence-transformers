@@ -2,7 +2,6 @@ import logging
 import traceback
 
 from datasets import load_dataset
-import torch
 
 from sentence_transformers.cross_encoder import CrossEncoder
 from sentence_transformers.cross_encoder.evaluation import CrossEncoderNanoBEIREvaluator
@@ -89,20 +88,20 @@ def main():
     logging.info(train_dataset)
 
     # 3. Define our training loss
-    
+
     # Option 1: Position-Aware ListMLE with default weighting
     loss = PListMLELoss(model, mini_batch_size=mini_batch_size, respect_input_order=respect_input_order)
-    
+
     # Option 2: Position-Aware ListMLE with custom weighting function (NDCG-like)
     # def custom_discount(ranks):
     #     return 1.0 / torch.log1p(ranks)
-    
+
     # from sentence_transformers.cross_encoder.losses import PListMLELambdaWeight
     # lambda_weight = PListMLELambdaWeight(rank_discount_fn=custom_discount)
     # loss = PListMLELoss(
-    #     model, 
-    #     lambda_weight=lambda_weight, 
-    #     mini_batch_size=mini_batch_size, 
+    #     model,
+    #     lambda_weight=lambda_weight,
+    #     mini_batch_size=mini_batch_size,
     #     respect_input_order=respect_input_order
     # )
 
