@@ -50,9 +50,9 @@ class PListMLELoss(nn.Module):
     ) -> None:
         """
         PListMLE loss for learning to rank with position-aware weighting. This loss function implements
-        the PListMLE ranking algorithm which uses a list-wise approach based on maximum likelihood
+        the ListMLE ranking algorithm which uses a list-wise approach based on maximum likelihood
         estimation of permutations. It maximizes the likelihood of the permutation induced by the
-        ground truth labels with optional position-aware weighting.
+        ground truth labels with position-aware weighting.
 
         .. note::
 
@@ -93,6 +93,18 @@ class PListMLELoss(nn.Module):
             | (query, [doc1, doc2, ..., docN])       | [score1, score2, ..., scoreN]  | 1                             |
             +----------------------------------------+--------------------------------+-------------------------------+
 
+        Recommendations:
+            - Use :class:`~sentence_transformers.util.mine_hard_negatives` with ``output_format="labeled-list"``
+              to convert question-answer pairs to the required input format with hard negatives.
+
+        Relations:
+            - The :class:`~sentence_transformers.cross_encoder.losses.PListMLELoss` is an extension of the
+              :class:`~sentence_transformers.cross_encoder.losses.ListMLELoss` and allows for positional weighting
+              of the loss. :class:`~sentence_transformers.cross_encoder.losses.PListMLELoss` generally outperforms
+              :class:`~sentence_transformers.cross_encoder.losses.ListMLELoss` and is recommended over it.
+            - :class:`~sentence_transformers.cross_encoder.losses.LambdaLoss` takes the same inputs, and generally
+              outperforms this loss.
+
         Example:
             ::
 
@@ -109,11 +121,11 @@ class PListMLELoss(nn.Module):
                     "labels": [[1, 0], [1, 1, 0]],
                 })
 
-                # Position-Aware ListMLE with default weighting
+                # Either: Position-Aware ListMLE with default weighting
                 lambda_weight = losses.PListMLELambdaWeight()
                 loss = losses.PListMLELoss(model, lambda_weight=lambda_weight)
 
-                # Position-Aware ListMLE with custom weighting function
+                # or: Position-Aware ListMLE with custom weighting function
                 def custom_discount(ranks): # e.g. ranks: [1, 2, 3, 4, 5]
                     return 1.0 / torch.log1p(ranks)
                 lambda_weight = losses.PListMLELambdaWeight(rank_discount_fn=custom_discount)

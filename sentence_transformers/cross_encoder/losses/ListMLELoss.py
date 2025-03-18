@@ -15,10 +15,9 @@ class ListMLELoss(PListMLELoss):
         respect_input_order: bool = True,
     ) -> None:
         """
-        ListMLE loss for learning to rank with position-aware weighting. This loss function implements
-        the ListMLE ranking algorithm which uses a list-wise approach based on maximum likelihood
-        estimation of permutations. It maximizes the likelihood of the permutation induced by the
-        ground truth labels with optional position-aware weighting.
+        This loss function implements the ListMLE learnin to rank algorithm, which uses a list-wise
+        approach based on maximum likelihood estimation of permutations. It maximizes the likelihood
+        of the permutation induced by the ground truth labels.
 
         .. note::
 
@@ -26,9 +25,6 @@ class ListMLELoss(PListMLELoss):
 
         Args:
             model (CrossEncoder): CrossEncoder model to be trained
-            lambda_weight (ListMLELambdaWeight, optional): Weighting scheme to use. When specified,
-                implements Position-Aware ListMLE which applies different weights to different rank
-                positions. Default is None (standard ListMLE).
             activation_fct (:class:`~torch.nn.Module`): Activation function applied to the logits before computing the
                 loss. Defaults to :class:`~torch.nn.Identity`.
             mini_batch_size (int, optional): Number of samples to process in each forward pass. This has a significant
@@ -58,6 +54,18 @@ class ListMLELoss(PListMLELoss):
             +========================================+================================+===============================+
             | (query, [doc1, doc2, ..., docN])       | [score1, score2, ..., scoreN]  | 1                             |
             +----------------------------------------+--------------------------------+-------------------------------+
+
+        Recommendations:
+            - Use :class:`~sentence_transformers.util.mine_hard_negatives` with ``output_format="labeled-list"``
+              to convert question-answer pairs to the required input format with hard negatives.
+
+        Relations:
+            - The :class:`~sentence_transformers.cross_encoder.losses.PListMLELoss` is an extension of the
+              :class:`~sentence_transformers.cross_encoder.losses.ListMLELoss` and allows for positional weighting
+              of the loss. :class:`~sentence_transformers.cross_encoder.losses.PListMLELoss` generally outperforms
+              :class:`~sentence_transformers.cross_encoder.losses.ListMLELoss` and is recommended over it.
+            - :class:`~sentence_transformers.cross_encoder.losses.LambdaLoss` takes the same inputs, and generally
+              outperforms this loss.
 
         Example:
             ::
@@ -92,3 +100,16 @@ class ListMLELoss(PListMLELoss):
             mini_batch_size=mini_batch_size,
             respect_input_order=respect_input_order,
         )
+
+    @property
+    def citation(self) -> str:
+        return """
+@inproceedings{10.1145/1390156.1390306,
+    title = {Listwise approach to learning to rank: theory and algorithm},
+    author = {Xia, Fen and Liu, Tie-Yan and Wang, Jue and Zhang, Wensheng and Li, Hang},
+    booktitle = {Proceedings of the 25th International Conference on Machine Learning},
+    pages = {1192–1199},
+    year = {2008},
+    url = {https://doi.org/10.1145/1390156.1390306},
+}
+"""
