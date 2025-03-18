@@ -46,12 +46,12 @@ class ListMLELoss(PListMLELoss):
 
         References:
             - Listwise approach to learning to rank: theory and algorithm: https://dl.acm.org/doi/abs/10.1145/1390156.1390306
-            - Position-Aware ListMLE: A Sequential Learning Process for Ranking: https://auai.org/uai2014/proceedings/individuals/164.pdf
             - `Cross Encoder > Training Examples > MS MARCO <../../../examples/cross_encoder/training/ms_marco/README.html>`_
 
         Requirements:
             1. Query with multiple documents (listwise approach)
             2. Documents must have relevance scores/labels. Both binary and continuous labels are supported.
+            3. Documents must be sorted in a defined rank order.
 
         Inputs:
             +----------------------------------------+--------------------------------+-------------------------------+
