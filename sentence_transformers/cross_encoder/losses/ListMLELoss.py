@@ -10,7 +10,6 @@ class ListMLELoss(PListMLELoss):
     def __init__(
         self,
         model: CrossEncoder,
-        lambda_weight: None = None,
         activation_fct: nn.Module | None = nn.Identity(),
         mini_batch_size: int | None = None,
         respect_input_order: bool = True,
@@ -88,7 +87,7 @@ class ListMLELoss(PListMLELoss):
         """
         super().__init__(
             model=model,
-            lambda_weight=lambda_weight,
+            lambda_weight=None,
             activation_fct=activation_fct,
             mini_batch_size=mini_batch_size,
             respect_input_order=respect_input_order,
