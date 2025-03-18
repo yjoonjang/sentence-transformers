@@ -6,7 +6,7 @@ import torch
 
 from sentence_transformers.cross_encoder import CrossEncoder
 from sentence_transformers.cross_encoder.evaluation import CrossEncoderNanoBEIREvaluator
-from sentence_transformers.cross_encoder.losses import ListMLELoss
+from sentence_transformers.cross_encoder.losses import PListMLELoss
 from sentence_transformers.cross_encoder.trainer import CrossEncoderTrainer
 from sentence_transformers.cross_encoder.training_args import CrossEncoderTrainingArguments
 
@@ -89,7 +89,22 @@ def main():
     logging.info(train_dataset)
 
     # 3. Define our training loss
-    loss = ListMLELoss(model, mini_batch_size=mini_batch_size, respect_input_order=respect_input_order)
+    
+    # Option 1: Position-Aware ListMLE with default weighting
+    loss = PListMLELoss(model, mini_batch_size=mini_batch_size, respect_input_order=respect_input_order)
+    
+    # Option 2: Position-Aware ListMLE with custom weighting function (NDCG-like)
+    # def custom_discount(ranks):
+    #     return 1.0 / torch.log1p(ranks)
+    
+    # from sentence_transformers.cross_encoder.losses import PListMLELambdaWeight
+    # lambda_weight = PListMLELambdaWeight(rank_discount_fn=custom_discount)
+    # loss = PListMLELoss(
+    #     model, 
+    #     lambda_weight=lambda_weight, 
+    #     mini_batch_size=mini_batch_size, 
+    #     respect_input_order=respect_input_order
+    # )
 
     # 4. Define the evaluator. We use the CENanoBEIREvaluator, which is a light-weight evaluator for English reranking
     evaluator = CrossEncoderNanoBEIREvaluator(dataset_names=["msmarco", "nfcorpus", "nq"], batch_size=eval_batch_size)
@@ -97,7 +112,7 @@ def main():
 
     # 5. Define the training arguments
     short_model_name = model_name if "/" not in model_name else model_name.split("/")[-1]
-    run_name = f"reranker-msmarco-v1.1-{short_model_name}-listmle"
+    run_name = f"reranker-msmarco-v1.1-{short_model_name}-plistmle"
     args = CrossEncoderTrainingArguments(
         # Required parameter:
         output_dir=f"models/{run_name}",
