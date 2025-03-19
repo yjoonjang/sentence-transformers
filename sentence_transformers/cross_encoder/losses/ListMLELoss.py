@@ -101,6 +101,17 @@ class ListMLELoss(PListMLELoss):
             respect_input_order=respect_input_order,
         )
 
+    def get_config_dict(self) -> dict[str, float | int | str | None]:
+        """
+        Get configuration parameters for this loss function.
+
+        Returns:
+            Dictionary containing the configuration parameters
+        """
+        config = super().get_config_dict()
+        del config["lambda_weight"]
+        return config
+
     @property
     def citation(self) -> str:
         return """
