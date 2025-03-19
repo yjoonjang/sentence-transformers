@@ -37,7 +37,7 @@ class PListMLELambdaWeight(nn.Module):
         # Apply default rank discount: 2^(num_docs - rank) - 1
         num_docs_per_query = mask.sum(dim=1, keepdim=True)
         ranks = torch.arange(1, mask.size(1) + 1, device=mask.device).expand_as(mask)
-        weights = torch.pow(2.0, num_docs_per_query - ranks) - 1.0
+        weights = torch.pow(2.0, num_docs_per_query - ranks + 1) - 1.0
         weights = weights * mask
         return weights
 
@@ -251,7 +251,10 @@ class PListMLELoss(nn.Module):
         # Apply position-aware lambda weights if specified. If None, then this loss
         # is just ListMLE.
         if self.lambda_weight is not None:
-            log_probs = log_probs * self.lambda_weight(mask)
+            lambda_weight = self.lambda_weight(mask)
+            # Normalize weights to sum to 1
+            lambda_weight = lambda_weight / (lambda_weight.sum(dim=1, keepdim=True) + self.eps)
+            log_probs = log_probs * lambda_weight
 
         # Sum the log probabilities for each list and mask padded entries
         log_probs[~mask] = 0.0
