@@ -36,8 +36,8 @@ class PListMLELambdaWeight(nn.Module):
 
         # Apply default rank discount: 2^(num_docs - rank) - 1
         num_docs_per_query = mask.sum(dim=1, keepdim=True)
-        ranks = torch.arange(1, mask.size(1) + 1, device=mask.device).expand_as(mask)
-        weights = torch.pow(2.0, num_docs_per_query - ranks + 1) - 1.0
+        ranks = torch.arange(mask.size(1), device=mask.device).expand_as(mask)
+        weights = torch.pow(2.0, num_docs_per_query - ranks) - 1.0
         weights = weights * mask
         return weights
 
