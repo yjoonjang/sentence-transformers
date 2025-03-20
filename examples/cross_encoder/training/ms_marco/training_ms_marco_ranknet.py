@@ -31,6 +31,7 @@ def main():
     num_epochs = 1
     max_docs = None
 
+    dt = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
     # 1. Define our CrossEncoder model
     model = CrossEncoder(model_name, num_labels=1)
@@ -105,7 +106,7 @@ def main():
     run_name = f"reranker-msmarco-v1.1-{short_model_name}-ranknetloss"
     args = CrossEncoderTrainingArguments(
         # Required parameter:
-        output_dir=f"models/{run_name}",
+        output_dir=f"models/{run_name}_{dt}",
         # Optional training parameters:
         num_train_epochs=num_epochs,
         per_device_train_batch_size=train_batch_size,
@@ -144,7 +145,7 @@ def main():
     evaluator(model)
 
     # 8. Save the final model
-    final_output_dir = f"models/{run_name}/final"
+    final_output_dir = f"models/{run_name}_{dt}/final"
     model.save_pretrained(final_output_dir)
 
     # 9. (Optional) save the model to the Hugging Face Hub!
