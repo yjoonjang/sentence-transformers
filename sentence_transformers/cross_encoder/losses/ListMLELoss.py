@@ -116,10 +116,10 @@ class ListMLELoss(PListMLELoss):
     def citation(self) -> str:
         return """
 @inproceedings{10.1145/1390156.1390306,
-    title = {Listwise approach to learning to rank: theory and algorithm},
+    title = {Listwise Approach to Learning to Rank - Theory and Algorithm},
     author = {Xia, Fen and Liu, Tie-Yan and Wang, Jue and Zhang, Wensheng and Li, Hang},
     booktitle = {Proceedings of the 25th International Conference on Machine Learning},
-    pages = {1192–1199},
+    pages = {1192-1199},
     year = {2008},
     url = {https://doi.org/10.1145/1390156.1390306},
 }

@@ -102,7 +102,7 @@ class RankNetLoss(LambdaLoss):
     def citation(self) -> str:
         return """
 @inproceedings{burges2005learning,
-  title={Learning to rank using gradient descent},
+  title={Learning to Rank using Gradient Descent},
   author={Burges, Chris and Shaked, Tal and Renshaw, Erin and Lazier, Ari and Deeds, Matt and Hamilton, Nicole and Hullender, Greg},
   booktitle={Proceedings of the 22nd international conference on Machine learning},
   pages={89--96},
