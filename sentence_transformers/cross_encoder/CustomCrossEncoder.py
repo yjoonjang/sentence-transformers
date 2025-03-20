@@ -68,7 +68,7 @@ class CustomCrossEncoder:
         convert_to_numpy: bool = True,
         apply_softmax: bool = True,
         normalize_scores: bool = True,
-        return_class_id: bool = True,  # 클래스 ID 반환 여부
+        return_class_id: bool = False,  # 클래스 ID 반환 여부
     ):
         """
         주어진 문장 쌍에 대한 점수를 예측합니다.
@@ -110,43 +110,33 @@ class CustomCrossEncoder:
                 return_tensors="pt"
             )
             
-            # 모델에 입력 전달
             features = {k: v.to(self.device) for k, v in features.items()}
             
             with torch.no_grad():
                 outputs = self.model(**features, return_dict=True)
                 logits = outputs.logits
                 
-                # num_labels에 따라 다르게 처리
                 if self.num_labels == 1:
-                    # 회귀 모델: 단일 점수
                     scores = logits.squeeze(-1)
                     if return_class_id:
-                        # 회귀 모델에서는 0.5를 기준으로 이진 분류
                         class_ids = (scores > 0.5).long()
                 else:
-                    # 분류 모델: 여러 클래스에 대한 확률 또는 로짓
                     if apply_softmax:
                         probs = torch.softmax(logits, dim=1)
                     else:
                         probs = logits
                         
-                    # 클래스 ID 계산 (argmax 사용)
                     if return_class_id:
                         class_ids = torch.argmax(logits, dim=1)
                     
-                    # 이진 분류에서 positive 클래스(인덱스 1)의 확률만 반환
                     if self.num_labels == 2 and not normalize_scores:
                         scores = probs[:, 1]
                     else:
                         scores = probs
                 
-                # 점수 정규화 (선택적)
                 if normalize_scores and self.num_labels == 2:
-                    # positive와 negative 점수 간의 차이를 사용
-                    scores = probs[:, 1] - probs[:, 0]
+                    scores = probs[:, 1]
                 
-                # CPU로 이동 및 결과 저장
                 all_scores.extend(scores.cpu())
                 if return_class_id:
                     all_class_ids.extend(class_ids.cpu())
