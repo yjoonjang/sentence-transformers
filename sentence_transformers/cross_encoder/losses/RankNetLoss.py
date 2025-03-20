@@ -6,7 +6,6 @@ from torch import nn
 
 from sentence_transformers.cross_encoder import CrossEncoder
 from sentence_transformers.cross_encoder.losses import LambdaLoss, NoWeightingScheme
-from sentence_transformers.util import fullname
 
 
 class RankNetLoss(LambdaLoss):
@@ -95,15 +94,9 @@ class RankNetLoss(LambdaLoss):
         Returns:
             Dictionary containing the configuration parameters
         """
-        return {
-            "weighting_scheme": fullname(self.weighting_scheme),
-            "k": self.k,
-            "sigma": self.sigma,
-            "eps": self.eps,
-            "reduction_log": self.reduction_log,
-            "activation_fct": fullname(self.activation_fct),
-            "mini_batch_size": self.mini_batch_size,
-        }
+        config = super().get_config_dict()
+        del config["weighting_scheme"]
+        return config
 
     @property
     def citation(self) -> str:
@@ -115,4 +108,4 @@ class RankNetLoss(LambdaLoss):
   pages={89--96},
   year={2005}
 }
-""" 
+"""
