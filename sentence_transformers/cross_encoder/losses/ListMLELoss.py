@@ -15,7 +15,7 @@ class ListMLELoss(PListMLELoss):
         respect_input_order: bool = True,
     ) -> None:
         """
-        This loss function implements the ListMLE learnin to rank algorithm, which uses a list-wise
+        This loss function implements the ListMLE learning to rank algorithm, which uses a list-wise
         approach based on maximum likelihood estimation of permutations. It maximizes the likelihood
         of the permutation induced by the ground truth labels.
 
