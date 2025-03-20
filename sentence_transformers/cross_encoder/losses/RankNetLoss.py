@@ -40,6 +40,7 @@ class RankNetLoss(LambdaLoss):
 
         References:
             - Learning to Rank using Gradient Descent: https://icml.cc/Conferences/2015/wp-content/uploads/2015/06/icml_ranking.pdf
+            - `Cross Encoder > Training Examples > MS MARCO <../../../examples/cross_encoder/training/ms_marco/README.html>`_
 
         Requirements:
             1. Query with multiple documents (pairwise approach)
