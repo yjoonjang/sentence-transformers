@@ -52,6 +52,17 @@ class RankNetLoss(LambdaLoss):
             | (query, [doc1, doc2, ..., docN])       | [score1, score2, ..., scoreN]  | 1                             |
             +----------------------------------------+--------------------------------+-------------------------------+
 
+        Recommendations:
+            - Use :class:`~sentence_transformers.util.mine_hard_negatives` with ``output_format="labeled-list"``
+              to convert question-answer pairs to the required input format with hard negatives.
+
+        Relations:
+            - :class:`~sentence_transformers.cross_encoder.losses.LambdaLoss` can be seen as an extension of this loss
+              where each score pair is weighted. Alternatively, this loss can be seen as a special case of the
+              :class:`~sentence_transformers.cross_encoder.losses.LambdaLoss` without a weighting scheme.
+            - :class:`~sentence_transformers.cross_encoder.losses.LambdaLoss` with its default NDCGLoss2++ weighting
+              scheme anecdotally performs better than the other losses with the same input format.
+
         Example:
             ::
 
