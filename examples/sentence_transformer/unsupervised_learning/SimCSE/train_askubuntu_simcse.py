@@ -2,19 +2,25 @@ import logging
 from datetime import datetime
 
 from datasets import load_dataset
-from torch.utils.data import DataLoader
 
-from sentence_transformers import LoggingHandler, SentenceTransformer, evaluation, losses, models
+from sentence_transformers import (
+    LoggingHandler,
+    SentenceTransformer,
+    SentenceTransformerTrainer,
+    SentenceTransformerTrainingArguments,
+    models,
+)
+from sentence_transformers.evaluation import RerankingEvaluator
+from sentence_transformers.losses import MultipleNegativesRankingLoss
 
 # Just some code to print debug information to stdout
 logging.basicConfig(
     format="%(asctime)s - %(message)s", datefmt="%Y-%m-%d %H:%M:%S", level=logging.INFO, handlers=[LoggingHandler()]
 )
-# /print debug information to stdout
 
 # Some training parameters. For the example, we use a batch_size of 128, a max sentence length (max_seq_length)
 # of 32 word pieces and as model roberta-base
-model_name = "roberta-base"
+model_name = "FacebookAI/roberta-base"
 batch_size = 128
 max_seq_length = 32
 num_epochs = 1
@@ -39,9 +45,10 @@ train_dataset = load_dataset("sentence-transformers/askubuntu-questions", split=
 )
 logging.info(train_dataset)
 
+# Because SimCSE uses pairs of positive pairs, with in-batch negatives, we need to convert the dataset accordingly
+train_dataset = train_dataset.add_column("identical_text", train_dataset["text"])
+
 # Initialize an SBERT model
-
-
 word_embedding_model = models.Transformer(model_name, max_seq_length=max_seq_length)
 
 # Apply mean pooling
@@ -53,36 +60,58 @@ pooling_model = models.Pooling(
 )
 model = SentenceTransformer(modules=[word_embedding_model, pooling_model])
 
-# Train the model
-
 # As Loss function, we use MultipleNegativesRankingLoss
-train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
-train_loss = losses.MultipleNegativesRankingLoss(model)
+train_loss = MultipleNegativesRankingLoss(model)
 
 # Create a dev evaluator
-dev_evaluator = evaluation.RerankingEvaluator(eval_dataset, name="AskUbuntu dev")
-test_evaluator = evaluation.RerankingEvaluator(test_dataset, name="AskUbuntu test")
+dev_evaluator = RerankingEvaluator(eval_dataset, name="AskUbuntu dev")
+test_evaluator = RerankingEvaluator(test_dataset, name="AskUbuntu test")
 
-logging.info("Dev performance before training")
+logging.info("Performance before training")
 dev_evaluator(model)
+test_evaluator(model)
 
-warmup_steps = int(num_epochs * len(train_dataloader) * 0.1)
-
-logging.info("Start training")
-model.fit(
-    train_objectives=[(train_dataloader, train_loss)],
-    evaluator=dev_evaluator,
-    evaluation_steps=100,
-    epochs=num_epochs,
-    warmup_steps=warmup_steps,
-    output_path=output_path,
-    show_progress_bar=True,
-    use_amp=True,  # If your GPU does not have FP16 cores, set use_amp=False
+# Prepare training arguments
+args = SentenceTransformerTrainingArguments(
+    output_dir=output_path,
+    num_train_epochs=num_epochs,
+    per_device_train_batch_size=batch_size,
+    warmup_ratio=0.1,
+    eval_strategy="steps",
+    eval_steps=0.1,
+    logging_steps=0.01,
+    learning_rate=5e-5,
+    save_strategy="no",
+    fp16=True,  # If your GPU does not have FP16 cores, set fp16=False
 )
 
-latest_output_path = output_path + "-latest"
-model.save(latest_output_path)
+# Train the model
+trainer = SentenceTransformerTrainer(
+    model=model,
+    args=args,
+    train_dataset=train_dataset,
+    evaluator=dev_evaluator,
+    loss=train_loss,
+)
 
-# Run test evaluation on the latest model. This is equivalent to not having a dev dataset
-model = SentenceTransformer(latest_output_path)
+logging.info("Start training")
+trainer.train()
+
+# Run evaluation
+dev_evaluator(model)
 test_evaluator(model)
+
+latest_output_path = output_path + "-latest"
+model.save_pretrained(latest_output_path)
+
+# (Optional) save the model to the Hugging Face Hub!
+# It is recommended to run `huggingface-cli login` to log into your Hugging Face account first
+model_name = model_name if "/" not in model_name else model_name.split("/")[-1]
+try:
+    model.push_to_hub(f"{model_name}-askubuntu-simcse")
+except Exception:
+    logging.error(
+        f"Error uploading model to the Hugging Face Hub:\nTo upload it manually, you can run "
+        f"`huggingface-cli login`, followed by loading the model using `model = SentenceTransformer({latest_output_path!r})` "
+        f"and saving it using `model.push_to_hub('{model_name}-askubuntu-simcse')`."
+    )
