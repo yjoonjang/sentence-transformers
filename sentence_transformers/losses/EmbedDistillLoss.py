@@ -20,7 +20,7 @@ class EmbedDistillLoss(nn.Module):
         self,
         model: SentenceTransformer,
         teacher_model: SentenceTransformer | None = None,
-        distance_metric: Literal["mse", "l2", "cosine"] = "l2",
+        distance_metric: Literal["mse", "l2", "cosine"] = "cosine",
         add_projection_layer: bool = False,
         projection_save_path: str | None = None,
     ) -> None:
