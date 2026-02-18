@@ -20,9 +20,10 @@ class EmbedDistillLoss(nn.Module):
         self,
         model: SentenceTransformer,
         teacher_model: SentenceTransformer | None = None,
-        distance_metric: Literal["mse", "l2", "cosine"] = "cosine",
+        distance_metric: Literal["mse", "l2", "cosine", "kl_div"] = "cosine",
         add_projection_layer: bool = False,
         projection_save_path: str | None = None,
+        temperature: float = 1.0,
     ) -> None:
         """
         Computes the embedding distillation loss between the student model and a teacher model.
@@ -44,7 +45,8 @@ class EmbedDistillLoss(nn.Module):
                 Defaults to None.
             distance_metric: The distance metric to use for comparing embeddings.
                 One of ``"mse"`` (mean squared error), ``"l2"`` (L2 norm / Euclidean distance),
-                or ``"cosine"`` (cosine distance). Defaults to ``"l2"``.
+                ``"cosine"`` (cosine distance), or ``"kl_div"`` (KL divergence after softmax).
+                Defaults to ``"cosine"``.
             add_projection_layer: If True, adds a learnable linear projection layer that maps
                 student embeddings to the teacher embedding dimension. This is useful when the
                 student and teacher have different embedding dimensions. The projection layer
@@ -55,6 +57,10 @@ class EmbedDistillLoss(nn.Module):
                 this path after training via :meth:`save_projection`. You can also load
                 a previously saved projection layer via :meth:`load_projection`.
                 Defaults to None.
+            temperature: Temperature parameter for the ``"kl_div"`` distance metric. Higher
+                values produce softer probability distributions. The loss is scaled by
+                ``temperature ** 2`` to preserve gradient magnitudes. Has no effect on
+                other distance metrics. Defaults to 1.0.
 
         References:
             - EmbedDistill: A Geometric Knowledge Distillation for Information Retrieval: https://huggingface.co/papers/2301.12005
@@ -155,9 +161,10 @@ class EmbedDistillLoss(nn.Module):
         self.teacher_model = teacher_model
         self.distance_metric = distance_metric
         self.projection_save_path = projection_save_path
+        self.temperature = temperature
 
-        if distance_metric not in ("mse", "l2", "cosine"):
-            raise ValueError(f"distance_metric must be 'mse', 'l2', or 'cosine', got '{distance_metric}'")
+        if distance_metric not in ("mse", "l2", "cosine", "kl_div"):
+            raise ValueError(f"distance_metric must be 'mse', 'l2', 'cosine', or 'kl_div', got '{distance_metric}'")
 
         # Handle retokenization if tokenizers differ (only when teacher_model is provided)
         self.must_retokenize = False
@@ -287,6 +294,11 @@ class EmbedDistillLoss(nn.Module):
                 losses.append(torch.norm(student_emb - teacher_emb, dim=-1).mean())
             elif self.distance_metric == "cosine":
                 losses.append((1 - nn.functional.cosine_similarity(student_emb, teacher_emb, dim=-1)).mean())
+            elif self.distance_metric == "kl_div":
+                student_log_prob = nn.functional.log_softmax(student_emb / self.temperature, dim=-1)
+                teacher_prob = nn.functional.softmax(teacher_emb / self.temperature, dim=-1)
+                loss = nn.functional.kl_div(student_log_prob, teacher_prob, reduction="batchmean")
+                losses.append(loss * (self.temperature ** 2))
 
         return torch.stack(losses).mean()
 
