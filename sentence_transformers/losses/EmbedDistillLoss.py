@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import Iterable
 from typing import Any, Literal
 
@@ -21,6 +22,7 @@ class EmbedDistillLoss(nn.Module):
         teacher_model: SentenceTransformer | None = None,
         distance_metric: Literal["mse", "l2", "cosine"] = "l2",
         add_projection_layer: bool = False,
+        projection_save_path: str | None = None,
     ) -> None:
         """
         Computes the embedding distillation loss between the student model and a teacher model.
@@ -49,6 +51,10 @@ class EmbedDistillLoss(nn.Module):
                 is only used during training and can be discarded at inference. Requires
                 ``teacher_model`` to be provided for automatic dimension detection.
                 Defaults to False.
+            projection_save_path: If provided, the projection layer weights will be saved to
+                this path after training via :meth:`save_projection`. You can also load
+                a previously saved projection layer via :meth:`load_projection`.
+                Defaults to None.
 
         References:
             - EmbedDistill: A Geometric Knowledge Distillation for Information Retrieval: https://huggingface.co/papers/2301.12005
@@ -148,6 +154,7 @@ class EmbedDistillLoss(nn.Module):
         self.model = model
         self.teacher_model = teacher_model
         self.distance_metric = distance_metric
+        self.projection_save_path = projection_save_path
 
         if distance_metric not in ("mse", "l2", "cosine"):
             raise ValueError(f"distance_metric must be 'mse', 'l2', or 'cosine', got '{distance_metric}'")
@@ -282,6 +289,55 @@ class EmbedDistillLoss(nn.Module):
                 losses.append((1 - nn.functional.cosine_similarity(student_emb, teacher_emb, dim=-1)).mean())
 
         return torch.stack(losses).mean()
+
+    def save_projection(self, path: str | None = None) -> None:
+        """Save the projection layer weights to disk.
+
+        Args:
+            path: File path to save the projection layer. If None, uses the
+                ``projection_save_path`` provided during initialization.
+
+        Raises:
+            ValueError: If no path is provided and ``projection_save_path`` was not set.
+            ValueError: If no projection layer exists.
+        """
+        save_path = path or self.projection_save_path
+        if save_path is None:
+            raise ValueError(
+                "No save path provided. Either pass a path argument or set "
+                "projection_save_path during initialization."
+            )
+        if self.projection is None:
+            raise ValueError("No projection layer to save. Set add_projection_layer=True during initialization.")
+
+        os.makedirs(os.path.dirname(save_path) if os.path.dirname(save_path) else ".", exist_ok=True)
+        torch.save(self.projection.state_dict(), save_path)
+        logger.info("Projection layer saved to %s", save_path)
+
+    def load_projection(self, path: str | None = None) -> None:
+        """Load projection layer weights from disk.
+
+        Args:
+            path: File path to load the projection layer from. If None, uses the
+                ``projection_save_path`` provided during initialization.
+
+        Raises:
+            ValueError: If no path is provided and ``projection_save_path`` was not set.
+            ValueError: If no projection layer exists to load weights into.
+        """
+        load_path = path or self.projection_save_path
+        if load_path is None:
+            raise ValueError(
+                "No load path provided. Either pass a path argument or set "
+                "projection_save_path during initialization."
+            )
+        if self.projection is None:
+            raise ValueError(
+                "No projection layer to load weights into. Set add_projection_layer=True during initialization."
+            )
+
+        self.projection.load_state_dict(torch.load(load_path, weights_only=True))
+        logger.info("Projection layer loaded from %s", load_path)
 
     def get_config_dict(self) -> dict[str, Any]:
         return {
