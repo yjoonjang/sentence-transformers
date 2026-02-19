@@ -267,9 +267,7 @@ class EmbedDistillLoss(nn.Module):
 
         return self.compute_loss_from_embeddings(embeddings, teacher_embeddings)
 
-    def compute_loss_from_embeddings(
-        self, embeddings: list[Tensor], teacher_embeddings: list[Tensor]
-    ) -> Tensor:
+    def compute_loss_from_embeddings(self, embeddings: list[Tensor], teacher_embeddings: list[Tensor]) -> Tensor:
         """Compute the embedding distillation loss.
 
         Args:
@@ -298,7 +296,7 @@ class EmbedDistillLoss(nn.Module):
                 student_log_prob = nn.functional.log_softmax(student_emb / self.temperature, dim=-1)
                 teacher_prob = nn.functional.softmax(teacher_emb / self.temperature, dim=-1)
                 loss = nn.functional.kl_div(student_log_prob, teacher_prob, reduction="batchmean")
-                losses.append(loss * (self.temperature ** 2))
+                losses.append(loss * (self.temperature**2))
 
         return torch.stack(losses).mean()
 
@@ -316,8 +314,7 @@ class EmbedDistillLoss(nn.Module):
         save_path = path or self.projection_save_path
         if save_path is None:
             raise ValueError(
-                "No save path provided. Either pass a path argument or set "
-                "projection_save_path during initialization."
+                "No save path provided. Either pass a path argument or set projection_save_path during initialization."
             )
         if self.projection is None:
             raise ValueError("No projection layer to save. Set add_projection_layer=True during initialization.")
@@ -340,8 +337,7 @@ class EmbedDistillLoss(nn.Module):
         load_path = path or self.projection_save_path
         if load_path is None:
             raise ValueError(
-                "No load path provided. Either pass a path argument or set "
-                "projection_save_path during initialization."
+                "No load path provided. Either pass a path argument or set projection_save_path during initialization."
             )
         if self.projection is None:
             raise ValueError(
