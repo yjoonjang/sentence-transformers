@@ -11,8 +11,10 @@ from .SparseMSELoss import SparseMSELoss
 from .SparseMultipleNegativesRankingLoss import SparseMultipleNegativesRankingLoss
 from .SparseTripletLoss import SparseTripletLoss
 from .SpladeLoss import SpladeLoss
+from .CachedSpladeLoss import CachedSpladeLoss
 
 __all__ = [
+    "CachedSpladeLoss",
     "CSRLoss",
     "CSRReconstructionLoss",
     "SparseMultipleNegativesRankingLoss",
