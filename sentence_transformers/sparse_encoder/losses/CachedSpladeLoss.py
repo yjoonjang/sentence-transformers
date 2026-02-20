@@ -4,14 +4,13 @@ import logging
 from collections.abc import Iterable, Iterator
 from contextlib import nullcontext
 from functools import partial
-from typing import Any, Literal
+from typing import Any
 
 import torch
 import tqdm
 from torch import Tensor, nn
 
 from sentence_transformers.losses.CachedMultipleNegativesRankingLoss import RandContext, _backward_hook
-from sentence_transformers.sparse_encoder.losses.FlopsLoss import FlopsLoss
 from sentence_transformers.sparse_encoder.losses.SpladeLoss import SpladeLoss
 from sentence_transformers.sparse_encoder.SparseEncoder import SparseEncoder
 
@@ -186,9 +185,7 @@ class CachedSpladeLoss(SpladeLoss):
             )
             yield reps, random_state
 
-    def calculate_loss_and_cache_gradients(
-        self, reps: list[list[Tensor]], labels: Tensor | None
-    ) -> Tensor:
+    def calculate_loss_and_cache_gradients(self, reps: list[list[Tensor]], labels: Tensor | None) -> Tensor:
         """Calculate the combined loss (base + regularizers) and cache gradients w.r.t. the embeddings."""
         loss = self._compute_total_loss(reps, labels, with_backward=True)
         loss = loss.detach().requires_grad_()
