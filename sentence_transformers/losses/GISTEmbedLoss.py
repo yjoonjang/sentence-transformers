@@ -267,9 +267,7 @@ class GISTEmbedLoss(nn.Module):
 
         if self.hardness_alpha > 0.0 and self.hardness_mode == "hard_only" and negative is not None:
             with torch.no_grad():
-                hard_neg_sims = nn.functional.cosine_similarity(
-                    anchor, negative[offset : offset + batch_size], dim=-1
-                )
+                hard_neg_sims = nn.functional.cosine_similarity(anchor, negative[offset : offset + batch_size], dim=-1)
                 weights = torch.exp(self.hardness_alpha * hard_neg_sims)
             per_sample_loss = nn.functional.cross_entropy(scores, range_labels, reduction="none")
             return (weights * per_sample_loss).sum() / weights.sum()

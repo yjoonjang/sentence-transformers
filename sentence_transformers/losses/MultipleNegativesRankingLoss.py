@@ -281,13 +281,17 @@ class MultipleNegativesRankingLoss(nn.Module):
 
         if self.hardness_alpha > 0.0 and self.hardness_mode == "hard_only" and len(docs) > 1:
             with torch.no_grad():
-                hard_neg_sims = torch.stack(
-                    [
-                        nn.functional.cosine_similarity(local_queries, neg[local_indices], dim=-1)
-                        for neg in docs[1:]
-                    ],
-                    dim=0,
-                ).max(dim=0).values
+                hard_neg_sims = (
+                    torch.stack(
+                        [
+                            nn.functional.cosine_similarity(local_queries, neg[local_indices], dim=-1)
+                            for neg in docs[1:]
+                        ],
+                        dim=0,
+                    )
+                    .max(dim=0)
+                    .values
+                )
                 weights = torch.exp(self.hardness_alpha * hard_neg_sims)
             loss = (weights * per_sample_loss).sum() / weights.sum()
         else:

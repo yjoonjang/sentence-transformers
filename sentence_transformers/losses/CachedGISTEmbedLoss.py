@@ -340,15 +340,17 @@ class CachedGISTEmbedLoss(nn.Module):
         # Precompute hardness weights for "hard_only" mode
         if self.hardness_alpha > 0.0 and self.hardness_mode == "hard_only" and len(candidates) > 1:
             with torch.no_grad():
-                hardness_weights = torch.stack(
-                    [
-                        nn.functional.cosine_similarity(
-                            anchors, neg[offset : offset + batch_size], dim=-1
-                        )
-                        for neg in candidates[1:]
-                    ],
-                    dim=0,
-                ).max(dim=0).values
+                hardness_weights = (
+                    torch.stack(
+                        [
+                            nn.functional.cosine_similarity(anchors, neg[offset : offset + batch_size], dim=-1)
+                            for neg in candidates[1:]
+                        ],
+                        dim=0,
+                    )
+                    .max(dim=0)
+                    .values
+                )
                 hardness_weights = torch.exp(self.hardness_alpha * hardness_weights)
                 total_weight_sum = hardness_weights.sum()
         else:

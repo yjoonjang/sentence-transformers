@@ -320,13 +320,14 @@ class CachedMultipleNegativesRankingLoss(nn.Module):
         if self.hardness_alpha > 0.0 and self.hardness_mode == "hard_only" and num_docs > 1:
             with torch.no_grad():
                 local_qs = queries[local_indices]
-                hardness_weights = torch.stack(
-                    [
-                        nn.functional.cosine_similarity(local_qs, neg[local_indices], dim=-1)
-                        for neg in docs[1:]
-                    ],
-                    dim=0,
-                ).max(dim=0).values
+                hardness_weights = (
+                    torch.stack(
+                        [nn.functional.cosine_similarity(local_qs, neg[local_indices], dim=-1) for neg in docs[1:]],
+                        dim=0,
+                    )
+                    .max(dim=0)
+                    .values
+                )
                 hardness_weights = torch.exp(self.hardness_alpha * hardness_weights)
                 total_weight_sum = hardness_weights.sum()
         else:
