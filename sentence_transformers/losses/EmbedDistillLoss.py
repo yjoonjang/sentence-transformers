@@ -22,7 +22,7 @@ class EmbedDistillLoss(nn.Module):
         teacher_model: SentenceTransformer | None = None,
         distance_metric: Literal["mse", "l2", "cosine", "kl_div"] = "cosine",
         add_projection_layer: bool = False,
-        projection_save_path: str | None = None,
+        pretrained_projection_path: str | None = None,
         temperature: float = 1.0,
     ) -> None:
         """
@@ -53,9 +53,10 @@ class EmbedDistillLoss(nn.Module):
                 is only used during training and can be discarded at inference. Requires
                 ``teacher_model`` to be provided for automatic dimension detection.
                 Defaults to False.
-            projection_save_path: If provided, the projection layer weights will be saved to
-                this path after training via :meth:`save_projection`. You can also load
-                a previously saved projection layer via :meth:`load_projection`.
+            pretrained_projection_path: If provided, loads pre-trained projection layer weights
+                from this path during initialization. This is useful when resuming training
+                or reusing a projection layer trained in a previous session. The projection
+                layer must already be created via ``add_projection_layer=True``.
                 Defaults to None.
             temperature: Temperature parameter for the ``"kl_div"`` distance metric. Higher
                 values produce softer probability distributions. The loss is scaled by
@@ -160,7 +161,6 @@ class EmbedDistillLoss(nn.Module):
         self.model = model
         self.teacher_model = teacher_model
         self.distance_metric = distance_metric
-        self.projection_save_path = projection_save_path
         self.temperature = temperature
 
         if distance_metric not in ("mse", "l2", "cosine", "kl_div"):
@@ -214,6 +214,16 @@ class EmbedDistillLoss(nn.Module):
                 "Cannot determine teacher embedding dimension for projection layer. "
                 "Provide teacher_model when using add_projection_layer=True."
             )
+
+        # Load pre-trained projection weights if provided
+        if pretrained_projection_path is not None:
+            if self.projection is None:
+                raise ValueError(
+                    "Cannot load pre-trained projection weights without a projection layer. "
+                    "Set add_projection_layer=True when using pretrained_projection_path."
+                )
+            self.projection.load_state_dict(torch.load(pretrained_projection_path, weights_only=True))
+            logger.info("Loaded pre-trained projection layer from %s", pretrained_projection_path)
 
     def forward(self, sentence_features: Iterable[dict[str, Tensor]], labels: Tensor) -> Tensor:
         sentence_features = list(sentence_features)
@@ -300,52 +310,38 @@ class EmbedDistillLoss(nn.Module):
 
         return torch.stack(losses).mean()
 
-    def save_projection(self, path: str | None = None) -> None:
+    def save_projection(self, path: str) -> None:
         """Save the projection layer weights to disk.
 
         Args:
-            path: File path to save the projection layer. If None, uses the
-                ``projection_save_path`` provided during initialization.
+            path: File path to save the projection layer.
 
         Raises:
-            ValueError: If no path is provided and ``projection_save_path`` was not set.
             ValueError: If no projection layer exists.
         """
-        save_path = path or self.projection_save_path
-        if save_path is None:
-            raise ValueError(
-                "No save path provided. Either pass a path argument or set projection_save_path during initialization."
-            )
         if self.projection is None:
             raise ValueError("No projection layer to save. Set add_projection_layer=True during initialization.")
 
-        os.makedirs(os.path.dirname(save_path) if os.path.dirname(save_path) else ".", exist_ok=True)
-        torch.save(self.projection.state_dict(), save_path)
-        logger.info("Projection layer saved to %s", save_path)
+        os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
+        torch.save(self.projection.state_dict(), path)
+        logger.info("Projection layer saved to %s", path)
 
-    def load_projection(self, path: str | None = None) -> None:
+    def load_projection(self, path: str) -> None:
         """Load projection layer weights from disk.
 
         Args:
-            path: File path to load the projection layer from. If None, uses the
-                ``projection_save_path`` provided during initialization.
+            path: File path to load the projection layer from.
 
         Raises:
-            ValueError: If no path is provided and ``projection_save_path`` was not set.
             ValueError: If no projection layer exists to load weights into.
         """
-        load_path = path or self.projection_save_path
-        if load_path is None:
-            raise ValueError(
-                "No load path provided. Either pass a path argument or set projection_save_path during initialization."
-            )
         if self.projection is None:
             raise ValueError(
                 "No projection layer to load weights into. Set add_projection_layer=True during initialization."
             )
 
-        self.projection.load_state_dict(torch.load(load_path, weights_only=True))
-        logger.info("Projection layer loaded from %s", load_path)
+        self.projection.load_state_dict(torch.load(path, weights_only=True))
+        logger.info("Projection layer loaded from %s", path)
 
     def get_config_dict(self) -> dict[str, Any]:
         return {
