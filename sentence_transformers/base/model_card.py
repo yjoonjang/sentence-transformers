@@ -30,7 +30,7 @@ from transformers.modelcard import make_markdown_table
 from transformers.trainer_callback import TrainerControl, TrainerState
 
 from sentence_transformers import __version__ as sentence_transformers_version
-from sentence_transformers.base.modality import format_modality
+from sentence_transformers.base.modality import format_modality, infer_modality
 from sentence_transformers.base.training_args import BaseTrainingArguments
 from sentence_transformers.util import fullname, is_accelerate_available, is_datasets_available
 
@@ -989,6 +989,28 @@ class BaseModelCardData(CardData):
                 subsection = dataset[:1000][column]
                 first = subsection[0]
                 if isinstance(first, str):
+                    # Guard against ``model.preprocess()`` auto-detecting a non-text
+                    # modality from string contents. For datasets that store media as
+                    # file paths (e.g. a column of ``"/path/to/img.jpg"`` strings) the
+                    # preprocessor would otherwise read and decode 1000 real media
+                    # files per column, producing many GB of pixel/audio/video tensors
+                    # on ``Trainer.__init__``. With multiple media columns and multiple
+                    # DDP ranks this easily exhausts system RAM before the first
+                    # training step runs. Probe the modality of a single sample first
+                    # and skip the expensive ``preprocess`` call for non-text columns.
+                    try:
+                        probed_modality = infer_modality(
+                            first,
+                            supported_modalities=getattr(self.model, "modalities", None),
+                        )
+                    except Exception:
+                        probed_modality = "text"
+                    if probed_modality != "text":
+                        dataset_info["stats"][column] = {
+                            "dtype": f"string ({format_modality(probed_modality)} path)",
+                            "data": {"samples": f"{len(subsection)}"},
+                        }
+                        continue
                     tokenized = self.model.preprocess(subsection, task="document")
                     if isinstance(tokenized, (dict, UserDict)) and "attention_mask" in tokenized:
                         lengths = tokenized["attention_mask"].sum(dim=1).tolist()
