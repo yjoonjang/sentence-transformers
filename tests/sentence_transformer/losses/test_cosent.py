@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import re
 
 import pytest
 import torch
@@ -61,13 +62,17 @@ def _explicit_cosent_loss(loss_fn, embeddings, labels):
 
 
 @pytest.mark.parametrize("loss_class", [CoSENTLoss, AnglELoss, SparseCoSENTLoss, SparseAnglELoss])
-@pytest.mark.parametrize("label_shape", [(0,), (2,), (4,), (3, 1)])
-def test_cosent_rejects_mismatched_label_shapes(dummy_model, loss_class, label_shape):
+@pytest.mark.parametrize("label_shape", [(0,), (2,), (4,), (3, 3)])
+def test_cosent_rejects_mismatched_label_counts(dummy_model, loss_class, label_shape):
     embeddings = [torch.randn(3, 4) for _ in range(2)]
     labels = torch.zeros(label_shape)
     loss_fn = loss_class(dummy_model)
 
-    with pytest.raises(ValueError, match="Labels and scores must have the same shape"):
+    message = (
+        f"{loss_class.__name__} expects 3 labels (one per example), "
+        f"but got {labels.numel()} labels with shape {tuple(labels.shape)}."
+    )
+    with pytest.raises(ValueError, match=re.escape(message)):
         loss_fn.compute_loss_from_embeddings(embeddings, labels)
 
 
