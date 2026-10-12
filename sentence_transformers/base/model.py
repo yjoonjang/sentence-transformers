@@ -347,8 +347,8 @@ class BaseModel(nn.Sequential, PeftAdapterMixin, ABC):
         if self.default_prompt_name:
             logger.warning_once(
                 f"Default prompt name is set to '{self.default_prompt_name}'. "
-                f"This prompt will be applied to all inference calls, except if "
-                f"a `prompt` or `prompt_name` parameter is provided."
+                "This prompt applies unless overridden by `prompt`, `prompt_name`, or a method-specific prompt, "
+                "including an empty prompt."
             )
 
     def _resolve_prompt(self, prompt: str | None, prompt_name: str | None) -> str | None:
