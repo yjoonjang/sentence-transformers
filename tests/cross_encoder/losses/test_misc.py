@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import sys
 
 import pytest
@@ -106,6 +107,40 @@ class _ScoreModel(torch.nn.Module):
 
     def forward(self, inputs):
         return {"scores": self.scores[inputs["indices"]].unsqueeze(-1)}
+
+
+@pytest.mark.parametrize("loss_cls", [LambdaLoss, RankNetLoss])
+@pytest.mark.parametrize("labels", [[0.0, 0.0], [1.0, 1.0], [1.0]])
+def test_ranking_loss_without_ordered_pairs_has_zero_loss_and_gradients(loss_cls, labels):
+    model = _ScoreModel(torch.arange(len(labels), dtype=torch.float32))
+    loss = loss_cls(model)((["query"], [[str(i) for i in range(len(labels))]]), [torch.tensor(labels)])
+
+    torch.testing.assert_close(loss, torch.tensor(0.0))
+    loss.backward()
+    torch.testing.assert_close(model.scores.grad, torch.zeros_like(model.scores))
+
+
+@pytest.mark.parametrize("loss_cls", [LambdaLoss, RankNetLoss])
+def test_ranking_loss_averages_ordered_pairs_in_mixed_batch(loss_cls):
+    model = _ScoreModel(torch.tensor([1.0, 0.0, -1.0, 0.0, 2.0, 3.0]))
+    loss_fn = loss_cls(model)
+    actual = loss_fn(
+        (["ranked", "tied", "single"], [["0", "1", "2"], ["3", "4"], ["5"]]),
+        [torch.tensor([1.0, 0.0, 0.0]), torch.tensor([0.0, 0.0]), torch.tensor([1.0])],
+    )
+
+    scores = model.scores.detach().double().requires_grad_()
+    pair_losses = torch.nn.functional.softplus(scores[1:3] - scores[0]) / math.log(2)
+    if loss_cls is LambdaLoss:
+        inverse_discount_at_2 = 1 / math.log2(3)
+        weights = scores.new_tensor([11 * (1 - inverse_discount_at_2), 10 * (inverse_discount_at_2 - 0.5) + 0.5])
+        pair_losses = pair_losses * weights
+    expected = pair_losses.mean()
+
+    torch.testing.assert_close(actual, expected.float())
+    actual.backward()
+    expected.backward()
+    torch.testing.assert_close(model.scores.grad, scores.grad.float())
 
 
 @pytest.mark.parametrize("loss_cls", [ListMLELoss, PListMLELoss])
