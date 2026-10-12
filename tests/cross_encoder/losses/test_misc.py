@@ -158,7 +158,7 @@ def test_listmle_large_scores_match_sequential_cross_entropy(loss_cls, respect_i
     scores = model.scores.detach().double().requires_grad_()
     orders = [[0, 1], [2, 3, 4]] if respect_input_order else [[1, 0], [3, 2, 4]]
     query_losses = []
-    for order, weights in zip(orders, [[3 / 4, 1 / 4], [7 / 11, 3 / 11, 1 / 11]]):
+    for order, weights in zip(orders, [[1.0, 0.0], [3 / 4, 1 / 4, 0.0]]):
         terms = torch.stack(
             [
                 torch.nn.functional.cross_entropy(scores[order[index:]].unsqueeze(0), torch.zeros(1, dtype=torch.long))
