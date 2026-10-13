@@ -1203,32 +1203,6 @@ def test_query_expansion_without_mask_module_warns(caplog) -> None:
     assert not any("no MultiVectorMask" in record.message for record in caplog.records)
 
 
-def test_media_counts_run_under_eval_mode(monkeypatch) -> None:
-    """trainer.evaluate() collates under model.eval(): the media-count bookkeeping keys on
-    ``track_media_counts`` alone (not ``self.training``), or VLM eval-loss batches lose
-    ``num_images_per_sample`` and fall back to naive sample slicing."""
-    import sentence_transformers.base.modules.transformer as transformer_module
-
-    model = MultiVectorEncoder("sentence-transformers-testing/stsb-bert-tiny-safetensors")
-    transformer = model[0]
-    transformer.processor.chat_template = (
-        "{% for message in messages %}{% for item in message['content'] %}{{ item['text'] }}{% endfor %}{% endfor %}"
-    )
-    transformer.modality_config = {**transformer.modality_config, "message": transformer.modality_config["text"]}
-    transformer.track_media_counts = True
-    transformer.eval()
-
-    calls: list[int] = []
-
-    def fake_count(messages):
-        calls.append(len(messages))
-        return [0] * len(messages), [0] * len(messages)
-
-    monkeypatch.setattr(transformer_module, "_count_media_per_sample", fake_count)
-    transformer.preprocess(["short input"], task="document")
-    assert calls, "media counting must run in eval mode when track_media_counts is set"
-
-
 def test_user_constructed_model_with_prefix_prompts_round_trips() -> None:
     # A model built from explicit modules + text prefix prompts must save/reload byte-identically.
     base = "sentence-transformers-testing/stsb-bert-tiny-safetensors"

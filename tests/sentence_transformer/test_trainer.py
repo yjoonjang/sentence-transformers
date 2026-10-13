@@ -1243,4 +1243,3 @@ def test_trainer_compiled_model_with_cached_loss(
     if not compile_before_loss:
         model = torch.compile(model, backend="eager")
     SentenceTransformerTrainer(model=model, loss=loss)
-    assert stsb_bert_tiny_model[0].track_media_counts

@@ -99,10 +99,6 @@ class MultiVectorDistillKLDivLoss(nn.Module):
             trainer.train()
     """
 
-    # Enables per-sample media counting in Transformer.preprocess, so mini-batching can slice VLM
-    # inputs (e.g. Qwen2-VL's flattened pixel_values) along the batch dimension.
-    requires_media_counts = True
-
     def __init__(
         self,
         model: MultiVectorEncoder,
