@@ -98,24 +98,41 @@ def test_binary_quantize_keeps_leading_dims(precision: str, shape: tuple[int, ..
 
 
 @pytest.mark.parametrize("precision", ["int8", "uint8"])
-def test_quantize_clips_out_of_range_values(precision: str) -> None:
+@pytest.mark.parametrize("shape", [(3,), (1, 3)])
+@pytest.mark.parametrize("calibration_source", ["ranges", "calibration_embeddings"])
+def test_quantize_clips_out_of_range_values(precision: str, shape: tuple[int, ...], calibration_source: str) -> None:
     """Values outside the calibration range must saturate, not wrap around, on cast.
 
     Without clipping, a value that should quantize above 255 silently wraps
     (e.g. 300 -> 44 in uint8) instead of saturating at the dtype's min/max.
     See issue #3159 / PR #2865.
     """
-    calibration_embeddings = np.array([[1, 20, -3], [4, 5, -60]], dtype=np.float32)
-    dataset = np.array([[-1, 15, 1]], dtype=np.float32)  # -1 and 1 fall outside calibration range
+    calibration = np.array([[1, 20, -3], [4, 5, -60]], dtype=np.float32)
+    if calibration_source == "ranges":
+        calibration = np.vstack((calibration.min(axis=0), calibration.max(axis=0)))
+    dataset = np.array([-1, 15, 1], dtype=np.float32).reshape(shape)
 
-    result = quantize_embeddings(dataset, precision, calibration_embeddings=calibration_embeddings)
+    result = quantize_embeddings(dataset, precision, **{calibration_source: calibration})
 
     if precision == "int8":
         expected = np.array([[-128, 42, 127]], dtype=np.int8)
     else:
         expected = np.array([[0, 170, 255]], dtype=np.uint8)
 
-    np.testing.assert_array_equal(result, expected)
+    np.testing.assert_array_equal(result, expected.reshape(shape))
+
+
+@pytest.mark.parametrize("precision", ["int8", "uint8"])
+@pytest.mark.parametrize("input_type", ["vector", "matrix", "multi_vector"])
+def test_scalar_quantize_single_embedding_without_calibration_raises(precision: str, input_type: str) -> None:
+    embeddings = np.array([[1, 2, 3]], dtype=np.float32)
+    if input_type == "vector":
+        embeddings = embeddings[0]
+    elif input_type == "multi_vector":
+        embeddings = [embeddings[:0], embeddings]
+
+    with pytest.raises(ValueError, match="single embedding"):
+        quantize_embeddings(embeddings, precision)
 
 
 @pytest.mark.parametrize("precision", ["int8", "uint8"])

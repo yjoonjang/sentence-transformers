@@ -434,9 +434,15 @@ def _get_quantization_ranges(
     calibration_embeddings: np.ndarray | None,
 ) -> np.ndarray:
     if calibration_embeddings is None:
+        if embeddings.ndim == 1 or embeddings.shape[0] == 1:
+            raise ValueError(
+                f"Cannot compute {precision} quantization ranges from a single embedding. "
+                "Call `quantize_embeddings` with `ranges` or `calibration_embeddings` "
+                "from a representative set of embeddings instead."
+            )
         if embeddings.shape[0] < 100:
             logger.warning(
-                f"Computing {precision} quantization buckets based on {len(embeddings)} embedding{'s' if len(embeddings) != 1 else ''}."
+                f"Computing {precision} quantization buckets based on {len(embeddings)} embeddings."
                 f" {precision} quantization is more stable with `ranges` calculated from more embeddings "
                 "or a `calibration_embeddings` that can be used to calculate the buckets."
             )
@@ -492,6 +498,10 @@ def quantize_embeddings(
     Returns:
         Quantized embeddings with the specified precision. For a list of multi-vector matrices (variable-length
         ``(num_tokens, dim)`` arrays), returns a list of quantized matrices with shared per-dimension buckets.
+
+    Raises:
+        ValueError: If int8 or uint8 ranges would have to be inferred from a single embedding without
+            explicit `ranges` or `calibration_embeddings`.
     """
     if isinstance(embeddings, Tensor):
         embeddings = _tensor_to_numpy(embeddings)
@@ -503,12 +513,11 @@ def quantize_embeddings(
         if isinstance(embeddings[0], np.ndarray) and embeddings[0].ndim == 2:
             # Calibrate once so all documents use the same ranges.
             if precision.endswith("int8") and ranges is None:
-                if calibration_embeddings is None:
-                    calibration_embeddings = np.concatenate(embeddings, axis=0)
-                if len(calibration_embeddings):
-                    ranges = np.vstack(
-                        (np.min(calibration_embeddings, axis=0), np.max(calibration_embeddings, axis=0))
-                    )
+                calibration_data = (
+                    np.concatenate(embeddings, axis=0) if calibration_embeddings is None else calibration_embeddings
+                )
+                if len(calibration_data):
+                    ranges = _get_quantization_ranges(calibration_data, precision, calibration_embeddings)
             return [
                 quantize_embeddings(
                     matrix, precision=precision, ranges=ranges, calibration_embeddings=calibration_embeddings
