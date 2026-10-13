@@ -287,6 +287,24 @@ class BaseModel(nn.Sequential, PeftAdapterMixin, ABC):
             self.to(device)
         self.is_hpu_graph_enabled = False
 
+        requested_dtype = (model_kwargs or {}).get("dtype") or (model_kwargs or {}).get("torch_dtype")
+        config_dtype = (config_kwargs or {}).get("dtype") or (config_kwargs or {}).get("torch_dtype")
+        if (
+            model_name_or_path
+            and backend == "torch"
+            and requested_dtype in (None, "auto")
+            and config_dtype in (None, "auto")
+            and self.transformers_model is not None
+            and self.dtype in (torch.float16, torch.bfloat16)
+            and self.device.type == "cpu"
+            and all(parameter.device.type == "cpu" for parameter in self.parameters())
+        ):
+            logger.warning_once(
+                f"This model was loaded in {self.dtype} on CPU. Depending on your CPU, inference may be significantly "
+                "slower than with torch.float32. Consider comparing inference speeds by loading with "
+                '`model_kwargs={"dtype": torch.float32}`.'
+            )
+
         # Validate prompts after model loading (which may have merged config prompts)
         self._validate_prompts()
 
