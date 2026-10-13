@@ -284,6 +284,41 @@ def test_community_detection_overlapping_communities():
     assert sorted([sorted(community) for community in result]) == sorted([sorted(community) for community in expected])
 
 
+@pytest.mark.parametrize(
+    "device",
+    ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU not available"))],
+)
+@pytest.mark.parametrize("batch_size", [4, 1024])
+@pytest.mark.parametrize(
+    ("angles", "dtype", "expected"),
+    [
+        pytest.param(
+            [(0, 0), (20, 0), (-20, 0), (0, -20), (0, 22), (0, 30), (0, 36), (0, 40), (0, 44)],
+            torch.float32,
+            [[4, 0, 5, 6, 7, 8]],
+            id="claimed_center",
+        ),
+        pytest.param(
+            [(0, 25.5), (0, 50), (0, 33), (0, 40), (0, -20), (-20, -1), (0, 0), (0, -1), (20, -1), (0, 45)],
+            torch.bfloat16,
+            [[0, 1, 2, 3, 6, 9], [7, 4, 5, 8]],
+            id="tied_center",
+        ),
+    ],
+)
+def test_community_detection_preserves_centers(angles, dtype, expected, batch_size, device):
+    y, z = torch.deg2rad(torch.tensor(angles, dtype=torch.float32)).unbind(dim=1)
+    embeddings = torch.stack((y.cos() * z.cos(), y.sin() * z.cos(), z.sin()), dim=1).to(device=device, dtype=dtype)
+    result = community_detection(embeddings, threshold=0.9, min_community_size=3, batch_size=batch_size)
+
+    assert [sorted(c) for c in result] == [sorted(c) for c in expected]
+    assert [c[0] for c in result] == [c[0] for c in expected]
+    normalized = torch.nn.functional.normalize(embeddings, dim=1)
+    scores = normalized @ normalized.T
+    for community in result:
+        assert (scores[community[0], community] >= 0.9).all()
+
+
 @pytest.mark.parametrize("as_numpy", [False, True])
 @pytest.mark.parametrize(("min_community_size", "expected"), [(1, [[0]]), (2, [])])
 def test_community_detection_accepts_1d_embedding(as_numpy, min_community_size, expected):
