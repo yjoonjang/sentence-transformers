@@ -6,6 +6,7 @@ import json
 import math
 import os
 import pickle
+import queue
 import shutil
 import sys
 import tempfile
@@ -1759,6 +1760,7 @@ This pull request has been automatically generated to add {self.__class__.__name
             p.join()
             p.close()
 
+        pool["input"].cancel_join_thread()
         pool["input"].close()
         pool["output"].close()
 
@@ -1792,7 +1794,6 @@ This pull request has been automatically generated to add {self.__class__.__name
                 chunk_size = max(1, min(math.ceil(len(inputs) / len(pool["processes"]) / 10), 5000))
 
             input_queue: Queue = pool["input"]
-            output_queue: Queue = pool["output"]
             chunk_starts = range(0, len(inputs), chunk_size)
             num_chunks = len(chunk_starts)
             for chunk_id, start in enumerate(chunk_starts):
@@ -1800,7 +1801,7 @@ This pull request has been automatically generated to add {self.__class__.__name
 
             outputs = [None] * num_chunks
             for _ in trange(num_chunks, desc="Chunks", disable=not show_progress_bar):
-                chunk_id, output = output_queue.get()
+                chunk_id, output = self._get_worker_result(pool)
                 outputs[chunk_id] = output
 
             for output in outputs:
@@ -1835,6 +1836,24 @@ This pull request has been automatically generated to add {self.__class__.__name
                 results_queue.put(cls._report_worker_failure(chunk_id, exc, target_device))
             else:
                 results_queue.put([chunk_id, outputs])
+
+    @staticmethod
+    def _get_worker_result(
+        pool: dict[Literal["input", "output", "processes"], Any], poll_interval: float = 1.0
+    ) -> Any:
+        """Wait for a result, checking for dead workers whenever the queue is empty."""
+        while True:
+            try:
+                return pool["output"].get(timeout=poll_interval)
+            except queue.Empty:
+                pass
+            dead = [p for p in pool["processes"] if not p.is_alive()]
+            if dead:
+                details = ", ".join(f"pid {p.pid} (exit code {p.exitcode})" for p in dead)
+                raise RuntimeError(
+                    f"{len(dead)} multi-process pool worker(s) died unexpectedly: {details}. "
+                    "Stop the pool and start a new one before retrying."
+                )
 
     @classmethod
     def _report_worker_failure(cls, chunk_id: int, exc: Exception, target_device: str) -> list[int | Exception]:
