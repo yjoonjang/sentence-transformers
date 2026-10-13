@@ -81,8 +81,7 @@ class SparseAutoEncoder(Module):
 
         def auxk_mask_fn(x):
             dead_mask = self.stats_last_nonzero > dead_threshold
-            x.data *= dead_mask  # inplace to save memory
-            return x
+            return x * dead_mask
 
         self.auxk_mask_fn = auxk_mask_fn
 
