@@ -106,9 +106,9 @@ class CoSENTLoss(nn.Module):
         scores = self.similarity_fct(embeddings[0], embeddings[1])
         if labels.shape != scores.shape:
             raise ValueError(f"Labels and scores must have the same shape, got {labels.shape} and {scores.shape}.")
-        scores = scores * self.scale
         if scores.dtype in (torch.float16, torch.bfloat16):
             scores = scores.float()
+        scores = scores * self.scale
         if labels.dtype == torch.bool:
             labels = labels.int()
 
