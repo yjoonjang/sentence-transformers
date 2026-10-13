@@ -40,6 +40,9 @@ def semantic_search_faiss(
     Only if these conditions are true, will we search for `top_k * rescore_multiplier` samples and then rescore to only
     keep `top_k`.
 
+    Scalar-quantized candidates are dequantized before rescoring. Use the same `ranges` or
+    `calibration_embeddings` that were used to quantize the corpus.
+
     Args:
         query_embeddings: Embeddings of the query sentences. Ideally not
             quantized to allow for rescoring.
@@ -136,6 +139,8 @@ def semantic_search_faiss(
                     'and pass `corpus_precision="..."` to `semantic_search_faiss`.'
                 )
 
+        if rescore_embeddings is not None and corpus_precision == "uint8" and ranges is None:
+            ranges = _get_quantization_ranges(query_embeddings, corpus_precision, calibration_embeddings)
         query_embeddings = quantize_embeddings(
             query_embeddings,
             precision=corpus_precision,
@@ -169,6 +174,12 @@ def semantic_search_faiss(
         if corpus_precision == "ubinary":
             top_k_embeddings = np.unpackbits(top_k_embeddings, axis=-1)[..., : rescore_embeddings.shape[-1]]
         top_k_embeddings = top_k_embeddings.astype(int)
+        if corpus_precision == "uint8":
+            top_k_embeddings = _dequantize_embeddings(
+                top_k_embeddings,
+                corpus_precision,
+                ranges,
+            )
 
         # rescore_embeddings: [num_queries, embedding_dim]
         # top_k_embeddings: [num_queries, top_k, embedding_dim]
@@ -223,6 +234,9 @@ def semantic_search_usearch(
     3. The corpus is quantized, i.e. the corpus precision is not float32
     Only if these conditions are true, will we search for `top_k * rescore_multiplier` samples and then rescore to only
     keep `top_k`.
+
+    Scalar-quantized candidates are dequantized before rescoring. Use the same `ranges` or
+    `calibration_embeddings` that were used to quantize the corpus.
 
     Args:
         query_embeddings: Embeddings of the query sentences. Ideally not
@@ -330,6 +344,8 @@ def semantic_search_usearch(
                     'and pass `corpus_precision="..."` to `semantic_search_usearch`.'
                 )
 
+        if rescore_embeddings is not None and corpus_precision == "int8" and ranges is None:
+            ranges = _get_quantization_ranges(query_embeddings, corpus_precision, calibration_embeddings)
         query_embeddings = quantize_embeddings(
             query_embeddings,
             precision=corpus_precision,
@@ -371,6 +387,12 @@ def semantic_search_usearch(
                 ..., : rescore_embeddings.shape[-1]
             ]
         top_k_embeddings = top_k_embeddings.astype(int)
+        if corpus_precision == "int8":
+            top_k_embeddings = _dequantize_embeddings(
+                top_k_embeddings,
+                corpus_precision,
+                ranges,
+            )
 
         # rescore_embeddings: [num_queries, embedding_dim]
         # top_k_embeddings: [num_queries, top_k, embedding_dim]
@@ -404,6 +426,38 @@ def semantic_search_usearch(
     if output_index:
         outputs = (*outputs, corpus_index)
     return outputs
+
+
+def _get_quantization_ranges(
+    embeddings: np.ndarray,
+    precision: Literal["int8", "uint8"],
+    calibration_embeddings: np.ndarray | None,
+) -> np.ndarray:
+    if calibration_embeddings is None:
+        if embeddings.shape[0] < 100:
+            logger.warning(
+                f"Computing {precision} quantization buckets based on {len(embeddings)} embedding{'s' if len(embeddings) != 1 else ''}."
+                f" {precision} quantization is more stable with `ranges` calculated from more embeddings "
+                "or a `calibration_embeddings` that can be used to calculate the buckets."
+            )
+        calibration_embeddings = embeddings
+    return np.vstack((np.min(calibration_embeddings, axis=0), np.max(calibration_embeddings, axis=0)))
+
+
+def _dequantize_embeddings(
+    embeddings: np.ndarray,
+    precision: Literal["int8", "uint8"],
+    ranges: np.ndarray,
+) -> np.ndarray:
+    """Restore scalar-quantized candidates to the coordinate system of the float query."""
+    ranges = ranges.astype(np.float32, copy=False)
+    steps = (ranges[1] - ranges[0]) / 255
+    steps = np.where(steps == 0, 1, steps)
+    # Convert before undoing the signed offset to avoid overflowing int8.
+    embeddings = embeddings.astype(np.float64)
+    if precision == "int8":
+        embeddings += 128
+    return embeddings * steps + ranges[0]
 
 
 def quantize_embeddings(
@@ -480,16 +534,7 @@ def quantize_embeddings(
     if precision.endswith("int8"):
         # Either use the 1. provided ranges, 2. the calibration dataset or 3. the provided embeddings
         if ranges is None:
-            if calibration_embeddings is not None:
-                ranges = np.vstack((np.min(calibration_embeddings, axis=0), np.max(calibration_embeddings, axis=0)))
-            else:
-                if embeddings.shape[0] < 100:
-                    logger.warning(
-                        f"Computing {precision} quantization buckets based on {len(embeddings)} embedding{'s' if len(embeddings) != 1 else ''}."
-                        f" {precision} quantization is more stable with `ranges` calculated from more embeddings "
-                        "or a `calibration_embeddings` that can be used to calculate the buckets."
-                    )
-                ranges = np.vstack((np.min(embeddings, axis=0), np.max(embeddings, axis=0)))
+            ranges = _get_quantization_ranges(embeddings, precision, calibration_embeddings)
         ranges = ranges.astype(np.float32, copy=False)
         starts = ranges[0, :]
         steps = (ranges[1, :] - starts) / 255
