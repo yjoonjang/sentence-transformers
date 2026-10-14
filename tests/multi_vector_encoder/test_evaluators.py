@@ -319,6 +319,46 @@ def test_distillation_evaluator_per_query_candidate_sets(model: MultiVectorEncod
     assert results["distill_kd_kl_divergence"] >= 0.0
 
 
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize(
+    ("device", "dtype", "grad_mode"),
+    [
+        pytest.param("cpu", torch.float32, "leaf", id="cpu-grad"),
+        pytest.param("cpu", torch.float64, "nonleaf", id="cpu-cast-grad"),
+        pytest.param(
+            "cuda",
+            torch.float32,
+            "none",
+            id="cuda",
+            marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable"),
+        ),
+    ],
+)
+def test_distillation_evaluator_tensor_scores(
+    model: MultiVectorEncoder, nested: bool, dtype: torch.dtype, grad_mode: str, device: str
+) -> None:
+    queries = ["What is the capital of France?", "Who painted the Mona Lisa?"]
+    documents = ["Paris is the capital of France.", "Leonardo da Vinci painted the Mona Lisa."]
+    scores = [5.0, 3.0]
+    if nested:
+        documents = [
+            [documents[0], "Berlin is the capital of Germany."],
+            [documents[1], "Van Gogh painted The Starry Night."],
+        ]
+        scores = [[5.0, 1.0], [4.5, 0.5]]
+    leaf_scores = torch.tensor(scores, dtype=dtype, device=device, requires_grad=grad_mode != "none")
+    tensor_scores = leaf_scores * 1.0 if grad_mode == "nonleaf" else leaf_scores
+    expected = MultiVectorDistillationEvaluator(queries, documents, scores, write_csv=False)(model)
+    evaluator = MultiVectorDistillationEvaluator(queries, documents, tensor_scores, write_csv=False)
+
+    assert evaluator(model) == pytest.approx(expected)
+    torch.testing.assert_close(tensor_scores, torch.tensor(scores, dtype=dtype, device=device))
+    assert tensor_scores.requires_grad == (grad_mode != "none")
+    if grad_mode != "none":
+        tensor_scores.sum().backward()
+        torch.testing.assert_close(leaf_scores.grad, torch.ones_like(leaf_scores))
+
+
 def _student_kd_scores(model: MultiVectorEncoder, queries: list[str], documents: list[list[str]]) -> torch.Tensor:
     """Mirror the evaluator's student MaxSim scoring so teacher scores can be built from it."""
     n_ways = len(documents[0])
