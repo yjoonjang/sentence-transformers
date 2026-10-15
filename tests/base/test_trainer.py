@@ -237,6 +237,39 @@ def test_track_loss_components_detaches_the_accumulated_values() -> None:
     assert accumulated.item() == pytest.approx(12.0)
 
 
+@pytest.mark.parametrize("nonfinite", [float("nan"), float("inf"), -float("inf")])
+@pytest.mark.parametrize(
+    ("training", "num_calls", "global_step"),
+    [
+        (True, 4, 1),  # gradient accumulation: 4 loss calls, 1 optimizer step since the last log
+        (False, 99, 0),  # evaluation: 99 batches, no optimizer step since the last log
+    ],
+)
+def test_track_loss_components_replaces_nonfinite_with_the_running_mean(
+    training: bool, num_calls: int, global_step: int, nonfinite: float
+) -> None:
+    trainer = SimpleNamespace(
+        args=SimpleNamespace(logging_nan_inf_filter=True),
+        model=SimpleNamespace(training=training),
+        accum_loss_components={"train": {}, "eval": {}},
+        state=SimpleNamespace(global_step=global_step),
+        _globalstep_last_logged=0,
+    )
+    for value in range(1, num_calls + 1):
+        SentenceTransformerTrainer.track_loss_components(trainer, {"base_loss": torch.tensor(float(value))})
+    SentenceTransformerTrainer.track_loss_components(trainer, {"base_loss": torch.tensor(nonfinite)})
+
+    accum = trainer.accum_loss_components["train" if training else "eval"]
+    assert (accum["base_loss"] / accum["steps"]).item() == pytest.approx((num_calls + 1) / 2)
+
+    # log() resets the accumulators but retains their keys.
+    accum["base_loss"].zero_()
+    accum["steps"].zero_()
+    SentenceTransformerTrainer.track_loss_components(trainer, {"base_loss": torch.tensor(nonfinite)})
+    assert accum["base_loss"].item() == 0.0
+    assert accum["steps"].item() == 1
+
+
 def _run_ddp_evaluation_loop(
     rank: int, world_size: int, port: int, tmp_dir: str, sharded_backend: str | None = None
 ) -> None:
