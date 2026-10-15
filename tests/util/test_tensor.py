@@ -70,6 +70,16 @@ def test_normalize_embeddings_single_vector() -> None:
     assert torch.allclose(normalized, embedding / 5.0)
 
 
+@pytest.mark.parametrize("values", [[3.0, -4.0, 0.0, 0.0], [0.0, 0.0], [], [1e-15, 0.0]])
+def test_normalize_embeddings_single_sparse_vector(values: list[float]) -> None:
+    embedding = torch.tensor(values)
+    normalized = normalize_embeddings(embedding.to_sparse())
+
+    assert normalized.is_sparse
+    assert normalized.shape == embedding.shape
+    torch.testing.assert_close(normalized.to_dense(), normalize_embeddings(embedding))
+
+
 @pytest.mark.parametrize(("array_fn", "dtype"), [(torch.tensor, torch.float32), (np.array, torch.float64)])
 def test_select_max_active_dims_keeps_top_k_without_mutating_input(array_fn, dtype: torch.dtype) -> None:
     """The top-k values by absolute value are kept with their signs, in a new tensor, leaving the input untouched."""
