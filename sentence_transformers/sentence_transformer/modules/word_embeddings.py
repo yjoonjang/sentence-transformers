@@ -73,7 +73,7 @@ class WordEmbeddings(InputModule):
             inputs = self._prepend_prompt(inputs, prompt)
         tokenized_texts = [self.tokenizer.tokenize(text, **kwargs) for text in inputs]
         sentence_lengths = [len(tokens) for tokens in tokenized_texts]
-        max_len = max(sentence_lengths)
+        max_len = max(1, max(sentence_lengths))
 
         input_ids = []
         attention_masks = []

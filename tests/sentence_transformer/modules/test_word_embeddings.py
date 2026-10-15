@@ -8,7 +8,7 @@ import torch
 
 import sentence_transformers.sentence_transformer.modules.word_embeddings as word_embeddings_module
 from sentence_transformers import SentenceTransformer
-from sentence_transformers.sentence_transformer.modules import WordEmbeddings
+from sentence_transformers.sentence_transformer.modules import CNN, LSTM, Pooling, WordEmbeddings
 from sentence_transformers.sentence_transformer.modules.tokenizer import WhitespaceTokenizer
 
 
@@ -114,3 +114,23 @@ def test_hf_tokenizer_preprocess_returns_token_id_lists(stsb_bert_tiny_model: Se
     torch.testing.assert_close(output["input_ids"], expected["input_ids"])
     torch.testing.assert_close(output["attention_mask"], expected["attention_mask"])
     torch.testing.assert_close(output["sentence_lengths"], expected["attention_mask"].sum(dim=1))
+
+
+@pytest.mark.parametrize(
+    "encoder", [lambda: LSTM(2, 2), lambda: CNN(2, out_channels=2, kernel_sizes=[1, 3])], ids=["lstm", "cnn"]
+)
+@pytest.mark.parametrize("batch_size", [1, 2])
+def test_word_embeddings_encode_empty_tokens_batch_invariance(encoder, batch_size):
+    words = WordEmbeddings(
+        tokenizer=WhitespaceTokenizer(vocab=["PADDING_TOKEN", "hello", "world"]),
+        embedding_weights=torch.tensor([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]]),
+    )
+    encoder = encoder()
+    model = SentenceTransformer(modules=[words, encoder, Pooling(encoder.get_embedding_dimension())], device="cpu")
+    texts = ["hello world", "", "unknownword", "the"]
+    expected = model.encode(texts, batch_size=len(texts), convert_to_tensor=True)
+
+    embeddings = model.encode(texts, batch_size=batch_size, convert_to_tensor=True)
+
+    torch.testing.assert_close(embeddings, expected)
+    torch.testing.assert_close(embeddings[1:], torch.zeros_like(embeddings[1:]))
