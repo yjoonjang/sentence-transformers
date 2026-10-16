@@ -179,6 +179,42 @@ def test_paraphrase_mining_embeddings_top_k_is_per_sentence(
     assert [score for score, _, _ in pairs] == pytest.approx([score for score, _, _ in expected])
 
 
+@pytest.mark.parametrize("corpus_chunk_size", [1, 2, 3])
+@pytest.mark.parametrize("query_chunk_size", [1, 2, 3])
+@pytest.mark.parametrize(
+    ("top_k", "expected"),
+    [
+        (0, []),
+        (1, [[6, 1, 2], [3, 0, 2]]),
+        (2, [[6, 1, 2], [3, 0, 2], [2, 0, 1]]),
+        (5, [[6, 1, 2], [3, 0, 2], [2, 0, 1]]),
+    ],
+)
+def test_paraphrase_mining_embeddings_dot_product_excludes_self(
+    query_chunk_size: int, corpus_chunk_size: int, top_k: int, expected: list[list[float | int]]
+) -> None:
+    pairs = paraphrase_mining_embeddings(
+        torch.tensor([[1.0], [2.0], [3.0]]),
+        query_chunk_size=query_chunk_size,
+        corpus_chunk_size=corpus_chunk_size,
+        top_k=top_k,
+        score_function=dot_score,
+    )
+
+    assert pairs == expected
+
+
+def test_paraphrase_mining_embeddings_preserves_score_buffer() -> None:
+    embeddings = torch.tensor([[1.0], [2.0], [3.0]])
+    scores = dot_score(embeddings, embeddings)
+    original_scores = scores.clone()
+
+    pairs = paraphrase_mining_embeddings(embeddings, top_k=1, score_function=lambda a, b: scores)
+
+    assert pairs == [[6, 1, 2], [3, 0, 2]]
+    torch.testing.assert_close(scores, original_scores)
+
+
 def test_community_detection_two_clear_communities():
     """Test case with two clear communities."""
     embeddings = torch.tensor(

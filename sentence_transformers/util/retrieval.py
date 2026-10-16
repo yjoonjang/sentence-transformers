@@ -111,8 +111,6 @@ def paraphrase_mining_embeddings(
         List[List[Union[float, int]]]: Returns a list of triplets with the format [score, id1, id2]
     """
 
-    top_k += 1  # A sentence has the highest similarity to itself. Increase +1 as we are interest in distinct pairs
-
     # Mine for duplicates
     pairs = []  # Min-heap of (score, i, j) with i < j, capped at max_pairs entries
     queued_pairs = set()  # The (i, j) of every pair currently in `pairs`
@@ -127,7 +125,7 @@ def paraphrase_mining_embeddings(
             scores = score_function(
                 query_embeddings, embeddings[corpus_start_idx : corpus_start_idx + corpus_chunk_size]
             ).detach()
-            chunk_values, chunk_idx = torch.topk(scores, min(top_k, len(scores[0])), dim=1, largest=True, sorted=False)
+            chunk_values, chunk_idx = torch.topk(scores, min(top_k + 1, len(scores[0])), dim=1, largest=True)
             chunk_idx = chunk_idx + corpus_start_idx
 
             if scores_top_k_values is None:
@@ -135,7 +133,7 @@ def paraphrase_mining_embeddings(
             else:
                 values = torch.cat([scores_top_k_values, chunk_values], dim=1)
                 idx = torch.cat([scores_top_k_idx, chunk_idx], dim=1)
-                scores_top_k_values, top_pos = torch.topk(values, min(top_k, len(values[0])), dim=1, sorted=False)
+                scores_top_k_values, top_pos = torch.topk(values, min(top_k + 1, len(values[0])), dim=1)
                 scores_top_k_idx = torch.gather(idx, 1, top_pos)
 
         scores_top_k_values = scores_top_k_values.cpu().tolist()
@@ -143,8 +141,11 @@ def paraphrase_mining_embeddings(
 
         for query_itr in range(len(scores_top_k_values)):
             i = query_start_idx + query_itr
-            for j, score in zip(scores_top_k_idx[query_itr], scores_top_k_values[query_itr]):
-                if i == j or score <= min_score:
+            neighbours = [
+                (j, score) for j, score in zip(scores_top_k_idx[query_itr], scores_top_k_values[query_itr]) if i != j
+            ][:top_k]
+            for j, score in neighbours:
+                if score <= min_score:
                     continue
 
                 pair = (i, j) if i < j else (j, i)
