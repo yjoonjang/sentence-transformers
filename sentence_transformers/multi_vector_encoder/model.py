@@ -763,10 +763,9 @@ class MultiVectorEncoder(BaseModel):
             device (str, torch.device, list, or None): Device(s) for computation. A single device moves the
                 model there unless a `device_map` or Accelerate hooks control placement, a list uses multi-process encoding, and
                 None uses the model's current device. Defaults to None.
-            normalize_embeddings (bool, optional): If True, L2-normalize each per-token embedding before
-                returning. Use this when the loaded pipeline does not include a :class:`Normalize` module
-                but you still want unit-norm vectors. No-op when a token-level ``Normalize`` already ran.
-                Defaults to False.
+            normalize_embeddings (bool, optional): If True, L2-normalize each per-token embedding after
+                the pipeline and before per-call token pooling. Use this when the loaded pipeline does
+                not include a :class:`Normalize` module but you still want unit-norm vectors. Defaults to False.
             pool (dict, optional): A multi-process pool created via :meth:`start_multi_process_pool`.
             chunk_size (int, optional): Chunk size for multi-process encoding.
             token_pooling (BaseTokenPooling, optional): Per-call token pooling applied after the pipeline
