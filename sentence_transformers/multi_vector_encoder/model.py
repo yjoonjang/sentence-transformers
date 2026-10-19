@@ -884,7 +884,7 @@ class MultiVectorEncoder(BaseModel):
 
             with torch.inference_mode():
                 # Route through __call__ so that model.compile() applies to the forward pass.
-                features = self(features, task=task)
+                features = self(features, task=task, **kwargs)
                 if output_value is None:
                     # Unlike normalization, pooling applies here, as ST's truncate_dim does.
                     # The pooling's own ``tasks`` gate decides whether this task is pooled.
