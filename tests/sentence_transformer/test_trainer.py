@@ -10,7 +10,7 @@ import pytest
 import torch
 from packaging.version import parse as parse_version
 from tokenizers.processors import TemplateProcessing
-from torch.utils.data import ConcatDataset, DataLoader
+from torch.utils.data import BatchSampler, ConcatDataset, DataLoader, SequentialSampler
 from transformers import __version__ as transformers_version
 from transformers.trainer_utils import EvalLoopOutput
 
@@ -1283,3 +1283,22 @@ def test_training_updates_loss_weights(stsb_bert_tiny_model, tmp_path, monkeypat
 
     assert not torch.equal(loss.classifier.weight.detach(), classifier_weight)
     assert all(parameter.grad is None for parameter in loss.parameters())
+
+
+def test_fit_with_custom_batch_sampler(stsb_bert_tiny_model, tmp_path, monkeypatch, caplog) -> None:
+    model = stsb_bert_tiny_model
+    monkeypatch.chdir(tmp_path)
+
+    def check_batch_size(trainer, **kwargs):
+        assert trainer.args.per_device_train_batch_size == 4
+
+    monkeypatch.setattr(SentenceTransformerTrainer, "train", check_batch_size)
+
+    examples = [InputExample(texts=[f"This is sentence {idx}", f"This is another sentence {idx}"]) for idx in range(8)]
+    batch_sampler = BatchSampler(SequentialSampler(examples), batch_size=4, drop_last=False)
+    model.fit(
+        train_objectives=[(DataLoader(examples, batch_sampler=batch_sampler), MultipleNegativesRankingLoss(model))],
+        epochs=1,
+        show_progress_bar=False,
+    )
+    assert "uses a custom `batch_sampler`, whose batch grouping `fit()` does not preserve" in caplog.text
