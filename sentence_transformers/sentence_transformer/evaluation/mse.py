@@ -118,7 +118,7 @@ class MSEEvaluator(BaseEvaluator):
         target_embeddings = self.embed_inputs(model, self.target_sentences)
 
         mse = ((self.source_embeddings - target_embeddings) ** 2).mean()
-        mse = mse * 100
+        mse = (mse * 100).item()
 
         logger.info(f"MSE evaluation (lower = better) on the {self.name} dataset{out_txt}:")
         logger.info(f"MSE (*100):\t{mse:4f}")
