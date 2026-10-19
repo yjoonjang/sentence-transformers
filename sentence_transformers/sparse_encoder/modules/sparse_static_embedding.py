@@ -205,7 +205,7 @@ class SparseStaticEmbedding(InputModule):
                 path,
                 tokenizer,
                 token=token,
-                cache_dir=cache_folder,
+                cache_folder=cache_folder,
                 revision=revision,
                 local_files_only=local_files_only,
                 **config,
