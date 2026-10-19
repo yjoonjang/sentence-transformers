@@ -7,6 +7,7 @@ import os
 import re
 from copy import deepcopy
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -14,10 +15,10 @@ from torch import nn
 
 from sentence_transformers import SentenceTransformer, SentenceTransformerTrainer, SentenceTransformerTrainingArguments
 from sentence_transformers.base.modality_types import Modality
-from sentence_transformers.base.modules import Dense, Router
+from sentence_transformers.base.modules import Dense, Module, Normalize, Router
 from sentence_transformers.base.modules.input_module import InputModule
 from sentence_transformers.sentence_transformer.losses import MultipleNegativesRankingLoss
-from sentence_transformers.sentence_transformer.modules import Normalize, StaticEmbedding
+from sentence_transformers.sentence_transformer.modules import StaticEmbedding
 from sentence_transformers.util import is_datasets_available
 
 from sentence_transformers.models import Asym  # isort:skip  Softly deprecated import
@@ -42,6 +43,21 @@ class MockModule(InputModule):
         pass
 
 
+class HookRecordingModule(Module):
+    def __init__(self):
+        super().__init__()
+        self.ready_model = None
+
+    def forward(self, features):
+        return features
+
+    def on_model_ready(self, model) -> None:
+        self.ready_model = model
+
+    def save(self, output_path: str, *args, safe_serialization: bool = True, **kwargs) -> None:
+        pass
+
+
 class MockModuleWithModalities(MockModule):
     def __init__(self, modalities: list[Modality]):
         super().__init__()
@@ -56,6 +72,19 @@ class MockModuleWithMaxLength(MockModule):
     def __init__(self, max_seq_length=32):
         super().__init__()
         self.max_seq_length = max_seq_length
+
+
+class TaskRecordingModule(MockModule):
+    """Records the ``task`` its preprocess was called with, so routing and per-task preprocessing
+    can be told apart."""
+
+    def __init__(self):
+        super().__init__()
+        self.seen_tasks = []
+
+    def preprocess(self, inputs, prompt=None, task=None, **kwargs):
+        self.seen_tasks.append(task)
+        return {}
 
 
 class InvertMockModule(MockModule):
@@ -255,6 +284,28 @@ def test_router_encode(static_embedding):
         model.encode(doc_texts)
 
 
+def test_router_task_not_forwarded_to_auto_model(stsb_bert_tiny_model, monkeypatch):
+    """Router.preprocess stamps features["task"] for routing, but that bookkeeping key must not
+    reach the wrapped auto_model.forward (ONNX backends warn on every such unexpected kwarg)."""
+    transformer, pooling = stsb_bert_tiny_model[0], stsb_bert_tiny_model[1]
+    router = Router({"query": [transformer, pooling], "document": [transformer, pooling]})
+    model = SentenceTransformer(modules=[router])
+
+    captured = {}
+    original_forward = transformer.model.forward
+
+    def spy(**kwargs):
+        captured.update(kwargs)
+        return original_forward(**kwargs)
+
+    monkeypatch.setattr(transformer.model, "forward", spy)
+    embeddings = model.encode_query(["What is the capital of France?"])
+
+    assert embeddings.shape == (1, model.get_embedding_dimension())
+    assert "input_ids" in captured
+    assert "task" not in captured
+
+
 def test_router_is_alias_for_asym():
     """Test that Router is an alias for Asym."""
 
@@ -343,6 +394,18 @@ def test_router_save_load(static_embedding: StaticEmbedding, tmp_path: Path):
     # Verify embeddings are the same
     assert (query_embeddings_original == query_embeddings_loaded).all()
     assert (doc_embeddings_original == doc_embeddings_loaded).all()
+
+
+@pytest.mark.parametrize("safe_serialization", [True, False])
+@pytest.mark.parametrize("share_module", [True, False])
+def test_router_save_load_preserves_shared_modules(tmp_path: Path, share_module: bool, safe_serialization: bool):
+    query = Dense(2, 2)
+    document = query if share_module else deepcopy(query)
+    router = Router.for_query_document([query], [document])
+    router.save(str(tmp_path), safe_serialization=safe_serialization)
+
+    loaded = Router.load(str(tmp_path), local_files_only=True)
+    assert (loaded.sub_modules["query"][0] is loaded.sub_modules["document"][0]) == share_module
 
 
 def test_router_save_load_with_custom_default_route(static_embedding: StaticEmbedding, tmp_path: Path):
@@ -603,7 +666,7 @@ def test_router_load_with_config(
 
     # Create and save a Router
     query_module = static_embedding
-    doc_module = static_embedding
+    doc_module = deepcopy(static_embedding)
 
     router = Router({"query": [query_module], "document": [doc_module]}, default_route="query")
     model = SentenceTransformer(modules=[router])
@@ -666,7 +729,7 @@ def test_router_load_forwards_trust_remote_code(
         local_files_only=True,
     )
 
-    assert len(captured) == 2  # one resolution per child route
+    assert len(captured) == 1  # one resolution for the shared child module
     for call in captured:
         assert call["trust_remote_code"] is True
         assert call["model_name_or_path"] == str(tmp_path)
@@ -745,8 +808,9 @@ def test_router_as_middle_module(static_embedding: StaticEmbedding, tmp_path: Pa
     model_path = os.path.join(tmp_path, "test_model")
     model.save(model_path)
 
-    # Load the model
-    loaded_model = SentenceTransformer(model_path)
+    # Load the model. The saved Router references the test-local InvertMockModule class, a
+    # non-ST module class that requires opting in since v6.0.
+    loaded_model = SentenceTransformer(model_path, trust_remote_code=True)
 
     # Verify loaded model structure
     assert len(list(loaded_model.children())) == 3
@@ -1438,3 +1502,109 @@ def test_router_forward_unsorted_tuple_modality_from_features():
     result = router.forward(features)
     # InvertMockModule negates the embedding, confirming multimodal_route was used
     assert torch.equal(result["sentence_embedding"], -embedding)
+
+
+def test_router_forwards_on_model_ready_to_routed_modules():
+    """Routed modules are invisible to the model's top-level module list, so the Router forwards the
+    hook. Without it they never resolve their model-dependent state (e.g. MultiVectorMask's skiplist)."""
+    query_hook = HookRecordingModule()
+    document_hook = HookRecordingModule()
+    router = Router({"query": [MockModule(), query_hook], "document": [MockModule(), document_hook]})
+
+    model = SentenceTransformer(modules=[router])
+
+    assert query_hook.ready_model is model
+    assert document_hook.ready_model is model
+
+
+def test_router_forwards_task_to_sub_module_preprocess():
+    """The route is resolved from ``task``, but input modules also read it to apply per-task
+    preprocessing (e.g. a Transformer's ``query_length`` / ``document_length``), so it must reach
+    them rather than being consumed by the routing."""
+    query_module = TaskRecordingModule()
+    document_module = TaskRecordingModule()
+    router = Router.for_query_document(query_modules=[query_module], document_modules=[document_module])
+
+    router.preprocess(["a query"], task="query")
+    router.preprocess(["a document"], task="document")
+
+    assert query_module.seen_tasks == ["query"]
+    assert document_module.seen_tasks == ["document"]
+
+
+@pytest.mark.parametrize(
+    "path", ["../outside_model", "/outside_model", r"C:\outside_model", r"\\server\share\outside_model"]
+)
+def test_router_validates_all_paths_before_resolving_classes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, path: str
+) -> None:
+    router_path = tmp_path / "nested" / "router"
+    router_path.mkdir(parents=True)
+    config = {
+        "types": {"valid": "sentence_transformers.models.Normalize", path: "sentence_transformers.models.Dense"},
+        "structure": {"query": ["valid", path]},
+        "parameters": {},
+    }
+    (router_path / "router_config.json").write_text(json.dumps(config))
+    resolve_class = MagicMock(side_effect=AssertionError("Module class resolution must not run"))
+    monkeypatch.setattr("sentence_transformers.base.modules.router.import_module_class", resolve_class)
+
+    with pytest.raises(ValueError, match="Invalid model path"):
+        Router.load(str(tmp_path), subfolder="nested/router", local_files_only=True)
+    resolve_class.assert_not_called()
+
+
+def test_nested_router_roundtrip(tmp_path: Path) -> None:
+    dense = Dense(4, 2, bias=False, activation_function=nn.Identity())
+    router = Router({"query": [Router({"query": [dense]}, default_route="query")]}, default_route="query")
+    router.save(str(tmp_path))
+
+    loaded = Router.load(str(tmp_path), local_files_only=True)
+    inputs = torch.randn(3, 4)
+    actual = loaded({"sentence_embedding": inputs}, task="query")["sentence_embedding"]
+    torch.testing.assert_close(actual, inputs @ dense.linear.weight.T)
+
+
+def test_router_roundtrip_with_nested_route_name(tmp_path: Path) -> None:
+    dense = Dense(4, 2, bias=False, activation_function=nn.Identity())
+    route = "nested/query"
+    router = Router({route: [dense]}, default_route=route)
+    router.save(str(tmp_path))
+
+    loaded = Router.load(str(tmp_path), local_files_only=True)
+    inputs = torch.randn(3, 4)
+    actual = loaded({"sentence_embedding": inputs}, task=route)["sentence_embedding"]
+    torch.testing.assert_close(actual, inputs @ dense.linear.weight.T)
+
+
+@pytest.mark.parametrize("external", [False, True])
+def test_legacy_router_module_paths(tmp_path: Path, external: bool) -> None:
+    loaded_paths = []
+
+    class LegacyDense(Dense):
+        @staticmethod
+        def load(input_path):
+            loaded_paths.append(Path(input_path))
+            return Dense.load(input_path, local_files_only=True)
+
+    model_path = tmp_path / "model"
+    model_path.mkdir()
+    module_path = tmp_path / "outside_model" if external else model_path / "nested" / "dense"
+    module_path.mkdir(parents=True)
+    Dense(4, 2).save(str(module_path))
+    path = "../outside_model" if external else "nested/dense"
+    module_classes = {"test.LegacyDense": LegacyDense}
+
+    config = {"types": {path: "test.LegacyDense"}, "structure": {"query": [path]}, "parameters": {}}
+    (model_path / "router_config.json").write_text(json.dumps(config))
+
+    def load():
+        return Router.load(str(model_path), module_classes=module_classes, local_files_only=True)
+
+    if external:
+        with pytest.raises(ValueError, match="Invalid model path"):
+            load()
+        assert loaded_paths == []
+    else:
+        load()
+        assert loaded_paths == [module_path]

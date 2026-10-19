@@ -237,11 +237,11 @@ def test_inference_free_splade_max_active_dims_routing(inference_free_splade_ber
     query = "What is the capital of France?"
     document = "The capital of France is Paris."
 
-    # Encode without max_active_dims — baseline
+    # Encode without max_active_dims: baseline
     query_emb = model.encode_query(query)
     doc_emb = model.encode_document(document)
 
-    # Encode with max_active_dims — should route to the same sub-modules
+    # Encode with max_active_dims: should route to the same sub-modules
     query_emb_mad = model.encode_query(query, max_active_dims=50)
     doc_emb_mad = model.encode_document(document, max_active_dims=50)
 
@@ -318,7 +318,13 @@ def test_max_active_dims_set_init(splade_bert_tiny_model: SparseEncoder, csr_ber
     splade_bert_tiny_model.save_pretrained(str(tmp_path / "splade_bert_tiny"))
     csr_bert_tiny_model.save_pretrained(str(tmp_path / "csr_bert_tiny"))
 
-    # Load the models with max_active_dims set
+    config_path = tmp_path / "splade_bert_tiny" / "config_sentence_transformers.json"
+    assert "max_active_dims" not in json.loads(config_path.read_text())
+    config_path = tmp_path / "csr_bert_tiny" / "config_sentence_transformers.json"
+    config = json.loads(config_path.read_text())
+    config.pop("max_active_dims", None)
+    config_path.write_text(json.dumps(config))
+
     loaded_model = SparseEncoder(str(tmp_path / "splade_bert_tiny"))
     assert loaded_model.max_active_dims is None
     loaded_model = SparseEncoder(str(tmp_path / "splade_bert_tiny"), max_active_dims=13)
@@ -328,6 +334,59 @@ def test_max_active_dims_set_init(splade_bert_tiny_model: SparseEncoder, csr_ber
     assert loaded_model.max_active_dims == 16  # Based on the SparseAutoEncoder's k value
     loaded_model = SparseEncoder(str(tmp_path / "csr_bert_tiny"), max_active_dims=13)
     assert loaded_model.max_active_dims == 13
+
+
+@pytest.mark.parametrize("model_fixture", ["splade_bert_tiny_model", "csr_bert_tiny_model"])
+@pytest.mark.parametrize("override", [None, 7])
+def test_max_active_dims_save_load(model_fixture: str, override: int | None, request: pytest.FixtureRequest, tmp_path):
+    model = request.getfixturevalue(model_fixture)
+    model.max_active_dims = 13
+    model.save_pretrained(str(tmp_path), create_model_card=False)
+    config = json.loads((tmp_path / "config_sentence_transformers.json").read_text())
+    assert config["max_active_dims"] == 13
+
+    loaded_model = SparseEncoder(str(tmp_path), max_active_dims=override)
+    expected_limit = override if override is not None else 13
+    assert loaded_model.max_active_dims == expected_limit
+    texts = ["The weather is nice!", "Plants use sunlight to make food."]
+    embeddings = loaded_model.encode(texts, convert_to_sparse_tensor=False)
+    expected = model.encode(texts, max_active_dims=expected_limit, convert_to_sparse_tensor=False)
+    torch.testing.assert_close(embeddings, expected)
+    assert (torch.count_nonzero(embeddings, dim=-1) <= expected_limit).all()
+
+
+def test_csr_max_active_dims_override_saved_limit(csr_bert_tiny_model: SparseEncoder, tmp_path):
+    model = csr_bert_tiny_model
+    model.max_active_dims = 13
+    model.save_pretrained(str(tmp_path), create_model_card=False)
+    loaded_model = SparseEncoder(str(tmp_path))
+    assert loaded_model.max_active_dims == 13
+    assert loaded_model[-1].k == 16
+
+    texts = ["The weather is nice!", "Plants use sunlight to make food."]
+    embeddings = loaded_model.encode(texts, max_active_dims=32, convert_to_sparse_tensor=False)
+    expected = model.encode(texts, max_active_dims=32, convert_to_sparse_tensor=False)
+    torch.testing.assert_close(embeddings, expected)
+    assert (torch.count_nonzero(embeddings, dim=-1) == 32).all()
+    assert loaded_model.max_active_dims == 13
+
+
+@pytest.mark.parametrize("max_active_dims", [0, -1, 1.5, "1", True, False])
+@pytest.mark.parametrize("from_config", [False, True])
+def test_max_active_dims_invalid(max_active_dims: int | float | str, from_config: bool, tmp_path):
+    if from_config:
+        model = SparseEncoder(modules=[SpladePooling()])
+        model.save_pretrained(str(tmp_path), create_model_card=False)
+        config_path = tmp_path / "config_sentence_transformers.json"
+        config = json.loads(config_path.read_text())
+        config["max_active_dims"] = max_active_dims
+        config_path.write_text(json.dumps(config))
+        kwargs = {"model_name_or_path": str(tmp_path)}
+    else:
+        kwargs = {"modules": [SpladePooling()], "max_active_dims": max_active_dims}
+
+    with pytest.raises(ValueError, match="max_active_dims must be a positive integer"):
+        SparseEncoder(**kwargs)
 
 
 def test_detect_mlm():
@@ -605,7 +664,11 @@ def test_get_model_kwargs(splade_bert_tiny_model: SparseEncoder) -> None:
         model.encode("Test sentence", task="document", foo=True, document_arg_1=12)
 
 
-@pytest.mark.parametrize("similarity_fn_name", SimilarityFunction.possible_values())
+# MaxSim is for multi-vector (3D) embeddings. SparseEncoder is single-vector so it's not applicable.
+@pytest.mark.parametrize(
+    "similarity_fn_name",
+    [v for v in SimilarityFunction.possible_values() if v in SparseEncoder.SUPPORTED_SIMILARITY_FN_NAMES],
+)
 def test_similarity_score(splade_bert_tiny_model: SparseEncoder, similarity_fn_name: str) -> None:
     model = splade_bert_tiny_model
     model.similarity_fn_name = similarity_fn_name
@@ -877,3 +940,72 @@ def test_encode_document_prompt_priority(splade_bert_tiny_model: SparseEncoder, 
     model.encode_document("test")
     _, kwargs = encode_calls[-1]
     assert kwargs["prompt_name"] is None
+
+
+def test_encode_routes_through_module_call(splade_bert_tiny_model: SparseEncoder) -> None:
+    """encode() must run the forward pass via __call__ so that model.compile() applies to inference."""
+    model = splade_bert_tiny_model
+    calls = []
+    handle = model.register_forward_hook(lambda module, args, output: calls.append(True))
+    try:
+        model.encode("Hello world")
+    finally:
+        handle.remove()
+    assert calls, "encode() should invoke the model via __call__, not call forward() directly"
+
+
+def test_similarity_fn_name_rejects_multi_vector_names(splade_bert_tiny_model: SparseEncoder) -> None:
+    """MaxSim scores ragged token embeddings: setting it on a sparse model would produce wrong shapes
+    silently, so it must fail loud with a pointer to MultiVectorEncoder."""
+    with pytest.raises(ValueError, match="MultiVectorEncoder"):
+        splade_bert_tiny_model.similarity_fn_name = "maxsim"
+
+
+def test_parse_model_config_ignores_multi_vector_similarity(splade_bert_tiny_model: SparseEncoder) -> None:
+    """A saved multi-vector similarity falls through to the default instead of raising in the strict
+    setter during config parsing."""
+    model = splade_bert_tiny_model
+    original = model._similarity_fn_name
+    try:
+        model._similarity_fn_name = None
+        model._parse_model_config({"similarity_fn_name": "maxsim"})
+        assert model._similarity_fn_name is None
+    finally:
+        model._similarity_fn_name = original
+
+
+def test_conversion_ignores_source_prompts_and_similarity(tmp_path) -> None:
+    """Converting a MultiVectorEncoder save rebuilds this family's default modules, so the source's
+    prompts, default_prompt_name and similarity_fn_name are not inherited (they would silently apply
+    to every encode call and persist on save). SentenceTransformer saves are the exception: their
+    modules are reused, see SparseEncoder._load_converted_modules."""
+    from sentence_transformers import MultiVectorEncoder
+
+    source = MultiVectorEncoder("sentence-transformers-testing/stsb-bert-tiny-safetensors")
+    source.prompts = {"query": "find: ", "document": "text: "}
+    source.default_prompt_name = "query"
+    source.save_pretrained(str(tmp_path))
+
+    model = SparseEncoder(str(tmp_path))
+    assert model.prompts == {"query": "", "document": ""}
+    assert model.default_prompt_name is None
+    assert model.similarity_fn_name == "dot"
+
+
+def test_conversion_from_sentence_transformer_keeps_prompts_and_similarity(tmp_path) -> None:
+    """The SentenceTransformer branch reuses the saved modules and appends a SparseAutoEncoder
+    (CSR), so the source's prompts and similarity stay meaningful for the kept backbone and survive.
+    Carrying the dense base's "cosine" over is what the CSR recipe wants, rather than the "dot" that
+    a SPLADE-shaped SparseEncoder defaults to."""
+    from sentence_transformers import SentenceTransformer
+
+    source = SentenceTransformer(
+        "sentence-transformers-testing/stsb-bert-tiny-safetensors",
+        prompts={"query": "Represent this sentence: "},
+    )
+    source.save_pretrained(str(tmp_path))
+
+    model = SparseEncoder(str(tmp_path))
+    assert isinstance(model[-1], SparseAutoEncoder)
+    assert model.prompts["query"] == "Represent this sentence: "
+    assert model.similarity_fn_name == "cosine"

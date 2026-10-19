@@ -1,0 +1,165 @@
+from __future__ import annotations
+
+import warnings
+
+import numpy as np
+import pytest
+import torch
+
+import sentence_transformers.sentence_transformer.modules.word_embeddings as word_embeddings_module
+from sentence_transformers import SentenceTransformer
+from sentence_transformers.sentence_transformer.modules import CNN, LSTM, Pooling, WordEmbeddings
+from sentence_transformers.sentence_transformer.modules.tokenizer import WhitespaceTokenizer
+
+
+@pytest.mark.parametrize("trust_remote_code", [False, True])
+def test_word_embeddings_load_routes_tokenizer_class_through_trust_gate(monkeypatch, trust_remote_code):
+    """`WordEmbeddings.load` must resolve the config-controlled `tokenizer_class` through the
+    `import_module_class` trust gate, forwarding `model_name_or_path` and the caller's `trust_remote_code`,
+    rather than a raw `import_from_string`. Otherwise an untrusted Hub model could point `tokenizer_class` at
+    an arbitrary dotted path and have it imported with no trust check (the same ungated-import class as the
+    module `type` field, see #3801). Passing both trust values pins that the caller's value is forwarded, not
+    a hardcoded default.
+    """
+    captured = {}
+
+    class FakeTokenizerClass:
+        @classmethod
+        def load(cls, path):
+            return WhitespaceTokenizer()
+
+    def fake_import_module_class(class_ref, **kwargs):
+        captured["class_ref"] = class_ref
+        captured["kwargs"] = kwargs
+        return FakeTokenizerClass
+
+    monkeypatch.setattr(word_embeddings_module, "import_module_class", fake_import_module_class)
+    monkeypatch.setattr(
+        WordEmbeddings,
+        "load_config",
+        classmethod(
+            lambda cls, **kwargs: {
+                "tokenizer_class": "attacker.evil.Tokenizer",
+                "update_embeddings": False,
+                "max_seq_length": 100,
+            }
+        ),
+    )
+    monkeypatch.setattr(WordEmbeddings, "load_dir_path", classmethod(lambda cls, **kwargs: "/fake/local/path"))
+    monkeypatch.setattr(
+        WordEmbeddings,
+        "load_torch_weights",
+        classmethod(lambda cls, **kwargs: {"emb_layer.weight": torch.zeros(3, 4)}),
+    )
+
+    model = WordEmbeddings.load("attacker/evil-word-embeddings", trust_remote_code=trust_remote_code)
+
+    assert isinstance(model, WordEmbeddings)
+    assert captured["class_ref"] == "attacker.evil.Tokenizer"
+    assert captured["kwargs"]["model_name_or_path"] == "attacker/evil-word-embeddings"
+    assert captured["kwargs"]["trust_remote_code"] is trust_remote_code
+
+
+def test_word_embeddings_save_load_round_trip_does_not_warn(tmp_path):
+    """A genuine WordEmbeddings model stores a `sentence_transformers.*` tokenizer class, so a real
+    save/load round-trip resolves through the gate's namespace allowlist (Path A) with no FutureWarning. This
+    guards against the trust gate regressing normal loading.
+    """
+    vocab = ["hello", "world", "foo"]
+    model = WordEmbeddings(
+        tokenizer=WhitespaceTokenizer(vocab=vocab),
+        embedding_weights=np.random.rand(len(vocab), 4).astype(np.float32),
+    )
+    model.save(str(tmp_path))
+
+    # A genuine model stores its tokenizer as a `sentence_transformers.*` ref, which is what routes loading
+    # through the gate's namespace allowlist (Path A) rather than the trust-gated fallback.
+    assert model.get_config_dict()["tokenizer_class"].startswith("sentence_transformers.")
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", FutureWarning)
+        loaded = WordEmbeddings.load(str(tmp_path))
+
+    assert isinstance(loaded, WordEmbeddings)
+    assert isinstance(loaded.tokenizer, WhitespaceTokenizer)
+    assert list(loaded.tokenizer.get_vocab()) == vocab
+
+
+def test_from_text_file_creates_independent_default_tokenizers(tmp_path):
+    """Loading another embedding file must not replace an earlier model's vocabulary."""
+    first_path = tmp_path / "first.txt"
+    first_path.write_text("apple 1 0\nbanana 0 1\n", encoding="utf-8")
+    second_path = tmp_path / "second.txt"
+    second_path.write_text("carrot 1 0\ndate 0 1\n", encoding="utf-8")
+
+    first_model = WordEmbeddings.from_text_file(str(first_path))
+    second_model = WordEmbeddings.from_text_file(str(second_path))
+
+    assert first_model.tokenizer is not second_model.tokenizer
+    assert list(first_model.tokenizer.get_vocab()) == ["PADDING_TOKEN", "apple", "banana"]
+    assert list(second_model.tokenizer.get_vocab()) == ["PADDING_TOKEN", "carrot", "date"]
+
+
+@pytest.mark.parametrize(
+    ("prompt", "expected_ids", "expected_embeddings"),
+    [
+        (None, [[1, 2], [2, 0]], [[0.5, 0.5], [0.0, 1.0]]),
+        ("alpha ", [[1, 1], [1, 2]], [[1.0, 0.0], [0.5, 0.5]]),
+    ],
+)
+def test_word_embeddings_respects_max_seq_length(prompt, expected_ids, expected_embeddings):
+    vocab = ["PADDING_TOKEN", "alpha", "beta", "gamma"]
+    weights = torch.tensor([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [9.0, 9.0]])
+    word_embeddings = WordEmbeddings(
+        tokenizer=WhitespaceTokenizer(vocab=vocab),
+        embedding_weights=weights,
+        max_seq_length=2,
+    )
+    model = SentenceTransformer(modules=[word_embeddings, Pooling(2, "mean")], device="cpu")
+    texts = ["alpha beta gamma", "beta"]
+    expected_mask = torch.tensor(expected_ids).ne(0).long()
+
+    features = model.preprocess(texts, prompt=prompt)
+    assert features["input_ids"].tolist() == expected_ids
+    torch.testing.assert_close(features["attention_mask"], expected_mask)
+    torch.testing.assert_close(features["sentence_lengths"], expected_mask.sum(dim=1))
+    torch.testing.assert_close(
+        model.encode(texts, prompt=prompt, convert_to_tensor=True),
+        torch.tensor(expected_embeddings),
+    )
+
+
+def test_hf_tokenizer_preprocess_returns_token_id_lists(stsb_bert_tiny_model: SentenceTransformer):
+    tokenizer = stsb_bert_tiny_model.tokenizer
+    model = WordEmbeddings(
+        tokenizer=tokenizer,
+        embedding_weights=torch.zeros(len(tokenizer), 4),
+    )
+    texts = ["hello world", "hello", ""]
+
+    output = model.preprocess(texts)
+    expected = tokenizer(texts, padding=True, return_tensors="pt")
+
+    torch.testing.assert_close(output["input_ids"], expected["input_ids"])
+    torch.testing.assert_close(output["attention_mask"], expected["attention_mask"])
+    torch.testing.assert_close(output["sentence_lengths"], expected["attention_mask"].sum(dim=1))
+
+
+@pytest.mark.parametrize(
+    "encoder", [lambda: LSTM(2, 2), lambda: CNN(2, out_channels=2, kernel_sizes=[1, 3])], ids=["lstm", "cnn"]
+)
+@pytest.mark.parametrize("batch_size", [1, 2])
+def test_word_embeddings_encode_empty_tokens_batch_invariance(encoder, batch_size):
+    words = WordEmbeddings(
+        tokenizer=WhitespaceTokenizer(vocab=["PADDING_TOKEN", "hello", "world"]),
+        embedding_weights=torch.tensor([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]]),
+    )
+    encoder = encoder()
+    model = SentenceTransformer(modules=[words, encoder, Pooling(encoder.get_embedding_dimension())], device="cpu")
+    texts = ["hello world", "", "unknownword", "the"]
+    expected = model.encode(texts, batch_size=len(texts), convert_to_tensor=True)
+
+    embeddings = model.encode(texts, batch_size=batch_size, convert_to_tensor=True)
+
+    torch.testing.assert_close(embeddings, expected)
+    torch.testing.assert_close(embeddings[1:], torch.zeros_like(embeddings[1:]))

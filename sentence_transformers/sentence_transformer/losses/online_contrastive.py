@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import warnings
 from collections.abc import Iterable
 from typing import Any
 
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from sentence_transformers.base.losses.merged_forward import embed_columns
 from sentence_transformers.sentence_transformer.model import SentenceTransformer
 
 from .contrastive import SiameseDistanceMetric
@@ -71,17 +73,37 @@ class OnlineContrastiveLoss(nn.Module):
         self.model = model
         self.margin = margin
         self.distance_metric = distance_metric
+        self._checked_labels = False
 
     def forward(self, sentence_features: Iterable[dict[str, Tensor]], labels: Tensor, size_average=False) -> Tensor:
-        embeddings = [self.model(sentence_feature)["sentence_embedding"] for sentence_feature in sentence_features]
+        embeddings = embed_columns(self.model, sentence_features)
+        return self.compute_loss_from_embeddings(embeddings, labels)
+
+    def compute_loss_from_embeddings(self, embeddings: list[Tensor], labels: Tensor) -> Tensor:
+        batch_size = embeddings[0].shape[0]
+        if labels.numel() != batch_size:
+            raise ValueError(
+                f"{self.__class__.__name__} expects {batch_size} labels (one per example), "
+                f"but got {labels.numel()} labels with shape {tuple(labels.shape)}."
+            )
+        labels = labels.view(-1)
+        if not self._checked_labels:
+            self._checked_labels = True
+            if labels.ne(0).logical_and(labels.ne(1)).any().item():
+                warnings.warn(
+                    "OnlineContrastiveLoss expects binary labels (0 or 1). Pairs with any other label are ignored, "
+                    "since they match neither the positive nor the negative set.",
+                    UserWarning,
+                    stacklevel=4,
+                )
 
         distance_matrix = self.distance_metric(embeddings[0], embeddings[1])
         negs = distance_matrix[labels == 0]
         poss = distance_matrix[labels == 1]
 
         # select hard positive and hard negative pairs
-        negative_pairs = negs[negs < (poss.max() if len(poss) > 1 else negs.mean())]
-        positive_pairs = poss[poss > (negs.min() if len(negs) > 1 else poss.mean())]
+        negative_pairs = negs[negs < (poss.max() if len(poss) else negs.mean())]
+        positive_pairs = poss[poss > (negs.min() if len(negs) else poss.mean())]
 
         positive_loss = positive_pairs.pow(2).sum()
         negative_loss = F.relu(self.margin - negative_pairs).pow(2).sum()

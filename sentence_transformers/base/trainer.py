@@ -9,7 +9,6 @@ import shutil
 from abc import ABC, abstractmethod
 from collections import OrderedDict
 from collections.abc import Callable
-from contextlib import nullcontext
 from functools import partial
 from typing import Any
 
@@ -47,7 +46,7 @@ from sentence_transformers.base.data_collator import BaseDataCollator
 from sentence_transformers.base.evaluation import BaseEvaluator, SequentialEvaluator
 from sentence_transformers.base.model import BaseModel
 from sentence_transformers.base.model_card import BaseModelCardCallback, BaseModelCardData
-from sentence_transformers.base.modules import Router
+from sentence_transformers.base.modules import Module, Router
 from sentence_transformers.base.sampler import (
     DefaultBatchSampler,
     GroupByLabelBatchSampler,
@@ -57,11 +56,15 @@ from sentence_transformers.base.sampler import (
     RoundRobinBatchSampler,
 )
 from sentence_transformers.base.training_args import BaseTrainingArguments, BatchSamplers, MultiDatasetBatchSamplers
-from sentence_transformers.util import disable_logging, fullname, is_datasets_available, is_training_available
+from sentence_transformers.util import fullname, is_datasets_available, is_training_available
 from sentence_transformers.util.decorators import deprecated_kwargs
+from sentence_transformers.util.distributed import distributed_evaluation
 
 if is_datasets_available():
-    from datasets import Dataset, DatasetDict, IterableDataset, IterableDatasetDict, Value
+    from datasets import Dataset, DatasetDict, IterableDataset, IterableDatasetDict, Sequence, Value
+
+if is_training_available():
+    from accelerate.utils import broadcast_object_list
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +74,16 @@ try:
     from transformers.integrations import TrackioCallback
 except ImportError:
     TrackioCallback = None
+
+
+class _OptimizerZeroGradCallback(TrainerCallback):
+    """Clear loss-owned gradients that the Transformers model.zero_grad() calls cannot reach."""
+
+    def on_train_begin(self, args, state, control, optimizer, **kwargs) -> None:
+        optimizer.zero_grad()
+
+    def on_step_end(self, args, state, control, optimizer, **kwargs) -> None:
+        optimizer.zero_grad()
 
 
 class BaseTrainer(Trainer, ABC):
@@ -235,9 +248,13 @@ class BaseTrainer(Trainer, ABC):
             if isinstance(dataset, IterableDataset) and dataset.column_names is None:
                 sample = next(iter(dataset))
                 naive_type_mapping = {str: "string", int: "int64", float: "float32", bool: "bool"}
-                example_features = {
-                    key: Value(naive_type_mapping.get(type(value), "null")) for key, value in sample.items()
-                }
+
+                def naive_feature(value: Any) -> Any:
+                    if isinstance(value, (list, tuple)):
+                        return Sequence(naive_feature(value[0]) if value else Value("string"))
+                    return Value(naive_type_mapping.get(type(value), "null"))
+
+                example_features = {key: naive_feature(value) for key, value in sample.items()}
                 raise ValueError(
                     f"The provided `{dataset_name}_dataset` must have Features. Specify them with e.g.:\n"
                     f"{dataset_name}_dataset = {dataset_name}_dataset.cast(Features({example_features}))\n"
@@ -327,7 +344,9 @@ class BaseTrainer(Trainer, ABC):
             self.train_dataset = self.preprocess_dataset(train_dataset, dataset_name="train")
         if self.eval_dataset is not None:
             self.eval_dataset = self.preprocess_dataset(eval_dataset, dataset_name="eval")
+        self._eval_dataloaders: dict[str, DataLoader] = {}
         self.add_model_card_callback(default_args_dict)
+        self.add_callback(_OptimizerZeroGradCallback())
 
     def get_data_collator(
         self,
@@ -368,6 +387,8 @@ class BaseTrainer(Trainer, ABC):
             preprocess_fn=model.preprocess,
             router_mapping=args.router_mapping,
             prompts=args.prompts,
+            # Only MultiVectorEncoderTrainingArguments defines max_length so far.
+            max_length=getattr(args, "max_length", None),
         )
 
     def add_model_card_callback(self, default_args_dict: dict[str, Any]) -> None:
@@ -419,7 +440,7 @@ class BaseTrainer(Trainer, ABC):
 
         for name, child in loss.named_children():
             if name == "model" and isinstance(child, BaseModel):
-                # DDP/compile wrappers don't expose BaseModel methods; bind the ones
+                # DDP/compile wrappers don't expose BaseModel methods. Bind the ones
                 # losses call inside `forward` (CE: `preprocess`, MatryoshkaLoss:
                 # `get_embedding_dimension`).
                 for attr in ("preprocess", "get_embedding_dimension"):
@@ -439,16 +460,6 @@ class BaseTrainer(Trainer, ABC):
             loss = loss.to(model.device)
         else:
             loss = loss(model).to(model.device)
-
-        # Enable per-sample media counting in Transformer.preprocess for losses that minibatch VLM inputs
-        if getattr(loss, "requires_media_counts", False):
-            if isinstance(model[0], Router):
-                input_modules = [route[0] for route in model[0].sub_modules.values()]  # type: ignore[index]
-            else:
-                input_modules = [model[0]]
-            for module in input_modules:
-                if hasattr(module, "track_media_counts"):
-                    module.track_media_counts = True
 
         return loss
 
@@ -510,15 +521,17 @@ class BaseTrainer(Trainer, ABC):
 
     def track_loss_components(self, loss: dict[str, torch.Tensor]) -> None:
         training_type = "train" if self.model.training else "eval"
+        steps = self.accum_loss_components[training_type].get("steps", 0)
         for key, value in loss.items():
+            # Accumulate free of the autograd graph, which would otherwise stay alive (with the
+            # gradient caches of the Cached* losses) until log() resets the accumulators.
+            value = value.detach()
             # if loss is nan or inf simply add the average of previous logged losses
             if self.args.logging_nan_inf_filter and (torch.isnan(value) or torch.isinf(value)):
-                if key not in self.accum_loss_components[training_type]:
+                if key not in self.accum_loss_components[training_type] or not steps:
                     value = torch.tensor(0.0, dtype=value.dtype, device=value.device)
                 else:
-                    value = self.accum_loss_components[training_type][key] / (
-                        1 + self.state.global_step - self._globalstep_last_logged
-                    )
+                    value = self.accum_loss_components[training_type][key] / steps
 
             if key not in self.accum_loss_components[training_type]:
                 self.accum_loss_components[training_type][key] = value
@@ -615,14 +628,13 @@ class BaseTrainer(Trainer, ABC):
 
     def evaluate(
         self,
-        eval_dataset: Dataset | dict[str, Dataset] | None = None,
+        eval_dataset: str | Dataset | dict[str, Dataset] | None = None,
         ignore_keys: list[str] | None = None,
         metric_key_prefix: str = "eval",
     ) -> dict[str, float]:
-        if eval_dataset is not None:
+        # None and str pass through: the superclass recurses over a dict self.eval_dataset by name
+        if eval_dataset is not None and not isinstance(eval_dataset, str):
             eval_dataset = self.preprocess_dataset(eval_dataset, dataset_name="eval")
-        else:
-            eval_dataset = self.eval_dataset
         return super().evaluate(eval_dataset, ignore_keys, metric_key_prefix)
 
     def evaluation_loop(
@@ -654,16 +666,24 @@ class BaseTrainer(Trainer, ABC):
             else:
                 return output
 
-        with nullcontext() if self.is_local_process_zero() else disable_logging(logging.INFO):
-            output_path = self.args.output_dir
-            if output_path is not None:
-                output_path = os.path.join(output_path, "eval")
-                os.makedirs(output_path, exist_ok=True)
-            evaluator_metrics = self.evaluator(
-                self.model, output_path=output_path, epoch=self.state.epoch, steps=self.state.global_step
-            )
-        if not isinstance(evaluator_metrics, dict):
-            evaluator_metrics = {"evaluator": evaluator_metrics}
+        with distributed_evaluation(
+            self.model, enabled=not self.is_fsdp_enabled and not self.is_deepspeed_enabled
+        ) as run_evaluator:
+            if run_evaluator:
+                output_path = self.args.output_dir if self.is_world_process_zero() else None
+                if output_path is not None:
+                    output_path = os.path.join(output_path, "eval")
+                    os.makedirs(output_path, exist_ok=True)
+                evaluator_metrics = self.evaluator(
+                    self.model, output_path=output_path, epoch=self.state.epoch, steps=self.state.global_step
+                )
+                if not isinstance(evaluator_metrics, dict):
+                    evaluator_metrics = {"evaluator": evaluator_metrics}
+            else:
+                evaluator_metrics = {}
+
+        # No-ops when there is nothing to broadcast to (single process, no distributed backend).
+        evaluator_metrics = broadcast_object_list([evaluator_metrics])[0]
 
         # Prefix all keys with metric_key_prefix + '_'
         for key in list(evaluator_metrics.keys()):
@@ -871,6 +891,7 @@ class BaseTrainer(Trainer, ABC):
                     drop_last=self.args.dataloader_drop_last,
                     valid_label_columns=data_collator.valid_label_columns,
                     generator=generator,
+                    seed=self.args.seed,
                 )
                 for sub_dataset in dataset.values()
             ]
@@ -891,6 +912,7 @@ class BaseTrainer(Trainer, ABC):
                 drop_last=self.args.dataloader_drop_last,
                 valid_label_columns=data_collator.valid_label_columns,
                 generator=generator,
+                seed=self.args.seed,
             )
             dataloader_params["batch_sampler"] = batch_sampler
         else:
@@ -921,15 +943,18 @@ class BaseTrainer(Trainer, ABC):
         )
         return self._train_dataloader
 
-    def get_eval_dataloader(self, eval_dataset: Dataset | DatasetDict | IterableDataset | None = None) -> DataLoader:
+    def get_eval_dataloader(
+        self, eval_dataset: str | Dataset | DatasetDict | IterableDataset | None = None
+    ) -> DataLoader:
         """
         Returns the evaluation [`~torch.utils.data.DataLoader`].
 
         Subclass and override this method if you want to inject some custom behavior.
 
         Args:
-            eval_dataset (`torch.utils.data.Dataset`, *optional*):
-                If provided, will override `self.eval_dataset`. If it is a [`~datasets.Dataset`], columns not accepted
+            eval_dataset (`str` or `torch.utils.data.Dataset`, *optional*):
+                If a `str`, will use `self.eval_dataset[eval_dataset]` as the evaluation dataset. If provided
+                otherwise, will override `self.eval_dataset`. If it is a [`~datasets.Dataset`], columns not accepted
                 by the `model.forward()` method are automatically removed. It must implement `__len__`.
         """
         if eval_dataset is None and self.eval_dataset is None:
@@ -938,15 +963,31 @@ class BaseTrainer(Trainer, ABC):
                 return DataLoader([])
             raise ValueError(f"Evaluation requires specifying an eval_dataset to the {self.__class__.__name__}.")
 
-        eval_dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
+        # With persistent workers, reuse prepared dataloaders so repeated evaluations don't leak
+        # workers, see https://github.com/huggingface/transformers/pull/39717
+        dataloader_key = eval_dataset if isinstance(eval_dataset, str) else "eval"
+        # Explicitly passed datasets all share the "eval" key, so never cache those
+        cacheable = isinstance(eval_dataset, str) or eval_dataset is None or eval_dataset is self.eval_dataset
+        if cacheable and self.args.dataloader_persistent_workers and dataloader_key in self._eval_dataloaders:
+            return self._eval_dataloaders[dataloader_key]
+
+        if isinstance(eval_dataset, str):
+            eval_dataset = self.eval_dataset[eval_dataset]
+        elif eval_dataset is None:
+            eval_dataset = self.eval_dataset
 
         # If 'even_batches' is True, it will use the initial few samples to pad out the last sample. This can
         # cause issues with multi-dataset training, so we want to set this to False during training.
         # For evaluation, setting 'even_batches' to False results in hanging, so we keep it as True here.
         self.accelerator.even_batches = True
-        return self.accelerator.prepare(
+        dataloader = self.accelerator.prepare(
             self._build_dataloader(eval_dataset, self.args.eval_batch_size, dataset_kind="eval")
         )
+
+        if cacheable and self.args.dataloader_persistent_workers:
+            self._eval_dataloaders[dataloader_key] = dataloader
+
+        return dataloader
 
     def get_test_dataloader(self, test_dataset: Dataset | DatasetDict | IterableDataset) -> DataLoader:
         """
@@ -1039,9 +1080,15 @@ class BaseTrainer(Trainer, ABC):
         return skip
 
     def _load_from_checkpoint(self, checkpoint_path: str) -> None:
-        model_class = self.model.__class__
-        loaded_model = model_class(checkpoint_path, trust_remote_code=self.model.trust_remote_code)
-        self.model.load_state_dict(loaded_model.state_dict())
+        model = getattr(self.model, "_orig_mod", self.model)
+        # Our own checkpoint of the model being trained, so its module classes are already imported here,
+        # yet a programmatically built model never carries trust_remote_code (#3801). Handing those classes
+        # over leaves the backbone on the model's own flag, where stale remote code stays unused.
+        module_classes = {fullname(module): type(module) for module in model.modules() if isinstance(module, Module)}
+        loaded_model = model.__class__._load_with_module_classes(
+            checkpoint_path, module_classes, trust_remote_code=model.trust_remote_code
+        )
+        model.load_state_dict(loaded_model.state_dict())
 
     def preprocess_dataset(
         self, dataset: DatasetDict | Dataset | None = None, dataset_name: str | None = None
@@ -1066,10 +1113,7 @@ class BaseTrainer(Trainer, ABC):
 
         if self.should_dataset_name_column_be_added(dataset, self.args, self.loss):
             dataset = self.add_dataset_name_column(dataset)
-
-        # Add a tag to the dataset to indicate that it has been preprocessed, to ensure that we don't apply the map or
-        # transform multiple times.
-        dataset._sentence_transformers_preprocessed = True
+            dataset._sentence_transformers_preprocessed = True
 
         return dataset
 

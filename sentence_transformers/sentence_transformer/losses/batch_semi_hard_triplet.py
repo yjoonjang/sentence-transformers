@@ -59,7 +59,7 @@ class BatchSemiHardTripletLoss(nn.Module):
             +------------------+--------+
 
         Recommendations:
-            - Use ``BatchSamplers.GROUP_BY_LABEL`` (:class:`docs <sentence_transformers.sentence_transformer.training_args.BatchSamplers>`)
+            - Use ``BatchSamplers.GROUP_BY_LABEL`` (:class:`docs <sentence_transformers.base.sampler.BatchSamplers>`)
               to ensure that each batch contains at least 2 distinct labels with at least 2 samples per label.
 
         Relations:
@@ -102,7 +102,10 @@ class BatchSemiHardTripletLoss(nn.Module):
 
     def forward(self, sentence_features: Iterable[dict[str, Tensor]], labels: Tensor) -> Tensor:
         rep = self.sentence_embedder(sentence_features[0])["sentence_embedding"]
-        return self.batch_semi_hard_triplet_loss(labels, rep)
+        return self.compute_loss_from_embeddings([rep], labels)
+
+    def compute_loss_from_embeddings(self, embeddings: list[Tensor], labels: Tensor) -> Tensor:
+        return self.batch_semi_hard_triplet_loss(labels, embeddings[0])
 
     # Semi-Hard Triplet Loss
     # Based on: https://github.com/tensorflow/addons/blob/master/tensorflow_addons/losses/triplet.py#L71
@@ -113,12 +116,17 @@ class BatchSemiHardTripletLoss(nn.Module):
         Args:
             labels: labels of the batch, of size (batch_size,)
             embeddings: tensor of shape (batch_size, embed_dim)
-            margin: margin for triplet loss
-            squared: Boolean. If true, output is the pairwise squared euclidean distance matrix.
-                     If false, output is the pairwise euclidean distance matrix.
         Returns:
             Label_Sentence_Triplet: scalar tensor containing the triplet loss
         """
+        batch_size = embeddings.shape[0]
+        if labels.numel() != batch_size:
+            raise ValueError(
+                f"{self.__class__.__name__} expects {batch_size} labels (one per example), "
+                f"but got {labels.numel()} labels with shape {tuple(labels.shape)}."
+            )
+        labels = labels.view(-1)
+
         labels = labels.unsqueeze(1)
 
         pdist_matrix = self.distance_metric(embeddings)
@@ -127,22 +135,15 @@ class BatchSemiHardTripletLoss(nn.Module):
         adjacency_not = ~adjacency
 
         batch_size = torch.numel(labels)
-        pdist_matrix_tile = pdist_matrix.repeat([batch_size, 1])
-
-        mask = adjacency_not.repeat([batch_size, 1]) & (pdist_matrix_tile > torch.reshape(pdist_matrix.t(), [-1, 1]))
-
-        mask_final = torch.reshape(torch.sum(mask, 1, keepdims=True) > 0.0, [batch_size, batch_size])
-        mask_final = mask_final.t()
-
-        negatives_outside = torch.reshape(
-            BatchSemiHardTripletLoss._masked_minimum(pdist_matrix_tile, mask), [batch_size, batch_size]
+        # Sort and search to avoid cubic distance and mask tensors.
+        negatives = pdist_matrix.masked_fill(adjacency, torch.inf)
+        sorted_negatives = negatives.sort(dim=1, stable=True).values
+        positions = torch.searchsorted(
+            sorted_negatives.detach().contiguous(), pdist_matrix.detach().contiguous(), right=True
         )
-        negatives_outside = negatives_outside.t()
-
+        negatives_outside = sorted_negatives.gather(1, positions.clamp(max=batch_size - 1))
         negatives_inside = BatchSemiHardTripletLoss._masked_maximum(pdist_matrix, adjacency_not)
-        negatives_inside = negatives_inside.repeat([1, batch_size])
-
-        semi_hard_negatives = torch.where(mask_final, negatives_outside, negatives_inside)
+        semi_hard_negatives = torch.where(torch.isfinite(negatives_outside), negatives_outside, negatives_inside)
 
         loss_mat = (pdist_matrix - semi_hard_negatives) + self.margin
 
@@ -155,15 +156,6 @@ class BatchSemiHardTripletLoss(nn.Module):
         ) / num_positives.clamp(min=1e-16)
 
         return triplet_loss
-
-    @staticmethod
-    def _masked_minimum(data: Tensor, mask: Tensor, dim: int = 1) -> Tensor:
-        axis_maximums, _ = data.max(dim, keepdims=True)
-        masked_minimums = (data - axis_maximums) * mask
-        masked_minimums, _ = masked_minimums.min(dim, keepdims=True)
-        masked_minimums += axis_maximums
-
-        return masked_minimums
 
     @staticmethod
     def _masked_maximum(data: Tensor, mask: Tensor, dim: int = 1) -> Tensor:

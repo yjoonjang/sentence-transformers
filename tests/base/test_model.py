@@ -1,21 +1,59 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
+import tempfile
 import warnings
 from collections import UserDict
+from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
 import torch
 from huggingface_hub import CommitInfo, HfApi, RepoUrl
 from torch import Tensor, nn
+from transformers import BertConfig, BertModel, BertTokenizer
 
-from sentence_transformers import CrossEncoder, SentenceTransformer, SparseEncoder
+from sentence_transformers import CrossEncoder, MultiVectorEncoder, SentenceTransformer, SparseEncoder
 from sentence_transformers.base.evaluation import BaseEvaluator
+from sentence_transformers.base.model import BaseModel
+from sentence_transformers.base.model_card import BaseModelCardData
+from sentence_transformers.base.modules import Dense
+from sentence_transformers.base.modules.module import Module
+
+
+@pytest.mark.parametrize("model_class", [SentenceTransformer, MultiVectorEncoder])
+@pytest.mark.parametrize("modality", ["text", ("image", "text")])
+def test_encode_output_value_none_keeps_modality(model_class, modality) -> None:
+    model = model_class("sentence-transformers-testing/stsb-bert-tiny-safetensors")
+    with model.register_forward_hook(lambda module, args, output: output | {"modality": modality}):
+        outputs = model.encode(["Text one"] * 5, batch_size=5, output_value=None)
+
+    assert [output["modality"] for output in outputs] == [modality] * 5
+    assert all(output["input_ids"].ndim == 1 for output in outputs)
+    assert all(output["token_embeddings"].ndim == 2 for output in outputs)
+
+
+def test_set_base_model_uses_resolved_revision_without_hub_lookup(monkeypatch: pytest.MonkeyPatch) -> None:
+    class ResolvedRevision(str):
+        initial = "main"
+        resolved = "f3cb857cba53019a20df283396bcca179cf051a4"
+
+    get_model_info = MagicMock()
+    monkeypatch.setattr("sentence_transformers.base.model_card.get_model_info", get_model_info)
+
+    data = BaseModelCardData()
+    assert data.set_base_model("sentence-transformers-testing/stsb-bert-tiny-safetensors", ResolvedRevision("main"))
+
+    get_model_info.assert_not_called()
+    assert data.base_model == "sentence-transformers-testing/stsb-bert-tiny-safetensors"
+    assert data.base_model_revision == ResolvedRevision.resolved
 
 
 class BaseModelPreprocessTest:
@@ -94,7 +132,7 @@ class TestSparseEncoderPreprocess(BaseModelPreprocessTest):
         return ["This is a test.", "Another test sentence."]
 
 
-# A 3D array is inferred as the "image" modality, a 1D array as "audio"; values are never read
+# A 3D array is inferred as the "image" modality, a 1D array as "audio". Values are never read
 # because preprocess() raises before processing, so reusing these constants across cases is safe.
 _IMAGE = np.zeros((8, 8, 3), dtype=np.uint8)
 _AUDIO = np.zeros((16000,), dtype=np.float32)
@@ -210,7 +248,7 @@ def test_preprocess_modality_error_messages(
 ) -> None:
     """preprocess() should raise a clear, accurate ValueError for each unsupported-modality scenario.
 
-    The model's supported modalities are simulated via ``modalities``; inputs use real inference
+    The model's supported modalities are simulated via ``modalities``. Inputs use real inference
     (numpy arrays for image/audio, dicts for combined/chat inputs) so the full path is exercised.
     ``forbidden`` guards against misleading wording, e.g. claiming a modality is unsupported when
     every part is actually supported.
@@ -262,6 +300,29 @@ def test_config_returns_none_when_no_underlying_transformers_model(
     """If the model has no underlying transformers PreTrainedModel (e.g. StaticEmbedding-only),
     `model.config` returns `None` instead of raising.
     """
+    assert static_embedding_model.config is None
+
+
+def test_config_is_settable(stsb_bert_tiny_model: SentenceTransformer) -> None:
+    """Assigning ``model.config`` should not raise and should round-trip through the
+    underlying transformers model (fixes optimum ONNX export regression in v5.5.0).
+    """
+    original_config = stsb_bert_tiny_model.config
+    assert original_config is not None
+    new_config = type(original_config)(**original_config.to_dict())
+    stsb_bert_tiny_model.config = new_config
+    assert stsb_bert_tiny_model.config is new_config
+    assert stsb_bert_tiny_model.transformers_model.config is new_config
+
+
+def test_config_setter_on_model_without_underlying_transformers_model(
+    static_embedding_model: SentenceTransformer,
+) -> None:
+    """Assigning ``model.config`` on a StaticEmbedding-only model (no underlying transformers
+    model) should be silently ignored, i.e. ``model.config`` keeps returning ``None``.
+    """
+    assert static_embedding_model.config is None
+    static_embedding_model.config = object()
     assert static_embedding_model.config is None
 
 
@@ -378,6 +439,36 @@ def test_cache_folder_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SENTENCE_TRANSFORMERS_HOME", "/tmp/fake_cache")
     model = SentenceTransformer(modules=[torch.nn.Linear(10, 10)])
     assert model is not None
+
+
+def test_hub_revision_is_resolved_before_model_loading(monkeypatch: pytest.MonkeyPatch) -> None:
+    resolve_mock = MagicMock(return_value="resolved-revision")
+    load_kwargs = {}
+
+    def mock_load_modules(self, model_name_or_path, **kwargs):
+        load_kwargs.update(kwargs)
+        return [torch.nn.Linear(2, 2)], {}
+
+    monkeypatch.setattr("sentence_transformers.base.model._resolve_model_revision", resolve_mock)
+    monkeypatch.setattr(SentenceTransformer, "_load_modules", mock_load_modules)
+
+    SentenceTransformer(
+        "some-org/some-model",
+        revision="branch",
+        token="token",
+        cache_folder="/cache",
+        local_files_only=True,
+        device="cpu",
+    )
+
+    resolve_mock.assert_called_once_with(
+        "some-org/some-model",
+        "branch",
+        token="token",
+        cache_folder="/cache",
+        local_files_only=True,
+    )
+    assert load_kwargs["revision"] == "resolved-revision"
 
 
 def test_save_creates_expected_files(stsb_bert_tiny_model: SentenceTransformer, tmp_path: Path) -> None:
@@ -498,10 +589,11 @@ def test_load_logs_no_modules_json(stsb_bert_tiny_model: SentenceTransformer, tm
 
 
 def test_load_logs_converting_model_type(stsb_bert_tiny_model: SentenceTransformer, tmp_path: Path, caplog) -> None:
-    """Loading a SentenceTransformer model as a SparseEncoder should log the converting message."""
+    """Loading a SentenceTransformer model as a SparseEncoder should log the converting message at
+    warning level, so it is visible at the default verbosity."""
     stsb_bert_tiny_model.save(str(tmp_path))
 
-    with caplog.at_level(logging.INFO, logger="sentence_transformers.base.model"):
+    with caplog.at_level(logging.WARNING, logger="sentence_transformers.base.model"):
         SparseEncoder(str(tmp_path))
 
     assert "Converting SentenceTransformer" in caplog.text
@@ -555,16 +647,33 @@ def test_load_module_class_from_ref_sentence_transformers(stsb_bert_tiny_model: 
     assert cls is Pooling
 
 
-def test_load_module_class_from_ref_fallback_to_import(stsb_bert_tiny_model: SentenceTransformer) -> None:
-    """A non-sentence_transformers class ref without trust_remote_code should fall back to import_from_string."""
-    cls = stsb_bert_tiny_model._load_module_class_from_ref(
-        "torch.nn.Linear",
-        model_name_or_path="nonexistent_path_12345",
-        trust_remote_code=False,
-        revision=None,
-        model_kwargs=None,
+def test_load_module_class_from_ref_untrusted_ref_raises(
+    stsb_bert_tiny_model: SentenceTransformer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A non-sentence_transformers class ref without `trust_remote_code=True` is refused: the import
+    would run repository-chosen code."""
+    dynamic_loading_attempted = False
+
+    def mock_get_class(class_ref, model_name_or_path, **kwargs):
+        nonlocal dynamic_loading_attempted
+        dynamic_loading_attempted = True
+        raise OSError("must not be reached for an untrusted ref")
+
+    monkeypatch.setattr(
+        "transformers.dynamic_module_utils.get_class_from_dynamic_module",
+        mock_get_class,
     )
-    assert cls is nn.Linear
+
+    with pytest.raises(ValueError, match="trust_remote_code"):
+        stsb_bert_tiny_model._load_module_class_from_ref(
+            "torch.nn.Linear",
+            model_name_or_path="nonexistent_path_12345",
+            trust_remote_code=False,
+            revision=None,
+            model_kwargs=None,
+        )
+    # The refusal must come from the gate, before any remote (dynamic) loading is attempted.
+    assert not dynamic_loading_attempted
 
 
 def test_load_module_class_from_ref_trust_remote_code_fallback(
@@ -615,6 +724,28 @@ def test_load_module_class_from_ref_code_revision(
     )
     assert "code_revision" not in model_kwargs
     assert captured_kwargs.get("code_revision") == "v1.0"
+
+
+@pytest.mark.parametrize("model_class", [SentenceTransformer, CrossEncoder, SparseEncoder])
+def test_model_path_pointing_to_a_file_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, model_class: type
+) -> None:
+    """A path that exists but is not a directory is not a local model, and must be rejected before any
+    loading happens. `load_file_path` only skips its Hub fallback for real directories, so accepting a file
+    would source `modules.json` (and the module class it names) from the Hub while the path still counts as
+    local. A file whose name collides with a repo id would then silently load that repo (#3801).
+    """
+    collision = tmp_path / "bert-base-uncased"
+    collision.write_text("not a model")
+
+    def fail_hub_request(*args, **kwargs):
+        raise AssertionError("no Hub request may be made for a path that points to a file")
+
+    monkeypatch.setattr("sentence_transformers.util.file_io.hf_hub_download", fail_hub_request)
+    monkeypatch.setattr("sentence_transformers.util.file_io.snapshot_download", fail_hub_request)
+
+    with pytest.raises(NotADirectoryError, match="is a file, not a directory"):
+        model_class(str(collision))
 
 
 def _setup_hub_mocks(monkeypatch: pytest.MonkeyPatch) -> dict[str, dict | list]:
@@ -806,6 +937,785 @@ def test_device_property(stsb_bert_tiny_model: SentenceTransformer) -> None:
     assert dev.type in ("cpu", "cuda")
 
 
+@pytest.mark.parametrize(
+    "model_class, model_id",
+    [
+        (SentenceTransformer, "sentence-transformers-testing/stsb-bert-tiny-safetensors"),
+        (CrossEncoder, "cross-encoder-testing/reranker-bert-tiny-gooaq-bce"),
+        (SparseEncoder, "sparse-encoder-testing/inference-free-splade-bert-tiny-nq"),
+    ],
+)
+def test_device_map_controls_placement(model_class: type, model_id: str) -> None:
+    """A ``device_map`` in ``model_kwargs`` must control placement and not be overridden by the
+    auto-detected ``device``. Previously the unconditional ``self.to(device)`` would e.g. pull a
+    ``device_map="cuda:1"`` model back onto ``cuda:0``. The fix lives in the shared base, so this is
+    checked for every model family. See #3822."""
+    # device_map pins the backbone to CPU. Even when a GPU is present (so the auto-detected device
+    # would be cuda), the device_map must win and nothing should be moved to cuda.
+    model = model_class(model_id, model_kwargs={"device_map": {"": "cpu"}})
+    assert model.transformers_model.device.type == "cpu"
+    assert all(param.device.type == "cpu" for param in model.parameters())
+
+
+def test_device_argument_warns_when_device_map_present(caplog: pytest.LogCaptureFixture) -> None:
+    """Passing both ``device`` and a ``device_map`` should warn that ``device_map`` wins. See #3822."""
+    model_id = "sentence-transformers-testing/stsb-bert-tiny-safetensors"
+    with caplog.at_level(logging.WARNING, logger="sentence_transformers.base.model"):
+        # device="cuda" is inert here (device_map controls placement), so this is safe without a GPU.
+        model = SentenceTransformer(model_id, device="cuda", model_kwargs={"device_map": {"": "cpu"}})
+    assert model.device.type == "cpu"
+    assert "Ignoring `device=cuda`" in caplog.text
+
+
+def test_encode_ignores_a_device_for_a_device_map_model(caplog: pytest.LogCaptureFixture) -> None:
+    """``encode`` must honour a ``device_map`` too, not just the constructor. See #3822.
+
+    ``transformers`` hands a model to accelerate only when the map spans several devices or offloads
+    to disk, so for a single-device map the requested map is the only trace there is to go on.
+    """
+    model_id = "sentence-transformers-testing/stsb-bert-tiny-safetensors"
+    model = SentenceTransformer(model_id, model_kwargs={"device_map": {"": "cpu"}})
+    assert model._accelerate_placement_hook is None
+
+    with caplog.at_level(logging.WARNING, logger="sentence_transformers.base.model"):
+        with (
+            patch.object(model, "to", wraps=model.to) as move,
+            patch.object(model, "_place_modules", wraps=model._place_modules) as align,
+        ):
+            model.encode(["hello"], device="meta")
+            model.encode(["hello"], device="meta")
+
+    move.assert_not_called()
+    align.assert_called_once_with()
+    assert "Ignoring `device=meta`" in caplog.text
+
+
+def test_device_map_alignment_reaches_modules_outside_the_backbone() -> None:
+    """A ``Router`` holds the backbone several levels down, so alignment cannot skip modules by index.
+
+    ``self[0]`` is the entire model for a Router-first architecture, while the query route holds
+    parameters accelerate never placed and that nothing else would move onto the backbone's device.
+    """
+    model = SparseEncoder(
+        "sparse-encoder-testing/inference-free-splade-bert-tiny-nq", model_kwargs={"device_map": {"": "cpu"}}
+    )
+    route = model[0].sub_modules["query"]
+    assert model.transformers_model not in list(route.modules())
+    route.register_buffer("state", torch.ones(1, dtype=torch.float64))
+    backbone_dtype = model.transformers_model.dtype
+
+    model._place_modules()
+
+    assert route.state.device == model.device
+    assert route.state.dtype == model.dtype
+    assert model.transformers_model.dtype == backbone_dtype
+
+
+def test_pool_takes_placement_over_from_an_undispatched_device_map() -> None:
+    """The pool guard must ask about accelerate hooks, not about the ``device_map`` itself.
+
+    ``device_map="auto"`` on a model that fits attaches no hooks, so pooling is safe. The pool then
+    owns placement, and clearing the requested map is what lets each worker move its own copy.
+    """
+    model = SentenceTransformer(
+        "sentence-transformers-testing/stsb-bert-tiny-safetensors", model_kwargs={"device_map": {"": "cpu"}}
+    )
+    with patch("torch.multiprocessing.get_context"):  # the guard and hand-off, without real workers
+        model.start_multi_process_pool(["cpu"])
+
+    assert model._device_map is None
+    with patch.object(model, "to", wraps=model.to) as move:
+        model._resolve_inference_device("meta")
+    move.assert_called_once()
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize(
+    "target_devices",
+    [
+        ["cpu", "cpu"],
+        pytest.param(
+            ["cpu", "cuda:0"], marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+        ),
+    ],
+    ids=["cpu", "cpu_cuda"],
+)
+def test_multi_process_encoding_works_with_an_undispatched_device_map(target_devices: list[str]) -> None:
+    """``device_map="auto"`` on a model that fits leaves an ordinary model, which a pool can still use.
+
+    ``transformers`` attaches no accelerate hooks in that case, so moving the model to the CPU to share
+    it is safe, and each worker is then free to place its own copy.
+    """
+    model = SentenceTransformer(
+        "sentence-transformers-testing/stsb-bert-tiny-safetensors", model_kwargs={"device_map": "auto"}
+    )
+    expected = model.encode(["a", "b", "c", "d"])
+    embeddings = model.encode(["a", "b", "c", "d"], device=target_devices, chunk_size=2)
+
+    assert embeddings.shape == (4, 128)
+    np.testing.assert_allclose(embeddings, expected, rtol=1e-4, atol=1e-5)
+    assert model._device_map is None  # the pool took placement over from the `device_map`
+
+
+ENCODE_MODELS = [
+    ("stsb_bert_tiny_model", "encode", ["hello"]),
+    ("splade_bert_tiny_model", "encode", ["hello"]),
+    ("reranker_bert_tiny_model", "predict", [("query", "passage")]),
+    ("mve_bert_tiny_model", "encode", ["hello"]),
+    ("static_embedding_model", "encode", ["hello"]),
+]
+ENCODE_MODEL_IDS = [
+    "sentence_transformer",
+    "sparse_encoder",
+    "cross_encoder",
+    "multi_vector_encoder",
+    "static_embedding",
+]
+PLACEMENT_DEVICES = [
+    "cpu",
+    pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")),
+]
+
+
+@pytest.mark.parametrize(["model_fixture", "encode_method", "inputs"], ENCODE_MODELS, ids=ENCODE_MODEL_IDS)
+def test_encode_does_not_move_a_model_that_is_already_in_place(
+    request: pytest.FixtureRequest, model_fixture: str, encode_method: str, inputs: list
+) -> None:
+    """Encoding must skip redundant moves for every model family, including static embeddings."""
+    model = request.getfixturevalue(model_fixture)
+
+    with patch.object(model, "to", wraps=model.to) as move:
+        getattr(model, encode_method)(inputs)
+    move.assert_not_called()
+
+
+@pytest.mark.parametrize("spelling", ["type", "type_and_index", "device_object"])
+def test_encode_recognises_every_spelling_of_the_device_it_is_on(
+    stsb_bert_tiny_model: SentenceTransformer, spelling: str
+) -> None:
+    """``"cuda"`` and ``torch.device("cpu")`` name the device the model's parameters are on.
+
+    A parameter on an accelerator always reports an index, so comparing ``torch.device("cuda")``
+    against it would differ and move the model on every call. The requested device is resolved the
+    way a tensor reports it to keep the two comparable. The spellings are derived from the device
+    the model loaded onto, so the accelerator case is exercised wherever one is available.
+    """
+    device = stsb_bert_tiny_model.device
+    requested = {
+        "type": device.type,
+        "type_and_index": f"{device.type}:{device.index or 0}",
+        "device_object": device,
+    }[spelling]
+    with patch.object(stsb_bert_tiny_model, "to", wraps=stsb_bert_tiny_model.to) as move:
+        stsb_bert_tiny_model.encode(["hello"], device=requested)
+    move.assert_not_called()
+
+
+@pytest.mark.parametrize(["model_fixture", "encode_method", "inputs"], ENCODE_MODELS[:4], ids=ENCODE_MODEL_IDS[:4])
+@pytest.mark.parametrize("stranded", ["buffer", "module"])
+@pytest.mark.parametrize("explicit_device", [False, True])
+def test_encode_moves_a_model_that_is_not_in_place(
+    request: pytest.FixtureRequest,
+    model_fixture: str,
+    encode_method: str,
+    inputs: list,
+    stranded: str,
+    explicit_device: bool,
+) -> None:
+    """A model that spans two devices must still be moved when a device is asked for.
+
+    ``model.device`` reports the underlying transformers model, so a separately loaded module or a
+    buffer can sit elsewhere without showing up there. ``to()`` moves buffers as well as parameters,
+    so both have to be considered.
+    """
+    model = request.getfixturevalue(model_fixture)
+    expected = model.device
+    requested = f"{expected.type}:{expected.index or 0}" if explicit_device else None
+
+    if stranded == "buffer":
+        name, buffer = next(iter(model.named_buffers()))
+        owner = model.get_submodule(name.rsplit(".", 1)[0])
+        attribute = name.rsplit(".", 1)[1]
+        setattr(owner, attribute, None)
+        owner.register_buffer(attribute, buffer.to("meta"))
+    else:
+        module = [child for child in model.modules() if next(child.parameters(recurse=False), None) is not None][-1]
+        module.to("meta")
+
+    with patch.object(model, "to", wraps=model.to) as move:
+        with contextlib.suppress(NotImplementedError):  # a meta tensor cannot be moved back
+            getattr(model, encode_method)(inputs, device=requested)
+    move.assert_called_once_with(requested if explicit_device else expected)
+
+
+@pytest.fixture
+def dispatched_model(tmp_path_factory: pytest.TempPathFactory) -> SentenceTransformer:
+    """Offload the first module so parameter order cannot identify the execution device."""
+    return SentenceTransformer(
+        "sentence-transformers-testing/stsb-bert-tiny-safetensors",
+        model_kwargs={
+            "device_map": {"embeddings": "disk", "encoder": "cpu", "pooler": "cpu"},
+            "offload_folder": str(tmp_path_factory.mktemp("offload")),
+        },
+    )
+
+
+def test_multi_process_pool_refuses_a_dispatched_model(dispatched_model: SentenceTransformer) -> None:
+    """accelerate's hooks cannot survive being moved to the CPU and forked into worker processes."""
+    with pytest.raises(ValueError, match="dispatched by accelerate"):
+        dispatched_model.start_multi_process_pool(["cpu"])
+
+
+def test_device_reports_where_a_dispatched_model_runs(dispatched_model: SentenceTransformer) -> None:
+    """An offloaded parameter sits on ``meta`` until accelerate streams it in, so it cannot name the device."""
+    assert dispatched_model.transformers_model.device == torch.device("meta")
+    assert dispatched_model.device == torch.device("cpu")
+
+
+def test_encode_with_composed_accelerate_hooks(dispatched_model: SentenceTransformer) -> None:
+    from accelerate.hooks import ModelHook, add_hook_to_module
+
+    expected = dispatched_model.encode(["hello"])
+    add_hook_to_module(dispatched_model.transformers_model, ModelHook(), append=True)
+
+    assert dispatched_model.device == torch.device("cpu")
+    np.testing.assert_allclose(dispatched_model.encode(["hello"]), expected)
+
+
+@pytest.mark.parametrize("hooked", [False, True])
+def test_placement_hook_is_cached(hooked: bool) -> None:
+    from accelerate.hooks import ModelHook
+
+    module = nn.Linear(2, 2)
+    hook = None
+    if hooked:
+        hook = ModelHook()
+        hook.execution_device = torch.device("cpu")
+        module._hf_hook = hook
+
+    model = SentenceTransformer(modules=[module], device="cpu")
+    assert model._accelerate_placement_hook is hook
+    with patch.object(model, "modules", side_effect=AssertionError("Unexpected module scan")):
+        assert model._accelerate_placement_hook is hook
+        assert model._placement_is_delegated is hooked
+        model._device_map = {"": "cpu"}
+        assert model._placement_is_delegated
+        model._device_map = None
+        assert model._placement_is_delegated is hooked
+    model._resolve_inference_device(None)
+    assert model.__dict__["_accelerate_placement_hook"] is hook
+
+
+def test_clear_placement_cache_refreshes_added_replaced_and_removed_hooks() -> None:
+    from accelerate.hooks import ModelHook
+
+    model = SentenceTransformer(modules=[nn.Linear(2, 2)], device="cpu")
+    model._resolve_inference_device(None)
+    for hook in [ModelHook(), ModelHook(), None]:
+        if hook is not None:
+            hook.execution_device = torch.device("cpu")
+        model[0]._hf_hook = hook
+        model.clear_placement_cache()
+        assert "_accelerate_placement_hook" not in model.__dict__
+        assert model._accelerate_placement_hook is hook
+        assert model._placement_is_delegated is (hook is not None)
+
+
+def test_first_inference_alignment_retries_after_failure() -> None:
+    model = SentenceTransformer(modules=[nn.Linear(2, 2)], device="cpu")
+    model._device_map = {"": "cpu"}
+    model.register_buffer("state", torch.ones(1, device="meta"))
+    with pytest.raises(NotImplementedError, match="meta"):
+        model._resolve_inference_device(None)
+    assert not model._modules_placed
+
+    model.state = torch.ones(1)
+    model._resolve_inference_device(None)
+    assert model._modules_placed
+    with patch.object(model, "_place_modules", side_effect=AssertionError("Unexpected alignment")):
+        model._resolve_inference_device(None)
+
+
+def test_clear_placement_cache_realigns_modules_added_after_inference() -> None:
+    model = SentenceTransformer(modules=[nn.Linear(2, 2)], device="cpu")
+    model._device_map = {"": "cpu"}
+    model._resolve_inference_device(None)
+    module = nn.Linear(2, 2, dtype=torch.float64)
+    model.add_module("dense", module)
+    model._resolve_inference_device(None)
+    assert module.weight.dtype == torch.float64
+
+    model.clear_placement_cache()
+    model._resolve_inference_device(None)
+    assert module.weight.dtype == torch.float32
+
+
+@pytest.mark.parametrize("prebuilt", [False, True])
+@pytest.mark.parametrize("execution_device", PLACEMENT_DEVICES)
+def test_offloaded_static_embedding(tmp_path: Path, prebuilt: bool, execution_device: str) -> None:
+    from accelerate import disk_offload
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+
+    from sentence_transformers.sentence_transformer.modules import StaticEmbedding
+
+    tokenizer = Tokenizer(WordLevel({"hello": 0, "[UNK]": 1}, unk_token="[UNK]"))
+    embedding = StaticEmbedding(tokenizer, embedding_dim=8)
+    model = SentenceTransformer(modules=[embedding], device="cpu")
+    expected = model.encode(["hello"])
+    disk_offload(embedding, str(tmp_path), execution_device=torch.device(execution_device))
+    model.clear_placement_cache()
+    if prebuilt:
+        model = SentenceTransformer(modules=[embedding], device="cpu")
+
+    assert model.transformers_model is None
+    assert model.device == torch.device(execution_device)
+    with patch.object(model, "to", wraps=model.to) as move:
+        np.testing.assert_allclose(model.encode(["hello"]), expected)
+        np.testing.assert_allclose(model.encode(["hello"], device="meta"), expected)
+    move.assert_not_called()
+    with pytest.raises(RuntimeError, match="offloaded"):
+        model.half()
+    with pytest.raises(ValueError, match="dispatched by accelerate"):
+        model.start_multi_process_pool(["cpu"])
+
+
+def test_dispatched_second_backbone_is_not_cast_or_moved(
+    stsb_bert_tiny_model: SentenceTransformer, dispatched_model: SentenceTransformer
+) -> None:
+    from sentence_transformers.base.modules import Router
+
+    router = Router({"query": list(stsb_bert_tiny_model), "document": list(dispatched_model)})
+    model = SentenceTransformer(modules=[router], device="cpu")
+    assert model.transformers_model is stsb_bert_tiny_model.transformers_model
+    assert model.device == torch.device("cpu")
+    np.testing.assert_allclose(model.encode_document(["hello"]), dispatched_model.encode(["hello"]))
+    with pytest.raises(RuntimeError, match="offloaded"):
+        model.to(torch.float16)
+
+
+@pytest.mark.parametrize("move_method", ["to", "cpu"])
+def test_explicit_move_overrides_a_single_device_map(move_method: str) -> None:
+    model = SentenceTransformer(
+        "sentence-transformers-testing/stsb-bert-tiny-safetensors", model_kwargs={"device_map": {"": "cpu"}}
+    )
+    model._resolve_inference_device(None)
+    model.to(torch.float64)
+    assert model._placement_is_delegated
+    model._resolve_inference_device(None)
+    if move_method == "to":
+        model.to("cpu")
+    else:
+        model.cpu()
+    assert not model._placement_is_delegated
+
+
+@pytest.mark.parametrize(
+    "args, kwargs, overrides_map",
+    [
+        pytest.param((), {"device": "cpu"}, True, id="device_keyword"),
+        pytest.param(("cpu", torch.float64), {}, True, id="device_and_dtype"),
+        pytest.param((torch.empty(0),), {}, True, id="tensor_positional"),
+        pytest.param((), {"tensor": torch.empty(0)}, True, id="tensor_keyword"),
+        pytest.param((torch.float64,), {}, False, id="dtype_positional"),
+        pytest.param((), {"dtype": torch.float64}, False, id="dtype_keyword"),
+        pytest.param((None, torch.float64), {}, False, id="none_and_dtype"),
+        pytest.param((), {"memory_format": torch.preserve_format}, False, id="memory_format"),
+        pytest.param((), {}, False, id="no_arguments"),
+    ],
+)
+def test_to_overloads_respect_device_map(args: tuple, kwargs: dict, overrides_map: bool) -> None:
+    model = SentenceTransformer(
+        "sentence-transformers-testing/stsb-bert-tiny-safetensors", model_kwargs={"device_map": {"": "cpu"}}
+    )
+
+    model.to(*args, **kwargs)
+
+    assert model._device_map == (None if overrides_map else {"": "cpu"})
+
+
+def test_device_uses_buffers_without_parameters() -> None:
+    module = nn.Module()
+    module.register_buffer("state", torch.ones(1))
+    model = SentenceTransformer(modules=[module], device="cpu")
+    model.to("meta")
+    assert model.device == torch.device("meta")
+
+
+def test_device_move_does_not_turn_parameters_into_inference_tensors() -> None:
+    model = SentenceTransformer(modules=[nn.Linear(2, 2)], device="cpu")
+    with torch.inference_mode():
+        model._resolve_inference_device("meta")
+    assert all(not parameter.is_inference() for parameter in model.parameters())
+
+
+@pytest.mark.parametrize("inputs", [["hello"], []])
+@pytest.mark.parametrize("model_class", [SentenceTransformer, SparseEncoder])
+def test_parameterless_model_uses_requested_input_device(inputs: list[str], model_class: type) -> None:
+    class InputEmbedding(Module):
+        def preprocess(self, inputs: list[str], **kwargs) -> dict[str, Tensor]:
+            return {"sentence_embedding": torch.ones(len(inputs), 3)}
+
+        def forward(self, features: dict[str, Tensor], **kwargs) -> dict[str, Tensor]:
+            return features
+
+        def save(self, output_path: str, **kwargs) -> None:
+            pass
+
+    model = model_class(modules=[InputEmbedding()], device="cpu")
+    kwargs = {"convert_to_sparse_tensor": False} if model_class is SparseEncoder else {}
+    embeddings = model.encode(inputs, device="meta", convert_to_tensor=True, **kwargs)
+    assert embeddings.device == torch.device("meta")
+    assert embeddings.shape == ((1, 3) if inputs else (0,))
+
+
+def test_parameterless_cross_encoder_uses_requested_device_for_empty_predictions() -> None:
+    model = CrossEncoder(modules=[nn.Identity()], device="cpu")
+    scores = model.predict([], device="meta", convert_to_tensor=True)
+    assert scores.device == torch.device("meta")
+    assert scores.shape == (0,)
+
+
+@pytest.mark.parametrize(["model_fixture", "encode_method", "inputs"], ENCODE_MODELS[:4], ids=ENCODE_MODEL_IDS[:4])
+@pytest.mark.parametrize("execution_device", PLACEMENT_DEVICES)
+@pytest.mark.parametrize("offload", ["cpu", "disk"])
+def test_offloaded_inference_for_each_model_family(
+    request: pytest.FixtureRequest,
+    tmp_path: Path,
+    model_fixture: str,
+    encode_method: str,
+    inputs: list,
+    execution_device: str,
+    offload: str,
+) -> None:
+    from accelerate import cpu_offload, disk_offload
+
+    model = request.getfixturevalue(model_fixture).to("cpu")
+    expected = getattr(model, encode_method)(inputs)
+    model.to(execution_device)
+    if offload == "disk":
+        disk_offload(model.transformers_model, str(tmp_path), execution_device=torch.device(execution_device))
+    else:
+        cpu_offload(model.transformers_model, execution_device=torch.device(execution_device))
+    model.clear_placement_cache()
+
+    assert model.device == torch.device(execution_device)
+    before = {name: parameter.device for name, parameter in model.named_parameters()}
+
+    with patch.object(model, "to", wraps=model.to) as move:
+        actual = getattr(model, encode_method)(inputs)
+
+    move.assert_not_called()
+    assert {name: parameter.device for name, parameter in model.named_parameters()} == before
+    torch.testing.assert_close(actual, expected, check_device=False, rtol=1e-4, atol=1e-5)
+
+
+@pytest.mark.parametrize("device", [None, "cpu", "cpu:0"])
+def test_encode_torchao_quantized_weights(stsb_bert_tiny_model: SentenceTransformer, device: str | None) -> None:
+    quantization = pytest.importorskip("torchao.quantization")
+    model = stsb_bert_tiny_model.to("cpu")
+    quantization.quantize_(
+        model.transformers_model, quantization.Int8WeightOnlyConfig(version=2, set_inductor_config=False)
+    )
+
+    embeddings = model.encode(["hello"], device=device)
+
+    assert embeddings.shape == (1, 128)
+    assert np.isfinite(embeddings).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(["model_fixture", "encode_method", "inputs"], ENCODE_MODELS, ids=ENCODE_MODEL_IDS)
+def test_encode_cpu_cuda_round_trip(
+    request: pytest.FixtureRequest, model_fixture: str, encode_method: str, inputs: list
+) -> None:
+    model = request.getfixturevalue(model_fixture).to("cpu")
+    expected = getattr(model, encode_method)(inputs)
+    for device in ("cuda", "cpu"):
+        actual = getattr(model, encode_method)(inputs, device=device)
+        tensors = list(model.parameters()) + list(model.buffers())
+        assert all(tensor.device.type == device and not tensor.is_inference() for tensor in tensors)
+        torch.testing.assert_close(actual, expected, check_device=False, rtol=1e-4, atol=1e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("device", [None, "cuda", "cuda:0", torch.device("cuda:0")], ids=str)
+def test_encode_torchao_quantized_weights_on_cuda(
+    stsb_bert_tiny_model: SentenceTransformer, device: str | torch.device | None
+) -> None:
+    quantization = pytest.importorskip("torchao.quantization")
+    model = stsb_bert_tiny_model.to("cuda")
+    quantization.quantize_(
+        model.transformers_model, quantization.Int8WeightOnlyConfig(version=2, set_inductor_config=False)
+    )
+    with patch.object(model, "to", wraps=model.to) as move:
+        embeddings = model.encode(["hello"], device=device)
+    move.assert_not_called()
+    assert embeddings.shape == (1, 128)
+    assert np.isfinite(embeddings).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_encode_torchao_quantized_cpu_cuda_round_trip(stsb_bert_tiny_model: SentenceTransformer) -> None:
+    quantization = pytest.importorskip("torchao.quantization")
+    model = stsb_bert_tiny_model.to("cpu")
+    quantization.quantize_(
+        model.transformers_model, quantization.Int8WeightOnlyConfig(version=2, set_inductor_config=False)
+    )
+    expected = model.encode(["hello"])
+    for device in ("cuda", "cpu"):
+        actual = model.encode(["hello"], device=device)
+        assert model.device.type == device
+        assert all(not parameter.is_inference() for parameter in model.parameters())
+        np.testing.assert_allclose(actual, expected, rtol=1e-4, atol=1e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(["model_fixture", "encode_method", "inputs"], ENCODE_MODELS[:4], ids=ENCODE_MODEL_IDS[:4])
+@pytest.mark.parametrize("offload", ["cpu", "disk"])
+def test_load_gpu_offload_map_for_each_model_family(
+    request: pytest.FixtureRequest, tmp_path: Path, model_fixture: str, encode_method: str, inputs: list, offload: str
+) -> None:
+    model = request.getfixturevalue(model_fixture).to("cpu")
+    expected = getattr(model, encode_method)(inputs)
+    prefix = "bert." if hasattr(model.transformers_model, "bert") else ""
+    bert = model.transformers_model.bert if prefix else model.transformers_model
+    device_map = {f"{prefix}{name}": "cuda:0" for name, _ in bert.named_children() if name != "encoder"}
+    device_map.update(
+        {
+            f"{prefix}encoder.layer.{index}": offload if index == 0 else "cuda:0"
+            for index in range(len(bert.encoder.layer))
+        }
+    )
+    if prefix:
+        device_map.update({name: "cuda:0" for name, _ in model.transformers_model.named_children() if name != "bert"})
+    model.save(str(tmp_path / "model"))
+    model = type(model)(
+        str(tmp_path / "model"),
+        model_kwargs={
+            "device_map": device_map,
+            "offload_folder": str(tmp_path / "offload"),
+        },
+    )
+    assert model.device == torch.device("cuda:0")
+    before = {name: parameter.device for name, parameter in model.named_parameters()}
+    assert any(device.type == "meta" for device in before.values())
+    actual = getattr(model, encode_method)(inputs)
+    torch.testing.assert_close(actual, expected, check_device=False, rtol=1e-4, atol=1e-5)
+    assert {name: parameter.device for name, parameter in model.named_parameters()} == before
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("device_map", ["auto", {"": "cpu"}, {"": "cuda:0"}], ids=["auto", "cpu", "cuda"])
+@pytest.mark.parametrize("move_method", ["to", "device_method"])
+def test_single_device_map_ignores_encode_device_until_explicit_move(device_map: str | dict, move_method: str) -> None:
+    model = SentenceTransformer(
+        "sentence-transformers-testing/stsb-bert-tiny-safetensors", model_kwargs={"device_map": device_map}
+    )
+    assert model._accelerate_placement_hook is None
+    initial_device = model.device
+    target = "cpu" if initial_device.type == "cuda" else "cuda"
+    expected = model.encode(["hello"])
+    with patch.object(model, "to", wraps=model.to) as move:
+        actual = model.encode(["hello"], device=target)
+    move.assert_not_called()
+    assert model.device == initial_device
+    np.testing.assert_allclose(actual, expected)
+
+    if move_method == "to":
+        model.to(target)
+    else:
+        getattr(model, target)()
+    assert not model._placement_is_delegated
+    actual = model.encode(["hello"], device=initial_device)
+    assert model.device == initial_device
+    np.testing.assert_allclose(actual, expected, rtol=1e-4, atol=1e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("offload", ["cpu", "disk"])
+def test_mixed_gpu_offload_map_with_auxiliary_dense(tmp_path: Path, offload: str) -> None:
+    from sentence_transformers.sentence_transformer.modules import Dense
+
+    model = SentenceTransformer("sentence-transformers-testing/stsb-bert-tiny-safetensors", device="cpu")
+    model.add_module("dense", Dense(model.get_sentence_embedding_dimension(), 32))
+    expected = model.encode(["hello"])
+    model.save(str(tmp_path / "model"))
+    model = SentenceTransformer(
+        str(tmp_path / "model"),
+        model_kwargs={
+            "device_map": {"embeddings": offload, "encoder": "cuda:0", "pooler": "cuda:0"},
+            "offload_folder": str(tmp_path / "offload"),
+        },
+    )
+    assert model.device == torch.device("cuda:0")
+    assert next(model.transformers_model.parameters()).device.type == "meta"
+    assert model[-1].linear.weight.device == model.device
+    before = {name: parameter.device for name, parameter in model.named_parameters()}
+    for device in (None, "cpu", "cuda"):
+        actual = model.encode(["hello"], device=device)
+        np.testing.assert_allclose(actual, expected, rtol=1e-4, atol=1e-5)
+        assert {name: parameter.device for name, parameter in model.named_parameters()} == before
+
+
+def test_placement_dtype_ignores_outer_parameters() -> None:
+    from sentence_transformers.sentence_transformer.modules import Dense
+
+    model = SentenceTransformer(
+        "sentence-transformers-testing/stsb-bert-tiny-safetensors",
+        model_kwargs={"device_map": {"": "cpu"}, "dtype": torch.float64},
+    )
+    dense = Dense(model.get_embedding_dimension(), 32).double()
+    model.add_module("dense", dense)
+    model.register_parameter("scale", nn.Parameter(torch.ones(1)))
+
+    embeddings = model.encode(["hello"], convert_to_tensor=True)
+
+    assert embeddings.shape == (1, 32)
+    assert embeddings.dtype == dense.linear.weight.dtype == model.transformers_model.dtype == torch.float64
+    torch.testing.assert_close(model.encode(["hello"], convert_to_tensor=True), embeddings)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("explicit_device", [False, True])
+@pytest.mark.parametrize(
+    "placement, dtype",
+    [
+        ("ordinary", torch.float32),
+        ("device_map", torch.float32),
+        ("device_map", torch.float16),
+        ("offload", torch.float32),
+        ("offload", torch.float16),
+    ],
+)
+def test_encode_aligns_appended_dense_module(
+    stsb_bert_tiny_model: SentenceTransformer,
+    tmp_path: Path,
+    explicit_device: bool,
+    placement: str,
+    dtype: torch.dtype,
+) -> None:
+    from sentence_transformers.sentence_transformer.modules import Dense
+
+    if placement == "ordinary":
+        model = stsb_bert_tiny_model.to("cuda")
+    else:
+        device_map = (
+            {"": "cuda:0"}
+            if placement == "device_map"
+            else {"embeddings": "disk", "encoder": "cuda:0", "pooler": "cuda:0"}
+        )
+        model = SentenceTransformer(
+            "sentence-transformers-testing/stsb-bert-tiny-safetensors",
+            model_kwargs={"device_map": device_map, "offload_folder": str(tmp_path), "dtype": dtype},
+        )
+    backbone_devices = {name: tensor.device for name, tensor in model.transformers_model.named_parameters()}
+    dense = Dense(model.get_embedding_dimension(), 32)
+    model.add_module("dense", dense)
+    model.register_buffer("stranded", torch.ones(1))
+
+    embeddings = model.encode(["hello"], device="cuda" if explicit_device else None, convert_to_tensor=True)
+
+    assert embeddings.shape == (1, 32)
+    assert embeddings.device == model.device == dense.linear.weight.device == model.stranded.device
+    assert embeddings.dtype == dense.linear.weight.dtype == model.stranded.dtype == dtype
+    assert not dense.linear.weight.is_inference()
+    assert not model.stranded.is_inference()
+    assert {name: tensor.device for name, tensor in model.transformers_model.named_parameters()} == backbone_devices
+    with patch.object(model, "_place_modules", side_effect=AssertionError("Unexpected alignment")):
+        repeated = model.encode(["hello"], convert_to_tensor=True)
+    torch.testing.assert_close(repeated, embeddings)
+
+
+@pytest.mark.parametrize("device", [None, "cpu"], ids=str)
+def test_encode_leaves_a_dispatched_model_where_accelerate_put_it(
+    dispatched_model: SentenceTransformer, device: str | None
+) -> None:
+    """accelerate owns placement for a ``device_map`` model, and moving it destroys the offloaded weights."""
+    before = {name: parameter.device for name, parameter in dispatched_model.named_parameters()}
+
+    with (
+        patch.object(dispatched_model, "to", wraps=dispatched_model.to) as move,
+        patch.object(dispatched_model, "_place_modules", wraps=dispatched_model._place_modules) as align,
+    ):
+        embeddings = dispatched_model.encode(["hello"], **({} if device is None else {"device": device}))
+        repeated = dispatched_model.encode(["hello"], **({} if device is None else {"device": device}))
+
+    move.assert_not_called()
+    align.assert_called_once_with()
+    np.testing.assert_allclose(repeated, embeddings)
+    assert embeddings.shape == (1, 128)
+    assert {name: parameter.device for name, parameter in dispatched_model.named_parameters()} == before
+
+
+@pytest.mark.parametrize(
+    "move",
+    [
+        lambda model: model.to("cpu"),
+        lambda model: model.cpu(),
+        lambda model: model.cuda(),
+        lambda model: model.half(),
+        lambda model: model.to(torch.float16),
+    ],
+    ids=["to_device", "cpu", "cuda", "half", "to_dtype"],
+)
+def test_every_mover_refuses_an_offloaded_model(
+    dispatched_model: SentenceTransformer, move: Callable[[SentenceTransformer], object]
+) -> None:
+    """``cpu()`` and ``half()`` reach ``nn.Module._apply`` without ever calling ``to``, and ``_apply``
+    recurses past accelerate's guard on the backbone, so the guard belongs on ``_apply`` itself.
+
+    accelerate refuses ``to(dtype)`` for the same reason, a cast rewriting the resident weights while
+    the offloaded shard keeps the dtype it was saved with. It leaves ``half()`` alone, since it only
+    patches ``to`` and ``cuda``, so refusing that one is a deliberate strengthening rather than parity.
+
+    Nothing may be mutated on the way to the refusal.
+    """
+    before = ({name: p.device for name, p in dispatched_model.named_parameters()}, dispatched_model.dtype)
+    device_map = dispatched_model._device_map
+
+    with pytest.raises(RuntimeError, match="offloaded to cpu or disk"):
+        move(dispatched_model)
+
+    assert ({name: p.device for name, p in dispatched_model.named_parameters()}, dispatched_model.dtype) == before
+    assert dispatched_model._device_map == device_map
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_device_map_aligns_auxiliary_modules_to_backbone() -> None:
+    """With a ``device_map`` placing the backbone on a GPU, separately-loaded modules (e.g. Dense,
+    which load on CPU) must be moved onto the backbone's device, else the forward pass mismatches."""
+    from sentence_transformers.sentence_transformer.modules import Dense, Pooling, Transformer
+
+    model_id = "sentence-transformers-testing/stsb-bert-tiny-safetensors"
+    transformer = Transformer(model_id)
+    dim = transformer.get_embedding_dimension()
+    model = SentenceTransformer(modules=[transformer, Pooling(dim), Dense(dim, 64)], device="cpu")
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        model.save(tmp_dir)
+        reloaded = SentenceTransformer(tmp_dir, model_kwargs={"device_map": {"": 0}})
+
+    for param in reloaded.parameters():
+        assert param.device.type == "cuda"
+    # A cross-device mismatch would raise here.
+    assert reloaded.encode("hello world").shape == (64,)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_device_map_ignored_for_prebuilt_modules() -> None:
+    """``device_map`` only applies when loading from a name (via ``from_pretrained``). With pre-built
+    ``modules`` it is inert, so it must not suppress the usual ``self.to(device)`` and strand the model."""
+    from sentence_transformers.sentence_transformer.modules import Pooling, Transformer
+
+    model_id = "sentence-transformers-testing/stsb-bert-tiny-safetensors"
+    transformer = Transformer(model_id)  # loads on CPU
+    pooling = Pooling(transformer.get_embedding_dimension())
+    # device defaults to the auto-detected GPU. The stray device_map must not prevent the move there.
+    model = SentenceTransformer(modules=[transformer, pooling], model_kwargs={"device_map": {"": "cpu"}})
+    assert model.device.type == "cuda"
+
+
 def test_get_max_seq_length(stsb_bert_tiny_model: SentenceTransformer) -> None:
     """get_max_seq_length should return an int for transformer-based models."""
     max_seq = stsb_bert_tiny_model.get_max_seq_length()
@@ -861,6 +1771,24 @@ def test_is_singular_input_list(stsb_bert_tiny_model: SentenceTransformer) -> No
 def test_is_singular_input_tuple(stsb_bert_tiny_model: SentenceTransformer) -> None:
     """A tuple input should be a batch (not singular)."""
     assert stsb_bert_tiny_model.is_singular_input(("hello", "world")) is False
+
+
+def test_is_singular_input_conversation(stsb_bert_tiny_model: SentenceTransformer) -> None:
+    """A bare conversation (list of role/content message dicts) is one input, not a batch."""
+    conversation = [
+        {"role": "user", "content": "What is the capital of France?"},
+        {"role": "assistant", "content": "Paris."},
+    ]
+    assert stsb_bert_tiny_model.is_singular_input(conversation) is True
+    assert stsb_bert_tiny_model.is_singular_input([{"role": "user", "content": "hi"}]) is True
+
+
+def test_is_singular_input_conversation_batch(stsb_bert_tiny_model: SentenceTransformer) -> None:
+    """A list of conversations is a batch, and non-message dicts do not trigger the conversation rule."""
+    conversations = [[{"role": "user", "content": "hi"}], [{"role": "user", "content": "hello"}]]
+    assert stsb_bert_tiny_model.is_singular_input(conversations) is False
+    multimodal_batch = [{"text": "a photo"}, {"text": "a dog"}]
+    assert stsb_bert_tiny_model.is_singular_input(multimodal_batch) is False
 
 
 def test_is_singular_input_numpy(stsb_bert_tiny_model: SentenceTransformer) -> None:
@@ -998,3 +1926,322 @@ def test_get_model_type_reads_model_type(stsb_bert_tiny_model: SentenceTransform
 
     result = stsb_bert_tiny_model._get_model_type(str(tmp_path), token=None, cache_folder=None, local_files_only=True)
     assert result == "SparseEncoder"
+
+
+def save_with_model_config(model: SentenceTransformer, path: Path, **config_updates: Any) -> None:
+    """Save a model, then update its config_sentence_transformers.json, e.g. to add requirements."""
+    model.save_pretrained(str(path))
+    config_path = path / "config_sentence_transformers.json"
+    config = json.loads(config_path.read_text(encoding="utf8"))
+    config.update(config_updates)
+    config_path.write_text(json.dumps(config), encoding="utf8")
+
+
+def test_met_requirements_load_normally(stsb_bert_tiny_model: SentenceTransformer, tmp_path: Path) -> None:
+    save_with_model_config(stsb_bert_tiny_model, tmp_path, requirements={"transformers": ">=1.0"})
+
+    model = SentenceTransformer(str(tmp_path))
+    assert len(model) == len(stsb_bert_tiny_model)
+
+
+def test_unmet_requirements_raise_when_loading(stsb_bert_tiny_model: SentenceTransformer, tmp_path: Path) -> None:
+    save_with_model_config(stsb_bert_tiny_model, tmp_path, requirements={"transformers": ">=999"})
+
+    with pytest.raises(ImportError, match="transformers>=999"):
+        SentenceTransformer(str(tmp_path))
+
+
+class StrictLoadModule(Module):
+    """Third-party-style module: load() pins an exact keyword list with no **kwargs catch-all."""
+
+    config_keys: list[str] = ["scale"]
+
+    def __init__(self, scale: float = 1.0) -> None:
+        super().__init__()
+        self.scale = scale
+
+    def forward(self, features: dict[str, Tensor], **kwargs) -> dict[str, Tensor]:
+        return features
+
+    def save(self, output_path: str, *args, safe_serialization: bool = True, **kwargs) -> None:
+        self.save_config(output_path)
+
+    @classmethod
+    def load(
+        cls,
+        model_name_or_path: str,
+        subfolder: str = "",
+        token: bool | str | None = None,
+        cache_folder: str | None = None,
+        revision: str | None = None,
+        local_files_only: bool = False,
+        trust_remote_code: bool = False,
+        model_kwargs: dict | None = None,
+        processor_kwargs: dict | None = None,
+        config_kwargs: dict | None = None,
+        backend: str = "torch",
+    ) -> StrictLoadModule:
+        config = cls.load_config(
+            model_name_or_path,
+            subfolder=subfolder,
+            token=token,
+            cache_folder=cache_folder,
+            revision=revision,
+            local_files_only=local_files_only,
+        )
+        return cls(**config)
+
+
+def test_modules_and_path_combo_warns_and_loads_from_path(caplog) -> None:
+    """Passing both ``model_name_or_path`` and ``modules`` silently discarded the modules: now it
+    warns, and the checkpoint's own modules win."""
+    from sentence_transformers.base.modules import Normalize
+
+    with caplog.at_level(logging.WARNING):
+        model = SentenceTransformer("sentence-transformers-testing/stsb-bert-tiny-safetensors", modules=[Normalize()])
+    assert any("`modules` argument is ignored" in record.message for record in caplog.records)
+    assert len(model) == 2  # the checkpoint's Transformer + Pooling, not the single Normalize
+
+
+def test_third_party_module_with_strict_load_signature_round_trips(tmp_path: Path) -> None:
+    """The loader passes init_defaults to module.load() only when the model provides some: a
+    third-party module pinning the exact keyword list without **kwargs must keep loading."""
+    from sentence_transformers.sentence_transformer.modules import Pooling, Transformer
+
+    transformer = Transformer("sentence-transformers-testing/stsb-bert-tiny-safetensors")
+    pooling = Pooling(transformer.get_embedding_dimension(), "mean")
+    model = SentenceTransformer(modules=[transformer, pooling, StrictLoadModule(scale=2.0)])
+    model.save_pretrained(str(tmp_path))
+
+    reloaded = SentenceTransformer(str(tmp_path), trust_remote_code=True)
+    strict = reloaded[2]
+    assert isinstance(strict, StrictLoadModule)
+    assert strict.scale == 2.0
+    reloaded.encode(["round trip"])
+
+
+def test_private_load_with_module_classes_loads_without_trust_remote_code(tmp_path: Path) -> None:
+    """A module class outside Sentence Transformers needs ``trust_remote_code=True``, which also permits
+    remote code for the backbone. Supplying the class this process already imported loads it without the
+    flag. A strict ``load()`` signature must survive that too, so it never sees the extra keyword."""
+    from sentence_transformers.sentence_transformer.modules import Pooling, Transformer
+    from sentence_transformers.util import fullname
+
+    transformer = Transformer("sentence-transformers-testing/stsb-bert-tiny-safetensors")
+    pooling = Pooling(transformer.get_embedding_dimension(), "mean")
+    SentenceTransformer(modules=[transformer, pooling, StrictLoadModule(scale=2.0)]).save_pretrained(str(tmp_path))
+
+    with pytest.raises(ValueError, match="trust_remote_code"):
+        SentenceTransformer(str(tmp_path))
+
+    # The mapping exempts only what it names: a ref it does not cover is still refused.
+    with pytest.raises(ValueError, match="trust_remote_code"):
+        SentenceTransformer._load_with_module_classes(str(tmp_path), {"other.pkg.Thing": StrictLoadModule})
+
+    reloaded = SentenceTransformer._load_with_module_classes(
+        str(tmp_path), {fullname(StrictLoadModule): StrictLoadModule}
+    )
+    assert isinstance(reloaded[2], StrictLoadModule)
+    assert reloaded[2].scale == 2.0
+    assert reloaded.trust_remote_code is False
+    reloaded.encode(["round trip"])
+
+
+def _save_cpu_dtype_checkpoint(path: Path, dtype: torch.dtype = torch.float16) -> str:
+    config = BertConfig(vocab_size=5, hidden_size=8, num_hidden_layers=1, num_attention_heads=2, intermediate_size=16)
+    BertModel(config).to(dtype).save_pretrained(path)
+    BertTokenizer(
+        vocab={token: i for i, token in enumerate(["[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]"])}
+    ).save_pretrained(path)
+    return str(path)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize(
+    ("model_kwargs", "override_dtype"),
+    [
+        (None, None),
+        ({"dtype": "auto"}, None),
+        ({"torch_dtype": "auto"}, None),
+        ({"dtype": None}, None),
+        ({"device_map": {"": "cpu"}}, None),
+        ({"dtype": torch.float16}, torch.float16),
+        ({"dtype": "bfloat16"}, torch.bfloat16),
+        ({"torch_dtype": torch.float16}, torch.float16),
+        ({"torch_dtype": "bfloat16"}, torch.bfloat16),
+        ({"dtype": torch.float32}, torch.float32),
+        ({"dtype": None, "torch_dtype": torch.float16}, torch.float16),
+        ({"dtype": torch.float16, "torch_dtype": "auto"}, torch.float16),
+        ({"dtype": "auto", "torch_dtype": torch.float16}, None),
+    ],
+)
+def test_cpu_dtype_warning_from_checkpoint(dtype, model_kwargs, override_dtype, tmp_path: Path, caplog) -> None:
+    model_path = _save_cpu_dtype_checkpoint(tmp_path, dtype)
+
+    with caplog.at_level(logging.WARNING, logger="sentence_transformers.base.model"):
+        model = SentenceTransformer(model_path, device="cpu", model_kwargs=model_kwargs, local_files_only=True)
+
+    assert model.dtype == (override_dtype or dtype)
+    messages = [record.message for record in caplog.records if "This model was loaded in" in record.message]
+    if dtype == torch.float32 or override_dtype is not None:
+        assert not messages
+    else:
+        assert len(messages) == 1
+        assert f"{dtype} on CPU" in messages[0]
+        assert 'model_kwargs={"dtype": torch.float32}' in messages[0]
+
+
+@pytest.mark.parametrize("model_class", [SentenceTransformer, SparseEncoder, CrossEncoder, MultiVectorEncoder])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_cpu_dtype_warning_once(model_class, dtype, tmp_path: Path, caplog) -> None:
+    model_path = _save_cpu_dtype_checkpoint(tmp_path, dtype)
+    with caplog.at_level(logging.WARNING, logger="sentence_transformers.base.model"):
+        for _ in range(2):
+            model_class(model_path, device="cpu", local_files_only=True)
+    assert sum("This model was loaded in" in record.message for record in caplog.records) == 1
+
+
+@pytest.mark.parametrize("backend", ["onnx", "openvino"])
+def test_cpu_dtype_warning_skips_other_backends(backend, tmp_path: Path, caplog) -> None:
+    model_path = _save_cpu_dtype_checkpoint(tmp_path)
+    module = BertModel.from_pretrained(model_path, local_files_only=True)
+    with patch.object(SentenceTransformer, "_load_modules", return_value=([module], None)):
+        SentenceTransformer(model_path, device="cpu", backend=backend)
+    assert "This model was loaded in" not in caplog.text
+
+
+@pytest.mark.parametrize("execution_device", ["cuda:0", "mps"])
+def test_cpu_dtype_warning_uses_execution_device(execution_device, tmp_path: Path, caplog) -> None:
+    model_path = _save_cpu_dtype_checkpoint(tmp_path)
+    module = BertModel.from_pretrained(model_path, local_files_only=True)
+    module._hf_hook = SimpleNamespace(execution_device=execution_device)
+    with patch.object(SentenceTransformer, "_load_modules", return_value=([module], None)):
+        model = SentenceTransformer(model_path)
+    assert next(model.parameters()).device.type == "cpu"
+    assert model.device == torch.device(execution_device)
+    assert "This model was loaded in" not in caplog.text
+
+
+@pytest.mark.parametrize("dtype_key", ["dtype", "torch_dtype"])
+@pytest.mark.parametrize("model_kwargs", [None, {"dtype": "auto"}])
+def test_cpu_dtype_warning_respects_config_dtype(dtype_key, model_kwargs, tmp_path: Path, caplog) -> None:
+    model_path = _save_cpu_dtype_checkpoint(tmp_path)
+    model = SentenceTransformer(
+        model_path,
+        device="cpu",
+        model_kwargs=model_kwargs,
+        config_kwargs={dtype_key: torch.bfloat16},
+        local_files_only=True,
+    )
+    assert model.dtype == torch.bfloat16
+    assert "This model was loaded in" not in caplog.text
+
+
+def test_cpu_dtype_warning_skips_prebuilt_modules(tmp_path: Path, caplog) -> None:
+    model_path = _save_cpu_dtype_checkpoint(tmp_path)
+    module = BertModel.from_pretrained(model_path, dtype=torch.bfloat16, local_files_only=True)
+    model = SentenceTransformer(modules=[module], device="cpu")
+    assert model.dtype == torch.bfloat16
+    assert "This model was loaded in" not in caplog.text
+
+
+def test_cpu_dtype_warning_skips_static_checkpoint(tmp_path: Path, caplog, clear_warning_once_cache) -> None:
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+
+    from sentence_transformers.sentence_transformer.modules import StaticEmbedding
+
+    tokenizer = Tokenizer(WordLevel({"hello": 0, "[UNK]": 1}, unk_token="[UNK]"))
+    module = StaticEmbedding(tokenizer, embedding_weights=torch.ones(2, 8, dtype=torch.bfloat16))
+    SentenceTransformer(modules=[module], device="cpu").save_pretrained(str(tmp_path), create_model_card=False)
+    caplog.clear()
+    clear_warning_once_cache()
+
+    model = SentenceTransformer(str(tmp_path), device="cpu", local_files_only=True)
+    assert model.dtype == torch.bfloat16
+    assert "This model was loaded in" not in caplog.text
+
+
+def test_cpu_dtype_warning_skips_parameterless_model(caplog) -> None:
+    SentenceTransformer(modules=[nn.Identity()], device="cpu")
+    assert "This model was loaded in" not in caplog.text
+
+
+@pytest.mark.parametrize("absolute", [False, True])
+@pytest.mark.parametrize("trust_remote_code", [False, True])
+def test_model_rejects_external_dense_module(tmp_path: Path, absolute: bool, trust_remote_code: bool) -> None:
+    outside_model = tmp_path / "outside_model" / "2_Dense"
+    outside_model.mkdir(parents=True)
+    Dense(4, 2, bias=False, activation_function=nn.Identity()).save(str(outside_model))
+    model = tmp_path / "model"
+    model.mkdir()
+    path = str(outside_model) if absolute else "../outside_model/2_Dense"
+    modules = [{"idx": 0, "name": "0", "path": path, "type": "sentence_transformers.models.Dense"}]
+    (model / "modules.json").write_text(json.dumps(modules))
+
+    with pytest.raises(ValueError, match="Invalid model path"):
+        SentenceTransformer(str(model), trust_remote_code=trust_remote_code, local_files_only=True, device="cpu")
+
+
+@pytest.mark.parametrize("path", ["", ".", "0_Dense", "nested/0_Dense"])
+def test_model_loads_relative_dense_module(tmp_path: Path, path: str) -> None:
+    module_path = tmp_path / path
+    module_path.mkdir(parents=True, exist_ok=True)
+    dense = Dense(4, 2, bias=False, activation_function=nn.Identity())
+    dense.save(str(module_path))
+    modules = [{"idx": 0, "name": "0", "path": path, "type": "sentence_transformers.models.Dense"}]
+    (tmp_path / "modules.json").write_text(json.dumps(modules))
+
+    model = SentenceTransformer(str(tmp_path), local_files_only=True, device="cpu")
+    inputs = torch.randn(3, 4)
+    actual = model({"sentence_embedding": inputs})["sentence_embedding"]
+    torch.testing.assert_close(actual, inputs @ dense.linear.weight.T)
+
+
+def test_model_validates_all_paths_before_resolving_classes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    modules = [
+        {"idx": 0, "name": "0", "path": "", "type": "sentence_transformers.models.Normalize"},
+        {"idx": 1, "name": "1", "path": "../outside_model", "type": "sentence_transformers.models.Normalize"},
+    ]
+    (tmp_path / "modules.json").write_text(json.dumps(modules))
+    resolve_class = MagicMock(side_effect=AssertionError("Module class resolution must not run"))
+    monkeypatch.setattr(BaseModel, "_load_module_class_from_ref", resolve_class)
+
+    with pytest.raises(ValueError, match="Invalid model path"):
+        SentenceTransformer(str(tmp_path), local_files_only=True, device="cpu")
+    resolve_class.assert_not_called()
+
+
+@pytest.mark.parametrize("external", [False, True])
+def test_legacy_model_module_paths(tmp_path: Path, external: bool) -> None:
+    loaded_paths = []
+
+    class LegacyDense(Dense):
+        @staticmethod
+        def load(input_path):
+            loaded_paths.append(Path(input_path))
+            return Dense.load(input_path, local_files_only=True)
+
+    model_path = tmp_path / "model"
+    model_path.mkdir()
+    module_path = tmp_path / "outside_model" if external else model_path / "nested" / "dense"
+    module_path.mkdir(parents=True)
+    Dense(4, 2).save(str(module_path))
+    path = "../outside_model" if external else "nested/dense"
+    module_classes = {"test.LegacyDense": LegacyDense}
+
+    modules = [{"idx": 0, "name": "0", "path": path, "type": "test.LegacyDense"}]
+    (model_path / "modules.json").write_text(json.dumps(modules))
+
+    def load():
+        return SentenceTransformer._load_with_module_classes(
+            str(model_path), module_classes=module_classes, local_files_only=True, device="cpu"
+        )
+
+    if external:
+        with pytest.raises(ValueError, match="Invalid model path"):
+            load()
+        assert loaded_paths == []
+    else:
+        load()
+        assert loaded_paths == [module_path]

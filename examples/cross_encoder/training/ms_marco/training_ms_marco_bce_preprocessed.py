@@ -99,7 +99,8 @@ def main():
         logging_first_step=True,
         run_name=run_name,  # Will be used in W&B if `wandb` is installed
         seed=12,
-        dataloader_num_workers=4,
+        dataloader_num_workers=2,
+        dataloader_persistent_workers=True,  # Recommended on Windows/macOS, can be False on Linux
     )
 
     # 6. Create the trainer & start training
@@ -121,13 +122,13 @@ def main():
     model.save_pretrained(final_output_dir)
 
     # 9. (Optional) save the model to the Hugging Face Hub!
-    # It is recommended to run `huggingface-cli login` to log into your Hugging Face account first
+    # It is recommended to run `hf auth login` to log into your Hugging Face account first
     try:
         model.push_to_hub(run_name)
     except Exception:
         logging.error(
             f"Error uploading model to the Hugging Face Hub:\n{traceback.format_exc()}To upload it manually, you can run "
-            f"`huggingface-cli login`, followed by loading the model using `model = CrossEncoder({final_output_dir!r})` "
+            f"`hf auth login`, followed by loading the model using `model = CrossEncoder({final_output_dir!r})` "
             f"and saving it using `model.push_to_hub('{run_name}')`."
         )
 

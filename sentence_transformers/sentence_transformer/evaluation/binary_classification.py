@@ -183,7 +183,7 @@ class BinaryClassificationEvaluator(BaseEvaluator):
         file_output_data = [epoch, steps]
 
         for header_name in self.csv_headers:
-            if header_name.count("_") == 1:
+            if header_name not in ("epoch", "steps"):
                 sim_fct, metric = header_name.split("_", maxsplit=1)
                 if sim_fct in scores:
                     file_output_data.append(scores[sim_fct][metric])
@@ -210,7 +210,7 @@ class BinaryClassificationEvaluator(BaseEvaluator):
             metrics.update(
                 {
                     f"max_{metric}": max(scores[short_name][metric] for short_name in scores)
-                    for metric in scores["cosine"]
+                    for metric in next(iter(scores.values()))
                 }
             )
             self.primary_metric = "max_ap"
@@ -225,7 +225,7 @@ class BinaryClassificationEvaluator(BaseEvaluator):
         try:
             # If the sentences are hashable, then we can use a set to avoid embedding the same sentences multiple
             # times
-            sentences = list(set(self.sentences1 + self.sentences2))
+            sentences = list({*self.sentences1, *self.sentences2})
         except TypeError:
             # Otherwise we just embed everything, e.g. if the sentences are images for evaluating a CLIP model
             embeddings1 = self.embed_inputs(model, self.sentences1)
@@ -247,13 +247,14 @@ class BinaryClassificationEvaluator(BaseEvaluator):
                 "name": "Dot-Product",
                 "greater_is_better": True,
             },
+            # pairwise_*_sim returns negative distances, so negate them back into positive distances (#3702)
             SimilarityFunction.MANHATTAN.value: {
-                "score_fn": lambda x, y: pairwise_manhattan_sim(x, y),
+                "score_fn": lambda x, y: -pairwise_manhattan_sim(x, y),
                 "name": "Manhattan-Distance",
                 "greater_is_better": False,
             },
             SimilarityFunction.EUCLIDEAN.value: {
-                "score_fn": lambda x, y: pairwise_euclidean_sim(x, y),
+                "score_fn": lambda x, y: -pairwise_euclidean_sim(x, y),
                 "name": "Euclidean-Distance",
                 "greater_is_better": False,
             },
@@ -315,6 +316,8 @@ class BinaryClassificationEvaluator(BaseEvaluator):
     @staticmethod
     def find_best_acc_and_threshold(scores, labels, high_score_more_similar: bool):
         assert len(scores) == len(labels)
+        labels = np.asarray(labels)
+        score_dtype = np.result_type(np.asarray(scores).dtype, np.float16)
         rows = list(zip(scores, labels))
 
         rows = sorted(rows, key=lambda x: x[0], reverse=high_score_more_similar)
@@ -324,18 +327,30 @@ class BinaryClassificationEvaluator(BaseEvaluator):
 
         positive_so_far = 0
         remaining_negatives = sum(labels == 0)
+        if rows:
+            # Start with the threshold that predicts every pair as dissimilar.
+            max_acc = remaining_negatives / len(labels)
+            best_threshold = np.nextafter(
+                rows[0][0], np.inf if high_score_more_similar else -np.inf, dtype=score_dtype
+            )
 
-        for i in range(len(rows) - 1):
-            score, label = rows[i]
+        for i, (score, label) in enumerate(rows):
             if label == 1:
                 positive_so_far += 1
             else:
                 remaining_negatives -= 1
 
+            is_last = i == len(rows) - 1
+            if not is_last and score == rows[i + 1][0]:
+                continue
+
             acc = (positive_so_far + remaining_negatives) / len(labels)
             if acc > max_acc:
                 max_acc = acc
-                best_threshold = (rows[i][0] + rows[i + 1][0]) / 2
+                best_threshold = score if is_last else (score + rows[i + 1][0]) / 2
+                # A rounded midpoint must not include the next score group.
+                if not is_last and best_threshold == rows[i + 1][0]:
+                    best_threshold = score
 
         return max_acc, best_threshold
 
@@ -356,12 +371,15 @@ class BinaryClassificationEvaluator(BaseEvaluator):
         ncorrect = 0
         total_num_duplicates = sum(labels)
 
-        for i in range(len(rows) - 1):
-            score, label = rows[i]
+        for i, (score, label) in enumerate(rows):
             nextract += 1
 
             if label == 1:
                 ncorrect += 1
+
+            is_last = i == len(rows) - 1
+            if not is_last and score == rows[i + 1][0]:
+                continue
 
             if ncorrect > 0:
                 precision = ncorrect / nextract
@@ -371,7 +389,9 @@ class BinaryClassificationEvaluator(BaseEvaluator):
                     best_f1 = f1
                     best_precision = precision
                     best_recall = recall
-                    threshold = (rows[i][0] + rows[i + 1][0]) / 2
+                    threshold = score if is_last else (score + rows[i + 1][0]) / 2
+                    if not is_last and threshold == rows[i + 1][0]:
+                        threshold = score
 
         return best_f1, best_precision, best_recall, threshold
 

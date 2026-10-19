@@ -53,6 +53,12 @@ Training Cross Encoder models involves between 4 to 6 components, just like [tra
 </div>
 <p></p>
 
+```{eval-rst}
+.. tip::
+
+   Before downloading training models or datasets, we recommend logging in with ``hf auth login`` for higher Hugging Face Hub rate limits and access to private or gated models and datasets your account can read. See the `login instructions <../installation.html#log-in-to-hugging-face>`_.
+```
+
 ## Model
 
 ```{eval-rst}
@@ -127,7 +133,7 @@ But if instead you want to train from another checkpoint, or from scratch, then 
         # Use a text-generation checkpoint as a reranker
         model = CrossEncoder("google/gemma-2-2b-it")
 
-    This causal-LM setup always behaves like a single-label scorer (effectively ``num_labels=1``): it is designed for scoring and reranking tasks (e.g. query–document relevance), **not** for multi-class classification where you need one logit per class. For classification problems with more than one label, you should prefer the encoder / sequence-classification checkpoints instead.
+    This causal-LM setup always behaves like a single-label scorer (effectively ``num_labels=1``): it is designed for scoring and reranking tasks (e.g. query-document relevance), **not** for multi-class classification where you need one logit per class. For classification problems with more than one label, you should prefer the encoder / sequence-classification checkpoints instead.
 ```
 
 ## Dataset
@@ -284,7 +290,7 @@ You can also train bidirectionally (e.g. image-to-text *and* text-to-image) by c
         loss=loss,
     )
 
-The data collator automatically handles multimodal preprocessing via the model's ``preprocess`` method, so no manual tokenization or image processing is needed. The dataset format is the same regardless of whether the underlying model is an encoder or a causal LM; only the model architecture differs. See `Training Examples > Multimodal <../../examples/cross_encoder/training/multimodal/README.html>`_ for complete training scripts.
+The data collator automatically handles multimodal preprocessing via the model's ``preprocess`` method, so no manual tokenization or image processing is needed. The dataset format is the same regardless of whether the underlying model is an encoder or a causal LM. Only the model architecture differs. See `Training Examples > Multimodal <../../examples/cross_encoder/training/multimodal/README.html>`_ for complete training scripts.
 ```
 
 ### Hard Negatives Mining
@@ -330,7 +336,7 @@ The strongest CrossEncoder models are generally trained to recognize hard negati
         range_max=100,  # Consider only the x most similar samples
         max_score=0.8,  # Only consider samples with a similarity score of at most x
         absolute_margin=0.1,  # Anchor-negative similarity is at least x lower than anchor-positive similarity
-        relative_margin=0.1,  # Anchor-negative similarity is at most 1-x times the anchor-positive similarity, e.g. 90%
+        relative_margin=0.1,  # Anchor-negative similarity is below anchor-positive similarity by at least x of its magnitude, e.g. 10%
         sampling_strategy="top",  # Sample the top negatives from the range
         batch_size=4096,  # Use a batch size of 4096 for the embedding model
         output_format="labeled-pair",  # The output format is (query, passage, label), as required by BinaryCrossEntropyLoss
@@ -438,6 +444,7 @@ The :class:`~sentence_transformers.cross_encoder.training_args.CrossEncoderTrain
         <a href="https://huggingface.co/docs/transformers/main/en/main_classes/trainer#transformers.TrainingArguments.eval_accumulation_steps"><code>eval_accumulation_steps</code></a>
         <a href="https://huggingface.co/docs/transformers/main/en/main_classes/trainer#transformers.TrainingArguments.optim"><code>optim</code></a>
         <a href="https://huggingface.co/docs/transformers/main/en/main_classes/trainer#transformers.TrainingArguments.dataloader_num_workers"><code>dataloader_num_workers</code></a>
+        <a href="https://huggingface.co/docs/transformers/main/en/main_classes/trainer#transformers.TrainingArguments.dataloader_persistent_workers"><code>dataloader_persistent_workers</code></a>
         <a href="https://huggingface.co/docs/transformers/main/en/main_classes/trainer#transformers.TrainingArguments.dataloader_prefetch_factor"><code>dataloader_prefetch_factor</code></a>
         <a href="../package_reference/cross_encoder/training_args.html#sentence_transformers.cross_encoder.training_args.CrossEncoderTrainingArguments"><code>batch_sampler</code></a>
         <a href="../package_reference/cross_encoder/training_args.html#sentence_transformers.cross_encoder.training_args.CrossEncoderTrainingArguments"><code>multi_dataset_batch_sampler</code></a>
@@ -486,11 +493,11 @@ args = CrossEncoderTrainingArguments(
     batch_sampler=BatchSamplers.NO_DUPLICATES,  # losses that use "in-batch negatives" benefit from no duplicates
     # Optional tracking/debugging parameters:
     eval_strategy="steps",
-    eval_steps=100,
+    eval_steps=0.1,
     save_strategy="steps",
-    save_steps=100,
+    save_steps=0.1,
     save_total_limit=2,
-    logging_steps=100,
+    logging_steps=0.01,
     run_name="reranker-MiniLM-msmarco-v1",  # Will be used in W&B if `wandb` is installed
 )
 ```
@@ -511,7 +518,7 @@ Evaluator                                                                       
 :class:`~sentence_transformers.cross_encoder.evaluation.CrossEncoderRerankingEvaluator`        List of ``{'query': '...', 'positive': [...], 'negative': [...]}`` dictionaries. Negatives can be mined with :func:`~sentence_transformers.util.hard_negatives.mine_hard_negatives`.
 =============================================================================================  ========================================================================================================================================================================
 
-Additionally, :class:`~sentence_transformers.sentence_transformer.evaluation.SequentialEvaluator` should be used to combine multiple evaluators into one Evaluator that can be passed to the :class:`~sentence_transformers.cross_encoder.trainer.CrossEncoderTrainer`.
+Additionally, :class:`~sentence_transformers.base.evaluation.SequentialEvaluator` should be used to combine multiple evaluators into one Evaluator that can be passed to the :class:`~sentence_transformers.cross_encoder.trainer.CrossEncoderTrainer`.
 
 Sometimes you don't have the required evaluation data to prepare one of these evaluators on your own, but you still want to track how well the model performs on some common benchmarks. In that case, you can use these evaluators with data from Hugging Face.
 
@@ -752,6 +759,7 @@ The :class:`~sentence_transformers.cross_encoder.trainer.CrossEncoderTrainer` is
                 <li><p><a class="reference internal" href="../package_reference/cross_encoder/cross_encoder.html#sentence_transformers.cross_encoder.model.CrossEncoder.save_pretrained" title="sentence_transformers.cross_encoder.model.CrossEncoder.save_pretrained"><code class="xref py py-meth docutils literal notranslate"><span class="pre">CrossEncoder.save_pretrained()</span></code></a></p></li>
                 <li><p><a class="reference internal" href="../package_reference/cross_encoder/cross_encoder.html#sentence_transformers.cross_encoder.model.CrossEncoder.push_to_hub" title="sentence_transformers.cross_encoder.model.CrossEncoder.push_to_hub"><code class="xref py py-meth docutils literal notranslate"><span class="pre">CrossEncoder.push_to_hub()</span></code></a></p></li>
             </ol>
+            <p>To upload your trained model with <code class="docutils literal notranslate">push_to_hub()</code>, <a class="reference internal" href="../installation.html#log-in-to-hugging-face">log in to Hugging Face</a> with credentials that have write access to the destination repository.</p>
         </div>
 
     ::
@@ -830,11 +838,11 @@ The :class:`~sentence_transformers.cross_encoder.trainer.CrossEncoderTrainer` is
             bf16=True,  # Set to True if you have a GPU that supports BF16
             # Optional tracking/debugging parameters:
             eval_strategy="steps",
-            eval_steps=100,
+            eval_steps=0.1,
             save_strategy="steps",
-            save_steps=100,
+            save_steps=0.1,
             save_total_limit=2,
-            logging_steps=50,
+            logging_steps=0.01,
             logging_first_step=True,
             run_name=run_name,  # Will be used in W&B if `wandb` is installed
             seed=12,
@@ -859,13 +867,13 @@ The :class:`~sentence_transformers.cross_encoder.trainer.CrossEncoderTrainer` is
         model.save_pretrained(final_output_dir)
 
         # 9. (Optional) save the model to the Hugging Face Hub!
-        # It is recommended to run `huggingface-cli login` to log into your Hugging Face account first
+        # It is recommended to run `hf auth login` to log into your Hugging Face account first
         try:
             model.push_to_hub(run_name)
         except Exception:
             logging.error(
                 f"Error uploading model to the Hugging Face Hub:\n{traceback.format_exc()}To upload it manually, you can run "
-                f"`huggingface-cli login`, followed by loading the model using `model = CrossEncoder({final_output_dir!r})` "
+                f"`hf auth login`, followed by loading the model using `model = CrossEncoder({final_output_dir!r})` "
                 f"and saving it using `model.push_to_hub('{run_name}')`."
             )
 
@@ -893,6 +901,7 @@ The :class:`~sentence_transformers.cross_encoder.trainer.CrossEncoderTrainer` is
                 <li><p><a class="reference internal" href="../package_reference/cross_encoder/cross_encoder.html#sentence_transformers.cross_encoder.model.CrossEncoder.save_pretrained" title="sentence_transformers.cross_encoder.model.CrossEncoder.save_pretrained"><code class="xref py py-meth docutils literal notranslate"><span class="pre">CrossEncoder.save_pretrained()</span></code></a></p></li>
                 <li><p><a class="reference internal" href="../package_reference/cross_encoder/cross_encoder.html#sentence_transformers.cross_encoder.model.CrossEncoder.push_to_hub" title="sentence_transformers.cross_encoder.model.CrossEncoder.push_to_hub"><code class="xref py py-meth docutils literal notranslate"><span class="pre">CrossEncoder.push_to_hub()</span></code></a></p></li>
             </ol>
+            <p>To upload your trained model with <code class="docutils literal notranslate">push_to_hub()</code>, <a class="reference internal" href="../installation.html#log-in-to-hugging-face">log in to Hugging Face</a> with credentials that have write access to the destination repository.</p>
         </div>
 
     ::
@@ -1030,16 +1039,17 @@ The :class:`~sentence_transformers.cross_encoder.trainer.CrossEncoderTrainer` is
                 warmup_steps=0.1,
                 fp16=False,  # Set to False if you get an error that your GPU can't run on FP16
                 bf16=True,  # Set to True if you have a GPU that supports BF16
-                dataloader_num_workers=4,
+                dataloader_num_workers=2,
+                dataloader_persistent_workers=True,  # Recommended on Windows/macOS, can be False on Linux
                 load_best_model_at_end=True,
                 metric_for_best_model="eval_gooaq-dev_ndcg@10",
                 # Optional tracking/debugging parameters:
                 eval_strategy="steps",
-                eval_steps=1000,
+                eval_steps=0.1,
                 save_strategy="steps",
-                save_steps=1000,
+                save_steps=0.1,
                 save_total_limit=2,
-                logging_steps=200,
+                logging_steps=0.01,
                 logging_first_step=True,
                 run_name=run_name,  # Will be used in W&B if `wandb` is installed
                 seed=12,
@@ -1063,13 +1073,13 @@ The :class:`~sentence_transformers.cross_encoder.trainer.CrossEncoderTrainer` is
             model.save_pretrained(final_output_dir)
 
             # 9. (Optional) save the model to the Hugging Face Hub!
-            # It is recommended to run `huggingface-cli login` to log into your Hugging Face account first
+            # It is recommended to run `hf auth login` to log into your Hugging Face account first
             try:
                 model.push_to_hub(run_name)
             except Exception:
                 logging.error(
                     f"Error uploading model to the Hugging Face Hub:\n{traceback.format_exc()}To upload it manually, you can run "
-                    f"`huggingface-cli login`, followed by loading the model using `model = CrossEncoder({final_output_dir!r})` "
+                    f"`hf auth login`, followed by loading the model using `model = CrossEncoder({final_output_dir!r})` "
                     f"and saving it using `model.push_to_hub('{run_name}')`."
                 )
 
@@ -1103,7 +1113,7 @@ The top performing models are trained using many datasets at once. Normally, thi
 - Use a dictionary of :class:`~datasets.Dataset` instances (or a :class:`~datasets.DatasetDict`) as the ``train_dataset`` (and optionally also ``eval_dataset``).
 - (Optional) Use a dictionary of loss functions mapping dataset names to losses. Only required if you wish to use different loss function for different datasets.
 
-Each training/evaluation batch will only contain samples from one of the datasets. The order in which batches are samples from the multiple datasets is defined by the :class:`~sentence_transformers.sentence_transformer.training_args.MultiDatasetBatchSamplers` enum, which can be passed to the :class:`~sentence_transformers.cross_encoder.training_args.CrossEncoderTrainingArguments` via ``multi_dataset_batch_sampler``. Valid options are:
+Each training/evaluation batch will only contain samples from one of the datasets. The order in which batches are samples from the multiple datasets is defined by the :class:`~sentence_transformers.base.sampler.MultiDatasetBatchSamplers` enum, which can be passed to the :class:`~sentence_transformers.cross_encoder.training_args.CrossEncoderTrainingArguments` via ``multi_dataset_batch_sampler``. Valid options are:
 
 - ``MultiDatasetBatchSamplers.ROUND_ROBIN``: Round-robin sampling from each dataset until one is exhausted. With this strategy, it’s likely that not all samples from each dataset are used, but each dataset is sampled from equally.
 - ``MultiDatasetBatchSamplers.PROPORTIONAL`` (default): Sample from each dataset in proportion to its size. With this strategy, all samples from each dataset are used and larger datasets are sampled from more frequently.

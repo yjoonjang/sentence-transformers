@@ -19,64 +19,90 @@ requires_transformers_v5 = pytest.mark.skipif(
 )
 
 
+@pytest.fixture(
+    params=[
+        "cpu",
+        pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")),
+    ]
+)
+def device(request: pytest.FixtureRequest) -> str:
+    return request.param
+
+
 @pytest.mark.parametrize("padding_side", ["right", "left"])
 @pytest.mark.parametrize("prompt", ["", "query: ", "Summarize the following information: "])
-def test_pooling_prompt_attention_mask_respects_include_prompt(
+def test_pooling_respects_include_prompt(
     stsb_bert_tiny_model: SentenceTransformer, padding_side: str, prompt: str
 ) -> None:
+    """``include_prompt=False`` drops the prompt tokens from the pooling average and nothing else:
+    the encoder still attends over them and the reported mask still describes them. So the contract
+    is on the pooled vector, which must be the mean over the real tokens that follow the prompt."""
     model = stsb_bert_tiny_model
     model.tokenizer.padding_side = padding_side
+    assert model[1].pooling_mode == "mean", "the premise recomputes a mean pool by hand"
 
     sentences = ["Text one", "Text two is a bit longer"]
 
     # First run with include_prompt=True (default behavior)
     model.set_pooling_include_prompt(True)
-    outputs_with_prompt = model.encode(
-        sentences,
-        prompt=prompt,
-        output_value=None,
-    )
+    outputs_with_prompt = model.encode(sentences, prompt=prompt, output_value=None)
 
     # Then run with include_prompt=False (new behavior)
     model.set_pooling_include_prompt(False)
-    outputs_without_prompt = model.encode(
-        sentences,
-        prompt=prompt,
-        output_value=None,
-    )
+    outputs_without_prompt = model.encode(sentences, prompt=prompt, output_value=None)
 
     assert len(outputs_with_prompt) == len(outputs_without_prompt) == len(sentences)
 
-    for i, (out_with, out_without) in enumerate(zip(outputs_with_prompt, outputs_without_prompt)):
-        attn_with = torch.as_tensor(out_with["attention_mask"])
-        attn_without = torch.as_tensor(out_without["attention_mask"])
+    for out_with, out_without in zip(outputs_with_prompt, outputs_without_prompt):
+        attention_mask = torch.as_tensor(out_without["attention_mask"])
+        # Both settings attend over the same tokens, so both report the same mask.
+        assert torch.equal(attention_mask, torch.as_tensor(out_with["attention_mask"]))
 
-        # We never want to turn padding tokens back on
-        assert torch.all(attn_without <= attn_with)
-
+        embedding = torch.as_tensor(out_without["sentence_embedding"])
         if prompt == "":
             assert "prompt_length" not in out_without
-            prompt_length = 0
-        else:
-            prompt_length = out_without["prompt_length"]
+            assert torch.allclose(embedding, torch.as_tensor(out_with["sentence_embedding"]), atol=1e-6)
+            continue
+
+        prompt_length = out_without["prompt_length"]
         if isinstance(prompt_length, torch.Tensor):
-            prompt_length = int(prompt_length.item())
-        else:
-            prompt_length = int(prompt_length)
+            prompt_length = int(prompt_length.flatten()[0].item())
+        prompt_length = int(prompt_length)
 
-        # Positions that changed from 1 -> 0 correspond exactly to the prompt tokens
-        removed = (attn_with == 1) & (attn_without == 0)
-        assert int(removed.sum().item()) == prompt_length
+        # The prompt tokens are the first `prompt_length` real ones, after any left padding.
+        pooled_mask = attention_mask.clone()
+        pooled_mask[: int(attention_mask.to(torch.int32).argmax().item()) + prompt_length] = 0
+        assert pooled_mask.sum() > 0, "the premise needs a token left to pool over"
 
-        # If this is the short text, we should always see some 0's at the start for left padding
-        # and at the end for right padding
-        if i == 0:
-            if padding_side == "left":
-                assert attn_without[0] == 0
-                assert attn_with[0] == 0
-            else:
-                assert attn_without[-1] == 0
-                assert attn_with[-1] == 0
+        token_embeddings = torch.as_tensor(out_without["token_embeddings"])
+        expected = (token_embeddings * pooled_mask.unsqueeze(-1)).sum(dim=0) / pooled_mask.sum()
+        assert torch.allclose(embedding, expected, atol=1e-5)
+        assert not torch.allclose(embedding, torch.as_tensor(out_with["sentence_embedding"]), atol=1e-5)
+
+
+@pytest.mark.parametrize("padding_side", ["right", "left"])
+def test_pooling_prompt_exclusion_is_idempotent(stsb_bert_tiny_model: SentenceTransformer, padding_side: str) -> None:
+    """The wrapper losses re-embed the dicts they were given, e.g. once per layer in
+    AdaptiveLayerLoss. Narrowing ``attention_mask`` in place would hide the prompt from the encoder
+    on the second pass and put the prompt boundary a prompt further in, so embedding a dict Pooling
+    already wrote to must reproduce the first result."""
+    model = stsb_bert_tiny_model
+    model.tokenizer.padding_side = padding_side
+    model.set_pooling_include_prompt(False)
+
+    features = {
+        key: value.to(model.device) if isinstance(value, torch.Tensor) else value
+        for key, value in model.preprocess(["Text one", "Text two is a bit longer"], prompt="query: ").items()
+    }
+    assert "prompt_length" in features, "the premise needs a prompt to exclude"
+
+    with torch.no_grad():
+        first = model(features)["sentence_embedding"].clone()
+        first_mask = features["attention_mask"].clone()
+        second = model(features)["sentence_embedding"].clone()
+
+    assert torch.equal(features["attention_mask"], first_mask)
+    assert torch.allclose(first, second, atol=1e-6)
 
 
 @pytest.mark.parametrize("pooling_mode", Pooling.POOLING_MODES)
@@ -193,6 +219,22 @@ def test_pooling_flattened_cls_uses_cls_token_embeddings() -> None:
     assert torch.allclose(sentence_embedding, cls_token_embeddings)
 
 
+@pytest.mark.parametrize("prompt_length, expected", [(2, [[1.0], [5.0], [7.0]]), (3, [[1.0], [6.0], [7.0]])])
+def test_pooling_flattened_cls_falls_back_when_prompt_covers_sequence(
+    prompt_length: int, expected: list[list[float]], device: str
+) -> None:
+    pooling = Pooling(embedding_dimension=1, pooling_mode="cls", include_prompt=False)
+    features = {
+        "token_embeddings": torch.arange(1, 9, dtype=torch.float32, device=device).reshape(1, 8, 1),
+        "cu_seq_lens_q": torch.tensor([0, 2, 6, 8], dtype=torch.int32, device=device),
+        "prompt_length": prompt_length,
+    }
+
+    output = pooling(features)["sentence_embedding"]
+
+    torch.testing.assert_close(output, torch.tensor(expected, device=device))
+
+
 def test_pooling_cls_right_padded_uses_position_zero() -> None:
     """For right-padded inputs, the first real token is at position 0."""
     dim = 1
@@ -225,7 +267,7 @@ def test_pooling_max_respects_attention_mask() -> None:
     dim = 1
     pooling = Pooling(embedding_dimension=dim, pooling_mode="max")
 
-    # Last position has the largest value but is masked out; max should
+    # Last position has the largest value but is masked out. Max should
     # therefore come from the last unmasked token.
     token_embeddings = torch.tensor(
         [
@@ -241,7 +283,8 @@ def test_pooling_max_respects_attention_mask() -> None:
     assert torch.allclose(sentence_embedding, torch.tensor([[5.0]]))
 
 
-def test_pooling_mean_and_mean_sqrt_len_tokens() -> None:
+@pytest.mark.parametrize("dtype", [torch.float32, torch.int64])
+def test_pooling_mean_and_mean_sqrt_len_tokens(dtype: torch.dtype) -> None:
     dim = 1
     # Enable both mean and mean_sqrt_len at once to test that the
     # output dimension doubles and that both values are correct.
@@ -252,8 +295,9 @@ def test_pooling_mean_and_mean_sqrt_len_tokens() -> None:
 
     token_embeddings = torch.tensor(
         [
-            [[1.0], [3.0], [5.0]],
-        ]
+            [[1.0], [2.0], [5.0]],
+        ],
+        dtype=dtype,
     )
     attention_mask = torch.tensor([[1, 1, 0]], dtype=torch.int64)
 
@@ -263,8 +307,8 @@ def test_pooling_mean_and_mean_sqrt_len_tokens() -> None:
     # Implementation uses: sum_embeddings / sqrt(len) for the
     # `mean_sqrt_len_tokens` component, where len is the number of
     # attended tokens.
-    expected_mean = (1.0 + 3.0) / 2.0
-    expected_mean_sqrt = (1.0 + 3.0) / (2.0**0.5)
+    expected_mean = (1.0 + 2.0) / 2.0
+    expected_mean_sqrt = (1.0 + 2.0) / (2.0**0.5)
 
     assert sentence_embedding.shape == (1, 2 * dim)
     assert torch.allclose(
@@ -300,7 +344,7 @@ def test_pooling_lasttoken_finds_last_attended_token() -> None:
     dim = 1
     pooling = Pooling(embedding_dimension=dim, pooling_mode="lasttoken")
 
-    # Each row has a different pattern of attended tokens; the last
+    # Each row has a different pattern of attended tokens. The last
     # attended position should be selected.
     token_embeddings = torch.tensor(
         [
@@ -372,8 +416,9 @@ def test_pooling_excludes_prompt_tokens_directly(padding_side: str, prompt_lengt
             dtype=torch.int64,
         )
 
-    # Clone so we can compare after the forward pass, since Pooling
-    # mutates the attention mask in-place when include_prompt=False.
+    # The narrowed mask never leaves the module, so the exclusion is checked on the pooled vector.
+    # Both the caller's tensor and its key must come back untouched: the gradient-cached losses
+    # re-embed the tensor in their backward pass, and the wrapper losses re-embed the dict.
     original_attention_mask = attention_mask.clone()
 
     features = {
@@ -382,24 +427,26 @@ def test_pooling_excludes_prompt_tokens_directly(padding_side: str, prompt_lengt
         "prompt_length": prompt_length_value,
     }
 
-    pooling(features)
+    outputs = pooling(features)
 
-    # For right padding, we expect the first `prompt_length` positions
-    # to be set to 0. For left padding, we expect all padding tokens
-    # plus the next `prompt_length` tokens to be set to 0.
+    assert torch.equal(attention_mask, original_attention_mask)
+    assert features["attention_mask"] is attention_mask
+
+    # For right padding, the first `prompt_length` positions drop out of the average. For left
+    # padding, all padding tokens plus the next `prompt_length` tokens do.
     if isinstance(prompt_length_value, torch.Tensor):
         prompt_length_scalar = int(prompt_length_value[0].item())
     else:
         prompt_length_scalar = int(prompt_length_value)
 
     pad_lengths = original_attention_mask.to(torch.int32).argmax(dim=1)
-    expected_zero_upto = pad_lengths + prompt_length_scalar
-
+    pooled_mask = original_attention_mask.clone()
     for i in range(batch_size):
-        # All positions strictly before expected_zero_upto[i] must be 0
-        assert torch.all(attention_mask[i, : expected_zero_upto[i]] == 0)
-        # All original padding positions must still be 0
-        assert torch.all(attention_mask[i, original_attention_mask[i] == 0] == 0)
+        pooled_mask[i, : pad_lengths[i] + prompt_length_scalar] = 0
+    assert torch.all(pooled_mask.sum(dim=1) > 0), "the premise needs a token left to pool over"
+
+    expected = (token_embeddings * pooled_mask.unsqueeze(-1)).sum(dim=1) / pooled_mask.sum(dim=1, keepdim=True)
+    assert torch.allclose(outputs["sentence_embedding"], expected, atol=1e-6)
 
 
 # Shared test fixtures: two sequences with different lengths and a mix of padding.
@@ -429,6 +476,7 @@ _EXPECTED_BY_MODE: dict[str, torch.Tensor] = {
 }
 
 _EXPECTED_BY_MODE_WITH_PROMPT_EXCLUDED: dict[str, torch.Tensor] = {
+    "cls": torch.tensor([[3.0, 4.0], [30.0, 40.0]]),
     "max": torch.tensor([[5.0, 6.0], [70.0, 80.0]]),
     "mean": torch.tensor([[4.0, 5.0], [50.0, 60.0]]),
     "mean_sqrt_len_tokens": torch.tensor([[8.0, 10.0], [150.0, 180.0]])
@@ -447,7 +495,7 @@ def _build_flattened_features(token_embeddings: torch.Tensor, attention_mask: to
     samples = [{"input_ids": torch.zeros(int(length.item()), dtype=torch.long)} for length in seq_lengths]
     collated = collator(samples)
 
-    flat = torch.cat([token_embeddings[i, : int(length.item())] for i, length in enumerate(seq_lengths)], dim=0)
+    flat = token_embeddings[attention_mask.bool()]
     collated["token_embeddings"] = flat.unsqueeze(0)
     collated.pop("input_ids", None)
     collated.pop("labels", None)
@@ -499,30 +547,85 @@ def test_pooling_multi_mode(modes: tuple[str, ...], flattened: bool) -> None:
     assert torch.allclose(output, expected, atol=1e-5)
 
 
+@pytest.mark.parametrize("padding_side", ["left", "right"])
+@pytest.mark.parametrize("include_prompt", [False, True])
+def test_weightedmean_padding_invariance(padding_side: str, include_prompt: bool, device: str) -> None:
+    embeddings = _TOKEN_EMBEDDINGS.clone().to(device)
+    mask = _ATTENTION_MASK.clone().to(device)
+    weights = torch.tensor([[1.0, 2.0, 3.0, 0.0], [1.0, 2.0, 3.0, 4.0]], device=device)
+    if padding_side == "left":
+        embeddings[0] = embeddings[0].roll(1, dims=0)
+        mask[0] = mask[0].roll(1)
+        weights[0] = weights[0].roll(1)
+    if not include_prompt:
+        weights[weights == 1] = 0
+    embeddings.requires_grad_()
+    features = {"token_embeddings": embeddings, "attention_mask": mask, "prompt_length": 1}
+    pooling = Pooling(embedding_dimension=_DIM, pooling_mode="weightedmean", include_prompt=include_prompt)
+    output = pooling(features)["sentence_embedding"]
+    expected = _EXPECTED_BY_MODE if include_prompt else _EXPECTED_BY_MODE_WITH_PROMPT_EXCLUDED
+    torch.testing.assert_close(output, expected["weightedmean"].to(device))
+    (gradient,) = torch.autograd.grad(output.sum(), embeddings)
+    expected_gradient = (weights / weights.sum(dim=1, keepdim=True)).unsqueeze(-1).expand_as(embeddings)
+    torch.testing.assert_close(gradient, expected_gradient)
+
+    flat_features = _build_flattened_features(_TOKEN_EMBEDDINGS, _ATTENTION_MASK)
+    flat_features = {
+        key: value.to(device) if isinstance(value, torch.Tensor) else value for key, value in flat_features.items()
+    }
+    flat_features["prompt_length"] = 1
+    torch.testing.assert_close(pooling(flat_features)["sentence_embedding"], output)
+
+
+@pytest.mark.parametrize("attention_mask", [None, torch.tensor([[0, 1]])])
+def test_weightedmean_missing_or_mismatched_mask(attention_mask: torch.Tensor | None) -> None:
+    pooling = Pooling(embedding_dimension=1, pooling_mode="weightedmean")
+    features = {"token_embeddings": torch.tensor([[[1.0], [3.0], [7.0]]])}
+    if attention_mask is not None:
+        features["attention_mask"] = attention_mask
+    output = pooling(features)["sentence_embedding"]
+    torch.testing.assert_close(output, torch.tensor([[(1.0 + 2 * 3.0 + 3 * 7.0) / 6]]))
+
+
+def test_weightedmean_empty_sequence() -> None:
+    pooling = Pooling(embedding_dimension=2, pooling_mode="weightedmean")
+    features = {"token_embeddings": torch.empty(1, 0, 2), "attention_mask": torch.empty(1, 0, dtype=torch.long)}
+    torch.testing.assert_close(pooling(features)["sentence_embedding"], torch.zeros(1, 2))
+
+
 @pytest.mark.parametrize(
     "pooling_mode",
-    ["max", "mean", "mean_sqrt_len_tokens", "weightedmean", "lasttoken"],
+    [*Pooling.POOLING_MODES, ("cls", "mean", "weightedmean")],
 )
+@pytest.mark.parametrize("padding_side", ["left", "right"])
 @pytest.mark.parametrize(
     "flattened",
     [False, pytest.param(True, marks=requires_transformers_v5)],
     ids=["padded", "flattened"],
 )
-def test_pooling_excludes_prompt_tokens_for_padded_and_flattened_inputs(pooling_mode: str, flattened: bool) -> None:
+def test_pooling_excludes_prompt_tokens_for_padded_and_flattened_inputs(
+    pooling_mode: str | tuple[str, ...], flattened: bool, padding_side: str
+) -> None:
     pooling = Pooling(embedding_dimension=_DIM, pooling_mode=pooling_mode, include_prompt=False)
+    token_embeddings = _TOKEN_EMBEDDINGS.clone()
+    attention_mask = _ATTENTION_MASK.clone()
+    if padding_side == "left":
+        token_embeddings[0] = token_embeddings[0].roll(1, dims=0)
+        attention_mask[0] = attention_mask[0].roll(1)
 
     features: dict[str, Any]
     if flattened:
-        features = cast(dict[str, Any], _build_flattened_features(_TOKEN_EMBEDDINGS, _ATTENTION_MASK))
+        features = cast(dict[str, Any], _build_flattened_features(token_embeddings, attention_mask))
     else:
         features = {
-            "token_embeddings": _TOKEN_EMBEDDINGS,
-            "attention_mask": _ATTENTION_MASK.clone(),
+            "token_embeddings": token_embeddings,
+            "attention_mask": attention_mask,
         }
     features["prompt_length"] = 1
 
     output = pooling(features)["sentence_embedding"]
-    expected = _EXPECTED_BY_MODE_WITH_PROMPT_EXCLUDED[pooling_mode]
+    modes = (pooling_mode,) if isinstance(pooling_mode, str) else pooling_mode
+    expected = torch.cat([_EXPECTED_BY_MODE_WITH_PROMPT_EXCLUDED[mode] for mode in modes], dim=-1)
 
     assert output.shape == expected.shape
     assert torch.allclose(output, expected, atol=1e-5)
@@ -593,6 +696,114 @@ def test_pooling_config_round_trip(tmp_path: Path) -> None:
         assert loaded.pooling_mode == pooling.pooling_mode
         assert loaded.embedding_dimension == pooling.embedding_dimension
         assert loaded.include_prompt == pooling.include_prompt
+
+
+@requires_transformers_v5
+@pytest.mark.parametrize("pooling_mode", ["mean", "mean_sqrt_len_tokens", "weightedmean"])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32, torch.float64])
+@pytest.mark.parametrize("prompt_length", [0, 5])
+@pytest.mark.parametrize("flattened", [False, True])
+def test_pooling_long_sequences_preserve_precision(
+    pooling_mode: str, dtype: torch.dtype, prompt_length: int, flattened: bool, device: str
+) -> None:
+    positions = torch.arange(1024, device=device)
+    values = torch.stack((100 + positions % 13, -100 - positions % 7, positions % 11 / 32), dim=-1)
+    token_embeddings = values.to(dtype).unsqueeze(0).repeat(2, 1, 1).requires_grad_(True)
+    attention_mask = positions.unsqueeze(0) < torch.tensor([257, 1024], device=device).unsqueeze(1)
+    pooling = Pooling(embedding_dimension=3, pooling_mode=pooling_mode, include_prompt=False)
+    features = (
+        _build_flattened_features(token_embeddings, attention_mask)
+        if flattened
+        else {
+            "token_embeddings": token_embeddings,
+            "attention_mask": attention_mask,
+        }
+    )
+    features = {key: value.to(device) if isinstance(value, torch.Tensor) else value for key, value in features.items()}
+    features["prompt_length"] = prompt_length
+    output = pooling(features)["sentence_embedding"]
+    reference_input = token_embeddings.detach().double().requires_grad_()
+    expected = pooling(
+        {
+            "token_embeddings": reference_input,
+            "attention_mask": attention_mask,
+            "prompt_length": prompt_length,
+        }
+    )["sentence_embedding"]
+
+    assert output.dtype == dtype
+    torch.testing.assert_close(output, expected.to(dtype))
+    output.sum().backward()
+    expected.sum().backward()
+    torch.testing.assert_close(token_embeddings.grad, reference_input.grad.to(dtype))
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32, torch.float64])
+@pytest.mark.parametrize("flattened", [False, True])
+@pytest.mark.parametrize("scenario", ["constant", "large_product", "varying", "empty_prompt"])
+def test_pooling_weightedmean_low_precision(dtype: torch.dtype, flattened: bool, scenario: str, device: str) -> None:
+    length = {"constant": 512, "large_product": 16, "varying": 512, "empty_prompt": 8}[scenario]
+    positions = torch.arange(length, dtype=torch.float64, device=device)
+    values = torch.ones(length, 3, dtype=torch.float64, device=device)
+    if scenario == "large_product":
+        values *= 4096
+    elif scenario == "varying":
+        values[:, 0] = positions.remainder(5) / 4
+        values[:, 1] = -positions.remainder(7) / 4
+        values[:, 2] = positions.remainder(3) + 1
+    token_embeddings = values.to(dtype).unsqueeze(0).requires_grad_()
+    original = token_embeddings.detach().clone()
+    attention_mask = torch.ones(1, length, dtype=torch.long, device=device)
+    features = {"token_embeddings": token_embeddings, "attention_mask": attention_mask}
+    if flattened:
+        features["cu_seq_lens_q"] = torch.tensor([0, length], dtype=torch.int32, device=device)
+    if scenario == "empty_prompt":
+        features["prompt_length"] = length
+    pooling = Pooling(embedding_dimension=3, pooling_mode="weightedmean", include_prompt=False)
+    output = pooling(features)["sentence_embedding"]
+
+    reference_input = original.double().requires_grad_()
+    weights = torch.arange(1, length + 1, dtype=torch.float64, device=device).view(1, length, 1)
+    if scenario == "empty_prompt":
+        weights = torch.zeros_like(weights)
+    expected = (reference_input * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1e-9)
+    assert output.dtype == dtype
+    torch.testing.assert_close(output, expected.to(dtype))
+    output.sum().backward()
+    expected.sum().backward()
+    torch.testing.assert_close(token_embeddings.grad, reference_input.grad.to(dtype))
+    assert torch.equal(token_embeddings.detach(), original)
+    assert torch.equal(attention_mask, torch.ones_like(attention_mask))
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32, torch.float64])
+@pytest.mark.parametrize("weight_dtype", [torch.float16, torch.bfloat16, torch.float32, torch.float64])
+@pytest.mark.parametrize(
+    ("pooling_mode", "empty_prompt"),
+    [("mean", False), ("mean_sqrt_len_tokens", False), ("weightedmean", False), ("weightedmean", True)],
+)
+def test_pooling_mean_external_normalizer_dtype(
+    dtype: torch.dtype, weight_dtype: torch.dtype, empty_prompt: bool, pooling_mode: str, device: str
+) -> None:
+    length = 16
+    token_embeddings = torch.ones(1, length, 3, dtype=dtype, device=device, requires_grad=True)
+    weight_sum = length * (length + 1) / 2 if pooling_mode == "weightedmean" else length
+    normalizer = torch.tensor([0 if empty_prompt else weight_sum], dtype=weight_dtype, device=device)
+    features = {
+        "token_embeddings": token_embeddings,
+        "attention_mask": torch.ones(1, length, dtype=torch.long, device=device),
+        "token_weights_sum": normalizer,
+    }
+    if empty_prompt:
+        features["prompt_length"] = length
+    pooling = Pooling(embedding_dimension=3, pooling_mode=pooling_mode, include_prompt=False)
+    output = pooling(features)["sentence_embedding"]
+    assert output.dtype == torch.promote_types(dtype, weight_dtype)
+    expected_value = 0 if empty_prompt else (length**0.5 if pooling_mode == "mean_sqrt_len_tokens" else 1)
+    expected = torch.full_like(output, expected_value)
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+    output.sum().backward()
+    assert torch.isfinite(token_embeddings.grad).all()
 
 
 def test_pooling_invalid_mode_raises() -> None:

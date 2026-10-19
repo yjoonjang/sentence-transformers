@@ -49,10 +49,10 @@ def main():
     model_name = "distilbert/distilbert-base-uncased"
     train_batch_size = 32
     max_seq_length = 300
-    dataset_size = 1_000_000  # bert-ensemble-margin-mse has ~40M triplets; cap for a single-epoch example.
+    dataset_size = 1_000_000  # bert-ensemble-margin-mse has ~40M triplets. Cap for a single-epoch example.
 
     # 1. Load a model to finetune with 2. (Optional) model card data. Weights stay in fp32
-    # so the optimizer accumulates updates at full precision; `bf16=True` in TrainingArguments
+    # so the optimizer accumulates updates at full precision. `bf16=True` in TrainingArguments
     # below adds bf16 autocast on the forward/backward.
     short_model_name = model_name.split("/")[-1]
     model = SentenceTransformer(
@@ -144,13 +144,13 @@ def main():
     model.save_pretrained(final_output_dir)
 
     # 11. (Optional) Push it to the Hugging Face Hub
-    # Run `huggingface-cli login` first if you haven't already.
+    # Run `hf auth login` first if you haven't already.
     try:
         model.push_to_hub(run_name)
     except Exception:
         logging.error(
             f"Error uploading model to the Hugging Face Hub. To upload it manually, run "
-            f"`huggingface-cli login`, then load with `model = SentenceTransformer({final_output_dir!r})` "
+            f"`hf auth login`, then load with `model = SentenceTransformer({final_output_dir!r})` "
             f"and call `model.push_to_hub({run_name!r})`."
         )
 

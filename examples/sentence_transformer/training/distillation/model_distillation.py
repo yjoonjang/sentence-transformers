@@ -152,7 +152,7 @@ eval_dataset = eval_dataset.map(map_embeddings, batched=True, batch_size=50000)
 # If the student and teacher have different embedding dimensions (the default here:
 # 312-dim student vs 768-dim teacher), we ask the loss for a learnable projection that
 # maps student embeddings into the teacher's space during training. The projection only
-# exists on the loss; the saved student keeps its native output dimension.
+# exists on the loss. The saved student keeps its native output dimension.
 student_dim = student_model.get_embedding_dimension()
 teacher_dim = teacher_model.get_embedding_dimension()
 projection_dim = teacher_dim if student_dim != teacher_dim else None
@@ -216,7 +216,7 @@ student_model.save(final_output_dir)
 # train_loss.save_projection(f"{output_dir}/projection.safetensors")
 
 # (Optional) save the model to the Hugging Face Hub!
-# It is recommended to run `huggingface-cli login` to log into your Hugging Face account first
+# It is recommended to run `hf auth login` to log into your Hugging Face account first
 if "/" in student_model_name:
     student_model_name = student_model_name.split("/")[-1]
 if "/" in teacher_model_name:
@@ -227,6 +227,6 @@ try:
 except Exception:
     logging.error(
         f"Error uploading model to the Hugging Face Hub:\n{traceback.format_exc()}To upload it manually, you can run "
-        f"`huggingface-cli login`, followed by loading the model using `model = SentenceTransformer({final_output_dir!r})` "
+        f"`hf auth login`, followed by loading the model using `model = SentenceTransformer({final_output_dir!r})` "
         f"and saving it using `model.push_to_hub({repo_id!r})`."
     )

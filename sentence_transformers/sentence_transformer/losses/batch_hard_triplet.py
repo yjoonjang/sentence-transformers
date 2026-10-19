@@ -28,9 +28,13 @@ class BatchHardTripletLossDistanceFunction:
                      If false, output is the pairwise euclidean distance matrix.
         Returns:
             pairwise_distances: tensor of shape (batch_size, batch_size)
+                Float16 and bfloat16 inputs are computed in float32, including under autocast.
         """
 
-        dot_product = torch.matmul(embeddings, embeddings.t())
+        with torch.autocast(device_type=embeddings.device.type, enabled=False):
+            if embeddings.dtype in (torch.float16, torch.bfloat16):
+                embeddings = embeddings.float()
+            dot_product = torch.matmul(embeddings, embeddings.t())
 
         # Get squared L2 norm for each embedding. We can just take the diagonal of `dot_product`.
         # This also provides more numerical stability (the diagonal of the result will be exactly 0).
@@ -107,7 +111,7 @@ class BatchHardTripletLoss(nn.Module):
             +------------------+--------+
 
         Recommendations:
-            - Use ``BatchSamplers.GROUP_BY_LABEL`` (:class:`docs <sentence_transformers.sentence_transformer.training_args.BatchSamplers>`)
+            - Use ``BatchSamplers.GROUP_BY_LABEL`` (:class:`docs <sentence_transformers.base.sampler.BatchSamplers>`)
               to ensure that each batch contains at least 2 distinct labels with at least 2 samples per label.
 
         Relations:
@@ -149,7 +153,10 @@ class BatchHardTripletLoss(nn.Module):
 
     def forward(self, sentence_features: Iterable[dict[str, Tensor]], labels: Tensor):
         rep = self.sentence_embedder(sentence_features[0])["sentence_embedding"]
-        return self.batch_hard_triplet_loss(labels, rep)
+        return self.compute_loss_from_embeddings([rep], labels)
+
+    def compute_loss_from_embeddings(self, embeddings: list[Tensor], labels: Tensor) -> Tensor:
+        return self.batch_hard_triplet_loss(labels, embeddings[0])
 
     # Hard Triplet Loss
     # Source: https://github.com/NegatioN/OnlineMiningTripletLoss/blob/master/online_triplet_loss/losses.py
@@ -161,13 +168,17 @@ class BatchHardTripletLoss(nn.Module):
         Args:
             labels: labels of the batch, of size (batch_size,)
             embeddings: tensor of shape (batch_size, embed_dim)
-            margin: margin for triplet loss
-            squared: Boolean. If true, output is the pairwise squared euclidean distance matrix.
-                     If false, output is the pairwise euclidean distance matrix.
         Returns:
             Label_Sentence_Triplet: scalar tensor containing the triplet loss
         """
-        # Get the pairwise distance matrix
+        batch_size = embeddings.shape[0]
+        if labels.numel() != batch_size:
+            raise ValueError(
+                f"{self.__class__.__name__} expects {batch_size} labels (one per example), "
+                f"but got {labels.numel()} labels with shape {tuple(labels.shape)}."
+            )
+        labels = labels.view(-1)
+
         pairwise_dist = self.distance_metric(embeddings)
 
         # For each anchor, get the hardest positive

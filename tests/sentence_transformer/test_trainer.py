@@ -8,11 +8,15 @@ from pathlib import Path
 
 import pytest
 import torch
+from packaging.version import parse as parse_version
 from tokenizers.processors import TemplateProcessing
-from torch.utils.data import ConcatDataset
+from torch.utils.data import BatchSampler, ConcatDataset, DataLoader, SequentialSampler
+from transformers import __version__ as transformers_version
+from transformers.trainer_utils import EvalLoopOutput
 
 from sentence_transformers import SentenceTransformer, SentenceTransformerTrainer
 from sentence_transformers.base.sampler import (
+    BatchSamplers,
     DefaultBatchSampler,
     GroupByLabelBatchSampler,
     NoDuplicatesBatchSampler,
@@ -21,7 +25,13 @@ from sentence_transformers.base.sampler import (
     SubsetRandomSampler,
 )
 from sentence_transformers.sentence_transformer.evaluation import EmbeddingSimilarityEvaluator
-from sentence_transformers.sentence_transformer.losses import CosineSimilarityLoss, MultipleNegativesRankingLoss
+from sentence_transformers.sentence_transformer.losses import (
+    CachedMultipleNegativesRankingLoss,
+    CosineSimilarityLoss,
+    MultipleNegativesRankingLoss,
+    SoftmaxLoss,
+)
+from sentence_transformers.sentence_transformer.readers import InputExample
 from sentence_transformers.sentence_transformer.training_args import SentenceTransformerTrainingArguments
 from sentence_transformers.util import is_datasets_available, is_training_available
 
@@ -286,6 +296,33 @@ def test_trainer(
         original_embeddings = original_model.encode("The cat is on the mat.", convert_to_tensor=True)
         new_embeddings = model.encode("The cat is on the the mat.", convert_to_tensor=True)
         assert not torch.equal(original_embeddings, new_embeddings)
+
+
+def test_trainer_featureless_iterable_dataset_hint_covers_list_columns(
+    stsb_bert_tiny_model: SentenceTransformer,
+) -> None:
+    # Streaming map without features= loses the schema. The suggested Features snippet must
+    # render KD-style list columns as list features, not the invalid Value('null').
+    train_dataset = Dataset.from_dict(
+        {"sentence1": ["a"], "sentence2": ["b"], "scores": [[1.0, 0.5]]}
+    ).to_iterable_dataset()
+    train_dataset = train_dataset.map(lambda batch: batch, batched=True)
+    assert train_dataset.column_names is None
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        args = SentenceTransformerTrainingArguments(output_dir=str(temp_dir))
+        with pytest.raises(ValueError, match="must have Features") as excinfo:
+            SentenceTransformerTrainer(
+                model=stsb_bert_tiny_model,
+                args=args,
+                train_dataset=train_dataset,
+                loss=CosineSimilarityLoss(model=stsb_bert_tiny_model),
+            )
+
+    message = str(excinfo.value)
+    assert "null" not in message
+    assert "'sentence1': Value('string')" in message or "'sentence1': Value(dtype='string', id=None)" in message
+    assert "'scores': List(Value('float32'))" in message or "'scores': Sequence(" in message
 
 
 @pytest.mark.slow
@@ -748,7 +785,9 @@ def test_data_collator(
     only_prompt_length = len(model.tokenizer(["Prompt: "], add_special_tokens=False)["input_ids"][0])
     if has_bos_token:
         only_prompt_length += 1
-    assert model[0]._prompt_length_mapping == {("Prompt: ", ("task", None)): only_prompt_length}
+    # The task is intentionally excluded from the cache key: prompts are measured under plain
+    # tokenization, and caching once per prompt avoids redundant per-task entries.
+    assert model[0]._prompt_length_mapping == {("Prompt: ",): only_prompt_length}
 
 
 def test_trainer_get_batch_sampler_class(
@@ -789,6 +828,36 @@ def test_trainer_get_batch_sampler_class(
         seed=42,
     )
     assert isinstance(batch_sampler, NoDuplicatesBatchSampler)
+
+
+@pytest.mark.parametrize(
+    ("batch_sampler", "multi_dataset"),
+    [
+        (BatchSamplers.NO_DUPLICATES, False),
+        (BatchSamplers.GROUP_BY_LABEL, False),
+        (BatchSamplers.NO_DUPLICATES, True),
+    ],
+)
+def test_trainer_batch_sampler_uses_args_seed(
+    stsb_bert_tiny_model: SentenceTransformer, batch_sampler: BatchSamplers, multi_dataset: bool
+) -> None:
+    """Changing ``args.seed`` should change the batch order, as it does for the default batch sampler."""
+    train_dataset = Dataset.from_dict(
+        {"sentence": [f"sentence {i}" for i in range(64)], "label": [i % 4 for i in range(64)]}
+    )
+    if multi_dataset:
+        train_dataset = DatasetDict({"a": train_dataset, "b": train_dataset})
+
+    def get_batches(seed: int) -> list[list[int]]:
+        args = SentenceTransformerTrainingArguments(
+            output_dir="dummy", seed=seed, batch_sampler=batch_sampler, per_device_train_batch_size=8
+        )
+        trainer = SentenceTransformerTrainer(model=stsb_bert_tiny_model, args=args, train_dataset=train_dataset)
+        # Only the batches of the first dataset, as the multi-dataset sampler reorders datasets by itself
+        return [batch for batch in trainer.get_train_dataloader().batch_sampler if max(batch) < 64]
+
+    assert get_batches(1) == get_batches(1)
+    assert get_batches(1) != get_batches(2)
 
 
 def test_trainer_get_batch_sampler_function(
@@ -1026,3 +1095,244 @@ def test_trainer_call_model_init_multi_loss(
         assert isinstance(loss_fn, torch.nn.Module), f"Loss '{key}' is not an nn.Module"
         assert loss_fn.model is trainer.model, f"Loss '{key}' model was not updated to the trainer's model"
         assert loss_fn.model is not model, f"Loss '{key}' model was not updated from the original model"
+
+
+@pytest.mark.parametrize("persistent_workers", [True, False])
+def test_trainer_get_eval_dataloader_with_persistent_workers(
+    stsb_bert_tiny_model: SentenceTransformer,
+    stsb_dataset_dict: DatasetDict,
+    persistent_workers: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # With `dataloader_persistent_workers=True`, eval dataloaders must be reused across evaluations,
+    # cached per dataset name. Otherwise, every evaluation of every dataset leaks its persistent
+    # worker processes, eventually exhausting file descriptors and memory.
+    model = stsb_bert_tiny_model
+    train_dataset = stsb_dataset_dict["train"].select(range(8))
+    eval_dataset = DatasetDict(
+        {
+            "first": stsb_dataset_dict["validation"].select(range(8)),
+            "second": stsb_dataset_dict["validation"].select(range(12)),
+        }
+    )
+    loss = CosineSimilarityLoss(model=model)
+    args = SentenceTransformerTrainingArguments(
+        output_dir=tmp_path,
+        dataloader_persistent_workers=persistent_workers,
+        dataloader_num_workers=1,
+    )
+    trainer = SentenceTransformerTrainer(
+        model=model,
+        args=args,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
+        loss=loss,
+    )
+    # Mocking the prepare method to avoid the dataloader changing with each call to get_eval_dataloader
+    monkeypatch.setattr(trainer.accelerator, "prepare", lambda x: x)
+
+    first_dataloader = trainer.get_eval_dataloader("first")
+    first_dataloader_repeated = trainer.get_eval_dataloader("first")
+    second_dataloader = trainer.get_eval_dataloader("second")
+    second_dataloader_repeated = trainer.get_eval_dataloader("second")
+
+    # Each dataset name must resolve to its own dataset, never another entry of the dict
+    assert len(first_dataloader.dataset) == 8
+    assert len(second_dataloader.dataset) == 12
+    assert first_dataloader is not second_dataloader
+
+    if persistent_workers:
+        assert first_dataloader is first_dataloader_repeated
+        assert second_dataloader is second_dataloader_repeated
+    else:
+        assert first_dataloader is not first_dataloader_repeated
+        assert second_dataloader is not second_dataloader_repeated
+
+    # Datasets passed explicitly (like the per-dataset recursion of `evaluate(eval_dataset=some_dict)`)
+    # all share the "eval" cache key, so they must never be cached in place of one another
+    explicit_first = trainer.get_eval_dataloader(eval_dataset["first"])
+    explicit_second = trainer.get_eval_dataloader(eval_dataset["second"])
+    assert len(explicit_first.dataset) == 8
+    assert len(explicit_second.dataset) == 12
+    if persistent_workers:
+        assert sorted(trainer._eval_dataloaders) == ["first", "second"]
+    else:
+        assert trainer._eval_dataloaders == {}
+
+
+@pytest.mark.skipif(
+    parse_version(transformers_version) < parse_version("4.42.0"),
+    reason="transformers only recurses over dict eval datasets by name since v4.42.0",
+)
+@pytest.mark.parametrize("persistent_workers", [True, False])
+def test_trainer_evaluate_caches_eval_dataloaders_per_dataset(
+    stsb_bert_tiny_model: SentenceTransformer,
+    stsb_dataset_dict: DatasetDict,
+    persistent_workers: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # End to end variant of the test above: evaluate() must reach get_eval_dataloader with dataset
+    # names via the superclass dict recursion, otherwise the per-name caching never engages
+    model = stsb_bert_tiny_model
+    train_dataset = stsb_dataset_dict["train"].select(range(8))
+    eval_dataset = DatasetDict(
+        {
+            "first": stsb_dataset_dict["validation"].select(range(8)),
+            "second": stsb_dataset_dict["validation"].select(range(12)),
+        }
+    )
+    loss = CosineSimilarityLoss(model=model)
+    args = SentenceTransformerTrainingArguments(
+        output_dir=tmp_path,
+        dataloader_persistent_workers=persistent_workers,
+        dataloader_num_workers=1,
+    )
+    trainer = SentenceTransformerTrainer(
+        model=model,
+        args=args,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
+        loss=loss,
+    )
+
+    # Stub the evaluation loop: dataloaders are still built, prepared, and cached for real, but
+    # nothing is iterated, so no worker processes are spawned
+    seen = {}
+
+    def evaluation_loop_stub(dataloader, *loop_args, metric_key_prefix="eval", **loop_kwargs):
+        seen.setdefault(metric_key_prefix, []).append(dataloader)
+        return EvalLoopOutput(
+            predictions=None,
+            label_ids=None,
+            metrics={f"{metric_key_prefix}_loss": 0.0},
+            num_samples=len(dataloader.dataset),
+        )
+
+    monkeypatch.setattr(trainer, "evaluation_loop", evaluation_loop_stub)
+
+    metrics = trainer.evaluate()
+    trainer.evaluate()
+
+    # Each dataset must be evaluated under its own name, on its own data, in both evaluations
+    assert {prefix: [len(dl.dataset) for dl in dls] for prefix, dls in seen.items()} == {
+        "eval_first": [8, 8],
+        "eval_second": [12, 12],
+    }
+    assert "eval_first_loss" in metrics
+    assert "eval_second_loss" in metrics
+
+    if persistent_workers:
+        # The second evaluate() must consume the same prepared dataloaders, not rebuild or re-prepare
+        assert seen["eval_first"][0] is seen["eval_first"][1]
+        assert seen["eval_second"][0] is seen["eval_second"][1]
+        assert sorted(trainer._eval_dataloaders) == ["first", "second"]
+    else:
+        assert seen["eval_first"][0] is not seen["eval_first"][1]
+        assert seen["eval_second"][0] is not seen["eval_second"][1]
+        assert trainer._eval_dataloaders == {}
+
+
+@pytest.mark.parametrize("compile_before_loss", [False, True])
+def test_trainer_compiled_model_with_cached_loss(
+    stsb_bert_tiny_model: SentenceTransformer, compile_before_loss: bool
+) -> None:
+    model = stsb_bert_tiny_model
+    if compile_before_loss:
+        model = torch.compile(model, backend="eager")
+    loss = CachedMultipleNegativesRankingLoss(model=model, mini_batch_size=2)
+    if not compile_before_loss:
+        model = torch.compile(model, backend="eager")
+    SentenceTransformerTrainer(model=model, loss=loss)
+
+
+@pytest.mark.parametrize("use_fit", [False, True], ids=["trainer", "fit"])
+def test_training_updates_loss_weights(stsb_bert_tiny_model, tmp_path, monkeypatch, use_fit: bool) -> None:
+    model = stsb_bert_tiny_model
+    loss = SoftmaxLoss(model, model.get_embedding_dimension(), num_labels=3)
+    classifier_weight = loss.classifier.weight.detach().clone()
+    dataset = Dataset.from_dict(
+        {
+            "sentence1": [f"This is sentence {idx}" for idx in range(16)],
+            "sentence2": [f"This is another sentence {idx}" for idx in range(16)],
+            "label": [idx % 3 for idx in range(16)],
+        }
+    )
+
+    if use_fit:
+        monkeypatch.chdir(tmp_path)
+        examples = [InputExample(texts=[row["sentence1"], row["sentence2"]], label=row["label"]) for row in dataset]
+        model.fit(
+            train_objectives=[(DataLoader(examples, batch_size=4), loss)],
+            epochs=1,
+            warmup_steps=0,
+            show_progress_bar=False,
+        )
+    else:
+        args = SentenceTransformerTrainingArguments(
+            output_dir=str(tmp_path),
+            num_train_epochs=1,
+            per_device_train_batch_size=4,
+            save_strategy="no",
+            report_to=[],
+            disable_tqdm=True,
+        )
+        trainer = SentenceTransformerTrainer(model=model, args=args, train_dataset=dataset, loss=loss)
+        trainer.train()
+
+    assert not torch.equal(loss.classifier.weight.detach(), classifier_weight)
+    assert all(parameter.grad is None for parameter in loss.parameters())
+
+
+@pytest.mark.parametrize("num_objectives", [1, 2])
+def test_fit_scheduler_covers_every_objective_step(
+    stsb_bert_tiny_model, tmp_path, monkeypatch, num_objectives: int
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    model = stsb_bert_tiny_model
+    learning_rates = []
+
+    class RecordingAdamW(torch.optim.AdamW):
+        def step(self, *args, **kwargs):
+            learning_rates.append(self.param_groups[0]["lr"])
+            return super().step(*args, **kwargs)
+
+    train_objectives = []
+    for objective in range(num_objectives):
+        examples = [
+            InputExample(texts=[f"This is sentence {idx} {objective}", f"This is another sentence {idx}"], label=0.5)
+            for idx in range(16)
+        ]
+        train_objectives.append((DataLoader(examples, batch_size=4), CosineSimilarityLoss(model)))
+
+    model.fit(
+        train_objectives=train_objectives,
+        epochs=1,
+        warmup_steps=1,
+        optimizer_class=RecordingAdamW,
+        show_progress_bar=False,
+    )
+
+    assert len(learning_rates) == 4 * num_objectives
+    # The first step sits at the start of the warmup, so only that one may have a zero learning rate
+    assert all(learning_rate > 0 for learning_rate in learning_rates[1:])
+
+
+def test_fit_with_custom_batch_sampler(stsb_bert_tiny_model, tmp_path, monkeypatch, caplog) -> None:
+    model = stsb_bert_tiny_model
+    monkeypatch.chdir(tmp_path)
+
+    def check_batch_size(trainer, **kwargs):
+        assert trainer.args.per_device_train_batch_size == 4
+
+    monkeypatch.setattr(SentenceTransformerTrainer, "train", check_batch_size)
+
+    examples = [InputExample(texts=[f"This is sentence {idx}", f"This is another sentence {idx}"]) for idx in range(8)]
+    batch_sampler = BatchSampler(SequentialSampler(examples), batch_size=4, drop_last=False)
+    model.fit(
+        train_objectives=[(DataLoader(examples, batch_sampler=batch_sampler), MultipleNegativesRankingLoss(model))],
+        epochs=1,
+        show_progress_bar=False,
+    )
+    assert "uses a custom `batch_sampler`, whose batch grouping `fit()` does not preserve" in caplog.text

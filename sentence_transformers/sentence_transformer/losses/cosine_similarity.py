@@ -6,6 +6,7 @@ from typing import Any
 import torch
 from torch import Tensor, nn
 
+from sentence_transformers.base.losses.merged_forward import embed_columns
 from sentence_transformers.sentence_transformer.model import SentenceTransformer
 from sentence_transformers.util import fullname
 
@@ -76,7 +77,7 @@ class CosineSimilarityLoss(nn.Module):
         self.cos_score_transformation = cos_score_transformation
 
     def forward(self, sentence_features: Iterable[dict[str, Tensor]], labels: Tensor) -> Tensor:
-        embeddings = [self.model(sentence_feature)["sentence_embedding"] for sentence_feature in sentence_features]
+        embeddings = embed_columns(self.model, sentence_features)
 
         return self.compute_loss_from_embeddings(embeddings, labels)
 
@@ -91,6 +92,12 @@ class CosineSimilarityLoss(nn.Module):
         Returns:
             Loss value
         """
+        batch_size = embeddings[0].shape[0]
+        if labels.numel() != batch_size:
+            raise ValueError(
+                f"{self.__class__.__name__} expects {batch_size} labels (one per example), "
+                f"but got {labels.numel()} labels with shape {tuple(labels.shape)}."
+            )
         output = self.cos_score_transformation(torch.cosine_similarity(embeddings[0], embeddings[1]))
         return self.loss_fct(output, labels.float().view(-1))
 

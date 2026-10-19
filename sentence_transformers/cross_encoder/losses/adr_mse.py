@@ -68,7 +68,7 @@ class ADRMSELoss(nn.Module):
             +----------------------------------------+--------------------------------+-------------------------------+
 
         Recommendations:
-            - Use :class:`~sentence_transformers.util.mine_hard_negatives` with ``output_format="labeled-list"``
+            - Use :class:`~sentence_transformers.util.hard_negatives.mine_hard_negatives` with ``output_format="labeled-list"``
               to convert question-answer pairs to the required input format with hard negatives.
 
         Relations:
@@ -122,7 +122,7 @@ class ADRMSELoss(nn.Module):
         """
         score_diffs = scores.unsqueeze(1) - scores.unsqueeze(2)
         pairwise = torch.sigmoid(self.alpha * score_diffs) * mask.unsqueeze(1).float()
-        # Each valid diagonal contributes sigmoid(0) = 0.5; subtract it to exclude the self-term
+        # Each valid diagonal contributes sigmoid(0) = 0.5. Subtract it to exclude the self-term
         return 1.0 + pairwise.sum(dim=2) - 0.5 * mask.float()
 
     def forward(
@@ -138,6 +138,8 @@ class ADRMSELoss(nn.Module):
         Args:
             inputs: List of (queries, documents_list)
             labels: Ground truth relevance scores, shape (batch_size, num_documents)
+            prompt: Optional prompt passed to the model's preprocessing of the (query, document) pairs.
+            task: Optional task passed to the model's preprocessing of the (query, document) pairs.
 
         Returns:
             Tensor: Mean ADR-MSE loss over the batch

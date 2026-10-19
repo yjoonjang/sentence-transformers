@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import importlib.util
+import io
+import logging
 import random
+import wave
 
 import numpy as np
 import pytest
@@ -10,12 +13,12 @@ from packaging.version import parse as parse_version
 from torch.utils.data import ConcatDataset
 
 import sentence_transformers.base.sampler as sampler_module
-from sentence_transformers.base.sampler import NoDuplicatesBatchSampler, ProportionalBatchSampler
+from sentence_transformers.base.sampler import NoDuplicatesBatchSampler, ProportionalBatchSampler, _sample_value_str
 from sentence_transformers.util import is_datasets_available
 
 if is_datasets_available():
     import datasets
-    from datasets import Dataset
+    from datasets import Audio, Dataset, Features, Value
 
     # datasets < 4.1.0 does not support num_proc=0
     PRECOMPUTE_NUM_PROC = 0 if parse_version(datasets.__version__) >= parse_version("4.1.0") else 1
@@ -24,6 +27,17 @@ else:
         reason='Sentence Transformers was not installed with the `["train"]` extra.',
         allow_module_level=True,
     )
+
+
+def _wav_bytes(frequency: int) -> bytes:
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as writer:
+        writer.setnchannels(1)
+        writer.setsampwidth(2)
+        writer.setframerate(16000)
+        samples = np.sin(2 * np.pi * frequency * np.linspace(0, 0.1, 1600, endpoint=False))
+        writer.writeframes((samples * 10_000).astype("<i2").tobytes())
+    return buffer.getvalue()
 
 
 @pytest.fixture
@@ -172,13 +186,13 @@ def test_proportional_no_duplicates(
     batches = list(iter(batch_sampler))
 
     if drop_last:
-        # If we drop the last batch (i.e. incomplete batches), we should have 16 batches out of the 18 possible,
-        # because of the duplicates being skipped by the NoDuplicatesBatchSampler.
-        # Notably, we should not crash like reported in #2816.
-        assert len(batches) == 16
+        # Each NoDuplicatesBatchSampler now resamples until it reaches ``__len__`` (#3348),
+        # so ProportionalBatchSampler can request the full advertised count from both sides
+        # without hitting StopIteration. Notably, we should not crash like reported in #2816.
+        assert len(batches) == 18
         # All batches are the same size: 2
         assert all(len(batch) == batch_size for batch in batches)
-        assert len(sum(batches, [])) == 32
+        assert len(sum(batches, [])) == 36
     else:
         # If we don't drop incomplete batches, we should be able to do 18 batches, and get more data.
         # Note: we don't get all data, because the NoDuplicatesBatchSampler will estimate the number of batches
@@ -224,8 +238,154 @@ def test_no_duplicates_batch_sampler_matches_reference_algorithm(
     )
 
     actual_batches = list(iter(sampler))
-    assert actual_batches == expected_batches
-    assert len(sum(actual_batches, [])) == len(sum(expected_batches, []))
+    # The first pass must match the historical algorithm. Extra batches may be
+    # appended when that pass is shorter than ``__len__`` (#3348 resampling).
+    assert actual_batches[: len(expected_batches)] == expected_batches
+    assert len(actual_batches) >= len(expected_batches)
+    if len(expected_batches) < len(sampler):
+        assert len(actual_batches) == len(sampler)
+
+
+@pytest.mark.parametrize("precompute_hashes", [False, True])
+def test_no_duplicates_batch_sampler_resamples_to_match_len(precompute_hashes: bool) -> None:
+    # 20 rows, only two distinct pairs, batch_size=2, drop_last=True:
+    # a single pass can form at most 8 full [pair_1, pair_2] batches (the leftover
+    # pair_1 copies cannot fill a unique batch). ``__len__`` still advertises 10.
+    # Resampling must fill the 2-batch shortfall so DataLoader/Trainer step counts match.
+    if precompute_hashes:
+        if not is_xxhash_available():
+            pytest.skip("xxhash not installed")
+        sampler_kwargs = {
+            "precompute_hashes": True,
+            "precompute_num_proc": PRECOMPUTE_NUM_PROC,
+            "precompute_batch_size": 10,
+        }
+    else:
+        sampler_kwargs = {}
+
+    dataset = Dataset.from_list(
+        [{"anchor": "anchor_1", "positive": "positive_1"}] * 12
+        + [{"anchor": "anchor_2", "positive": "positive_2"}] * 8
+    )
+    sampler = NoDuplicatesBatchSampler(
+        dataset=dataset,
+        batch_size=2,
+        drop_last=True,
+        generator=torch.Generator(),
+        seed=0,
+        **sampler_kwargs,
+    )
+
+    expected_first_pass = _reference_no_duplicates_batches(dataset=dataset, batch_size=2, drop_last=True, seed=0)
+    batches = list(iter(sampler))
+
+    assert len(expected_first_pass) == 8
+    assert len(sampler) == 10
+    assert len(batches) == len(sampler)
+    assert all(len(batch) == 2 for batch in batches)
+    assert batches[:8] == expected_first_pass
+    for batch in batches:
+        values = {(dataset[i]["anchor"], dataset[i]["positive"]) for i in batch}
+        assert len(values) == len(batch)
+
+
+def test_no_duplicates_batch_sampler_does_not_truncate_when_first_pass_exceeds_len() -> None:
+    # drop_last=False with collisions produces more (smaller) leftover batches than
+    # ``__len__``. Those extra batches must still be yielded; only a shortfall is filled.
+    dataset = Dataset.from_list(
+        [{"anchor": "anchor_1", "positive": "positive_1"}] * 12
+        + [{"anchor": "anchor_2", "positive": "positive_2"}] * 8
+    )
+    sampler = NoDuplicatesBatchSampler(
+        dataset=dataset,
+        batch_size=2,
+        drop_last=False,
+        generator=torch.Generator(),
+        seed=0,
+    )
+    expected_first_pass = _reference_no_duplicates_batches(dataset=dataset, batch_size=2, drop_last=False, seed=0)
+    batches = list(iter(sampler))
+
+    assert len(expected_first_pass) > len(sampler)
+    assert batches == expected_first_pass
+
+
+def test_no_duplicates_batch_sampler_unique_data_matches_len_without_resample() -> None:
+    dataset = Dataset.from_dict({"text": [f"sentence_{i}" for i in range(10)]})
+    sampler = NoDuplicatesBatchSampler(
+        dataset=dataset,
+        batch_size=2,
+        drop_last=True,
+        generator=torch.Generator(),
+        seed=0,
+    )
+    batches = list(iter(sampler))
+    assert len(batches) == len(sampler) == 5
+    assert sorted(sum(batches, [])) == list(range(10))
+
+
+def test_no_duplicates_batch_sampler_cannot_form_batch_does_not_loop_forever() -> None:
+    # Every row is identical, so a unique batch of size 2 can never be formed.
+    # Resampling must stop after a pass that yields nothing, rather than hang.
+    dataset = Dataset.from_list([{"anchor": "same", "positive": "same"}] * 10)
+    sampler = NoDuplicatesBatchSampler(
+        dataset=dataset,
+        batch_size=2,
+        drop_last=True,
+        generator=torch.Generator(),
+        seed=0,
+    )
+    batches = list(iter(sampler))
+    assert batches == []
+    assert len(sampler) == 5
+
+
+def test_no_duplicates_batch_sampler_warns_once_when_resampling(caplog) -> None:
+    dataset = Dataset.from_list(
+        [{"anchor": "anchor_1", "positive": "positive_1"}] * 12
+        + [{"anchor": "anchor_2", "positive": "positive_2"}] * 8
+    )
+    sampler = NoDuplicatesBatchSampler(
+        dataset=dataset,
+        batch_size=2,
+        drop_last=True,
+        generator=torch.Generator(),
+        seed=0,
+    )
+    with caplog.at_level(logging.WARNING):
+        batches = list(iter(sampler))
+        sampler.set_epoch(1)
+        batches_second_epoch = list(iter(sampler))
+
+    assert len(batches) == len(batches_second_epoch) == len(sampler)
+    warnings = [record for record in caplog.records if "repeats from earlier batches" in record.message]
+    assert len(warnings) == 1
+    assert "8 of the expected 10 batches" in warnings[0].message
+    assert "at most 20.0%" in warnings[0].message
+
+
+def test_no_duplicates_batch_sampler_caps_resample_passes(caplog) -> None:
+    # A dominant duplicate value limits every pass to a single unique batch, so filling
+    # ``__len__`` would cost one full pass per missing batch. The cap bounds that work
+    # and the shortfall is reported instead.
+    dataset = Dataset.from_list(
+        [{"anchor": "same", "positive": "same"}] * 20
+        + [{"anchor": f"unique_{i}", "positive": f"unique_positive_{i}"} for i in range(3)]
+    )
+    sampler = NoDuplicatesBatchSampler(
+        dataset=dataset,
+        batch_size=4,
+        drop_last=True,
+        generator=torch.Generator(),
+        seed=0,
+    )
+    with caplog.at_level(logging.WARNING):
+        batches = list(iter(sampler))
+
+    assert len(sampler) == 5
+    assert len(batches) == 1 + sampler_module._MAX_RESAMPLE_PASSES
+    assert all(len(batch) == 4 for batch in batches)
+    assert f"yielded only {len(batches)} of the expected {len(sampler)} batches" in caplog.text
 
 
 @pytest.mark.skipif(not is_xxhash_available(), reason="xxhash not installed")
@@ -278,6 +438,129 @@ def test_no_duplicates_batch_sampler_list_values_match_between_hash_and_non_hash
     assert hashed_batches == default_batches
     assert len(default_batches) == 1
     assert len(default_batches[0]) == 2
+
+
+@pytest.mark.parametrize("precompute_hashes", [False, True])
+def test_no_duplicates_batch_sampler_deduplicates_images(precompute_hashes: bool) -> None:
+    # PIL images stringify to a fresh object address on every dataset access, so without
+    # content digests every image row looks unique and the dedup silently no-ops.
+    pil_image = pytest.importorskip("PIL.Image")
+    sampler_kwargs = {}
+    if precompute_hashes:
+        if not is_xxhash_available():
+            pytest.skip("xxhash not installed")
+        sampler_kwargs = {
+            "precompute_hashes": True,
+            "precompute_num_proc": PRECOMPUTE_NUM_PROC,
+            "precompute_batch_size": 10,
+        }
+
+    images = [pil_image.new("RGB", (4, 4), color) for color in ("red", "green", "blue", "yellow")]
+    dataset = Dataset.from_dict(
+        {"query": [f"query_{i}" for i in range(16)], "image": [images[i % 4] for i in range(16)]}
+    )
+    sampler = NoDuplicatesBatchSampler(
+        dataset=dataset,
+        batch_size=8,
+        drop_last=False,
+        generator=torch.Generator(),
+        seed=0,
+        **sampler_kwargs,
+    )
+
+    batches = list(iter(sampler))
+
+    assert sum(len(batch) for batch in batches) == 16
+    for batch in batches:
+        # Only 4 unique images exist, so a batch of 8 must stop at 4 distinct rows.
+        assert len(batch) == 4
+        pixels = {dataset[i]["image"].tobytes() for i in batch}
+        assert len(pixels) == len(batch)
+
+
+@pytest.mark.parametrize("precompute_hashes", [False, True])
+def test_no_duplicates_batch_sampler_deduplicates_audio(precompute_hashes: bool) -> None:
+    # Audio / Video features return torchcodec decoders whose pickle embeds a torch storage key
+    # taken from the object address, so digesting the decoder itself is fresh on every access.
+    pytest.importorskip("torchcodec")
+    sampler_kwargs = {}
+    if precompute_hashes:
+        if not is_xxhash_available():
+            pytest.skip("xxhash not installed")
+        sampler_kwargs = {
+            "precompute_hashes": True,
+            "precompute_num_proc": PRECOMPUTE_NUM_PROC,
+            "precompute_batch_size": 10,
+        }
+
+    clips = [_wav_bytes(frequency) for frequency in (440, 660, 880, 1100)]
+    dataset = Dataset.from_dict(
+        {
+            "query": [f"query_{i}" for i in range(16)],
+            "audio": [{"bytes": clips[i % 4], "path": None} for i in range(16)],
+        },
+        features=Features({"query": Value("string"), "audio": Audio()}),
+    )
+    sampler = NoDuplicatesBatchSampler(
+        dataset=dataset,
+        batch_size=8,
+        drop_last=False,
+        generator=torch.Generator(),
+        seed=0,
+        **sampler_kwargs,
+    )
+
+    batches = list(iter(sampler))
+
+    assert sum(len(batch) for batch in batches) == 16
+    for batch in batches:
+        # Only 4 unique clips exist, so a batch of 8 must stop at 4 distinct rows.
+        assert len(batch) == 4
+
+
+def test_sample_value_str_decoder_digest_is_stable_across_accesses() -> None:
+    # The decoder is rebuilt per access, so its digest must come from the encoded source it wraps.
+    pytest.importorskip("torchcodec")
+    dataset = Dataset.from_dict(
+        {"audio": [{"bytes": _wav_bytes(440), "path": None}, {"bytes": _wav_bytes(880), "path": None}]},
+        features=Features({"audio": Audio()}),
+    )
+    assert _sample_value_str(dataset[0]["audio"]) == _sample_value_str(dataset[0]["audio"])
+    assert _sample_value_str(dataset[0]["audio"]) != _sample_value_str(dataset[1]["audio"])
+
+
+def test_sample_value_str_plain_values_keep_str() -> None:
+    # The historical text/number dedup keys must stay byte-identical.
+    assert _sample_value_str("a sentence") == "a sentence"
+    assert _sample_value_str(5) == "5"
+    assert _sample_value_str(["a", "b"]) == str(["a", "b"])
+    assert _sample_value_str([1.0, 0.5]) == str([1.0, 0.5])
+
+
+def test_sample_value_str_numpy_scalars_match_python_scalars() -> None:
+    # Every value went through str() before this function existed, so numpy scalars shared a key
+    # with their python counterparts. Arrays stay on the digest path.
+    assert _sample_value_str(np.int64(5)) == _sample_value_str(5)
+    assert _sample_value_str(np.float64(0.5)) == _sample_value_str(0.5)
+    assert _sample_value_str(np.bool_(True)) == _sample_value_str(True)
+    assert _sample_value_str(np.arange(3)) != str(np.arange(3))
+
+
+def test_sample_value_str_digests_object_content() -> None:
+    # str() of a large array is truncated to its head and tail, so distinct arrays could collide.
+    # Content digests keep equal content equal and distinct content distinct.
+    same_a = np.arange(10_000)
+    same_b = np.arange(10_000)
+    different = np.arange(10_000)
+    different[5_000] = -1
+    assert str(same_a) == str(different)
+    assert _sample_value_str(same_a) == _sample_value_str(same_b)
+    assert _sample_value_str(same_a) != _sample_value_str(different)
+
+
+def test_sample_value_str_unpicklable_falls_back_to_str() -> None:
+    unpicklable = lambda: None  # noqa: E731
+    assert _sample_value_str(unpicklable) == str(unpicklable)
 
 
 def test_no_duplicates_batch_sampler_uses_int64_indices_when_int32_range_is_exceeded(

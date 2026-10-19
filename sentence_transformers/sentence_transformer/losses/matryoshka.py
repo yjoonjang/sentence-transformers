@@ -9,11 +9,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from sentence_transformers.sentence_transformer.losses import (
-    CachedGISTEmbedLoss,
-    CachedMultipleNegativesRankingLoss,
-    CachedMultipleNegativesSymmetricRankingLoss,
-)
+from sentence_transformers.base.losses.gradcache import uses_gradient_cache
 from sentence_transformers.sentence_transformer.model import SentenceTransformer
 
 logger = logging.getLogger(__name__)
@@ -60,8 +56,6 @@ class ForwardDecorator:
         # Using cache:
         else:
             output = self.cache[self.idx]
-        if "token_embeddings" in output:
-            output["token_embeddings"] = shrink(output["token_embeddings"], self.dim)
         output["sentence_embedding"] = shrink(output["sentence_embedding"], self.dim)
         self.idx += 1
         return output
@@ -219,23 +213,18 @@ class MatryoshkaLoss(nn.Module):
         self.matryoshka_dims, self.matryoshka_weights = zip(*sorted(dims_weights, key=lambda x: x[0], reverse=True))
         self.n_dims_per_step = n_dims_per_step
 
-        # The Cached... losses require a special treatment as their backward pass is incompatible with the
-        # ForwardDecorator approach. Instead, we use a CachedLossDecorator to compute the loss for each
-        # Matryoshka dimensionality given pre-computed embeddings passed to `calculate_loss`.
-        self.cached_losses = (
-            CachedMultipleNegativesRankingLoss,
-            CachedGISTEmbedLoss,
-            CachedMultipleNegativesSymmetricRankingLoss,
-        )
-        if isinstance(loss, self.cached_losses):
+        # Gradient-caching losses back-propagate from a hook that fires after the ForwardDecorator
+        # is removed, so decorate their `calculate_loss` to shrink the cached embeddings instead.
+        self.uses_gradient_cache = uses_gradient_cache(loss)
+        if self.uses_gradient_cache:
             loss.calculate_loss = CachedLossDecorator(
                 loss.calculate_loss, self.matryoshka_dims, self.matryoshka_weights, self.n_dims_per_step
             )
 
     def forward(self, sentence_features: Iterable[dict[str, Tensor]], labels: Tensor) -> Tensor:
-        # For the Cached... losses, the CachedLossDecorator has been applied to the `calculate_loss` method,
-        # so we can directly call the loss function.
-        if isinstance(self.loss, self.cached_losses):
+        # For the gradient-caching losses, the CachedLossDecorator has been applied to the `calculate_loss`
+        # method, so we can directly call the loss function.
+        if self.uses_gradient_cache:
             return self.loss(sentence_features, labels)
 
         # Otherwise, we apply the ForwardDecorator to the model's forward pass, which will cache the output
@@ -255,15 +244,15 @@ class MatryoshkaLoss(nn.Module):
                 dim = self.matryoshka_dims[idx]
                 weight = self.matryoshka_weights[idx]
                 decorated_forward.set_dim(dim)
-                # If the labels seem to be embeddings, truncate them to match the soon-to-be-truncated predicted embeddings
-                # This allows for MatryoshkaLoss with a direct distillation loss
+                # If the labels seem to be (per-column) embeddings, truncate them to match the soon-to-be-truncated
+                # predicted embeddings. This allows for MatryoshkaLoss with a direct distillation loss
                 dim_labels = labels
                 if (
                     isinstance(labels, torch.Tensor)
-                    and labels.ndim == 2
+                    and labels.ndim in (2, 3)
                     and labels.size(-1) == self.model.get_embedding_dimension()
                 ):
-                    dim_labels = labels[:, :dim]
+                    dim_labels = labels[..., :dim]
 
                 loss += weight * self.loss(sentence_features, dim_labels)
         finally:

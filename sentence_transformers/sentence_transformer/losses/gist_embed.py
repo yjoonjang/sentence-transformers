@@ -7,9 +7,10 @@ import torch
 from torch import Tensor, nn
 from transformers import PreTrainedTokenizerBase
 
+from sentence_transformers.base.losses.merged_forward import embed_columns
 from sentence_transformers.sentence_transformer.model import SentenceTransformer
 from sentence_transformers.sentence_transformer.modules import StaticEmbedding
-from sentence_transformers.util import all_gather_with_grad, is_dist_initialized
+from sentence_transformers.util import all_gather_with_grad, batch_to_device, get_rank
 
 
 class GISTEmbedLoss(nn.Module):
@@ -33,8 +34,8 @@ class GISTEmbedLoss(nn.Module):
         You can apply different false-negative filtering strategies to discard hard negatives that are too similar to
         the positive. Two strategies are supported:
 
-            - "absolute": Discards negatives whose similarity score is greater than or equal to ``positive_score - margin``.
-            - "relative": Discards negatives whose similarity score is greater than or equal to ``positive_score * (1 - margin)``.
+            - "absolute": Discards negatives whose similarity score is greater than ``positive_score - margin``.
+            - "relative": Discards negatives whose similarity score is greater than ``positive_score - abs(positive_score) * margin``.
 
         Args:
             model: SentenceTransformer model based on a `transformers` model.
@@ -70,7 +71,7 @@ class GISTEmbedLoss(nn.Module):
             +---------------------------------------+--------+
 
         Recommendations:
-            - Use ``BatchSamplers.NO_DUPLICATES`` (:class:`docs <sentence_transformers.sentence_transformer.training_args.BatchSamplers>`) to
+            - Use ``BatchSamplers.NO_DUPLICATES`` (:class:`docs <sentence_transformers.base.sampler.BatchSamplers>`) to
               ensure that no in-batch negatives are duplicates of the anchor or positive samples.
 
         Relations:
@@ -137,25 +138,26 @@ class GISTEmbedLoss(nn.Module):
         return self.similarity_fct(embed1.unsqueeze(1), embed2.unsqueeze(0))
 
     def forward(self, sentence_features: Iterable[dict[str, Tensor]], labels: Tensor) -> Tensor:
-        embeddings = [self.model(sentence_feature)["sentence_embedding"] for sentence_feature in sentence_features]
+        sentence_features = list(sentence_features)
+        # Run the guide on shallow copies: it writes its outputs into the features it is given, and
+        # loss decorators like MatryoshkaLoss reuse the dicts the model filled.
+        guide_features = [dict(sentence_feature) for sentence_feature in sentence_features]
+        embeddings = embed_columns(self.model, sentence_features)
         with torch.no_grad():
             if self.must_retokenize:
-                decoded = [
-                    self.tokenizer.batch_decode(sentence_feature["input_ids"], skip_special_tokens=True)
-                    for sentence_feature in sentence_features
-                ]
-                sentence_features = [self.guide.preprocess(sentences) for sentences in decoded]
-                sentence_features = [
-                    {
-                        key: value.to(self.guide.device) if isinstance(value, Tensor) else value
-                        for key, value in sentence_feature.items()
-                    }
-                    for sentence_feature in sentence_features
-                ]
+                guide_features = []
+                for sentence_feature in sentence_features:
+                    input_ids = sentence_feature["input_ids"]
+                    if "cu_seq_lens_q" in sentence_feature:
+                        flat_input_ids = input_ids[0].tolist()
+                        cu_seq_lens = sentence_feature["cu_seq_lens_q"].tolist()
+                        input_ids = [
+                            flat_input_ids[start:end] for start, end in zip(cu_seq_lens[:-1], cu_seq_lens[1:])
+                        ]
+                    decoded = self.tokenizer.batch_decode(input_ids, skip_special_tokens=True)
+                    guide_features.append(batch_to_device(self.guide.preprocess(decoded), self.guide.device))
 
-            guide_embeddings = [
-                self.guide(sentence_feature)["sentence_embedding"] for sentence_feature in sentence_features
-            ]
+            guide_embeddings = embed_columns(self.guide, guide_features)
 
         negative = None
         negative_guide = None
@@ -182,9 +184,8 @@ class GISTEmbedLoss(nn.Module):
                 negative_guide = all_gather_with_grad(negative_guide)
             # All have this shape: (batch_size * world_size * (1 + num_negatives), embedding_dim)
 
-            if is_dist_initialized():
-                rank = torch.distributed.get_rank()
-                offset = rank * batch_size
+            # get_rank() returns 0 when not running distributed, so offset stays 0 in that case.
+            offset = get_rank() * batch_size
 
         # Compute the similarities given the training and guide embeddings.
         ap_sim = self.sim_matrix(anchor, positive)
@@ -199,8 +200,8 @@ class GISTEmbedLoss(nn.Module):
                 # Remove samples whose guided similarity is higher than (positive_sim - margin)
                 mask = guided_sim_mat > (guided_sim - self.margin)
             elif self.margin_strategy == "relative":
-                # Remove samples whose guided similarity is higher than (positive_sim * margin)
-                mask = guided_sim_mat > (guided_sim * (1 - self.margin))
+                # Remove samples whose guided similarity is higher than (positive_sim - |positive_sim| * margin)
+                mask = guided_sim_mat > (guided_sim - guided_sim.abs() * self.margin)
 
             if positive_mask is not None:
                 # Ensure true positive pairs are not masked out

@@ -1,9 +1,53 @@
 from __future__ import annotations
 
+import copy
+import warnings
+
 import numpy as np
+import pytest
 import torch
 
-from sentence_transformers.util.tensor import normalize_embeddings
+from sentence_transformers.util.similarity import cos_sim, dot_score, euclidean_sim, manhattan_sim, maxsim
+from sentence_transformers.util.tensor import (
+    _convert_to_tensor,
+    _move_tensors_to_cpu,
+    _move_tensors_to_device,
+    normalize_embeddings,
+    select_max_active_dims,
+    to_scipy_coo,
+)
+
+
+@pytest.mark.parametrize("target_device", ["cpu", torch.device("meta")])
+def test_move_tensors_to_device_preserves_nested_outputs(target_device):
+    tensor = torch.tensor([1.0, 2.0])
+    array = np.array([3.0, 4.0])
+    original = ({"embeddings": [tensor], "array": array}, "metadata", None)
+    moved = _move_tensors_to_device(original, target_device)
+
+    assert isinstance(moved, tuple)
+    assert isinstance(moved[0]["embeddings"], list)
+    output = moved[0]["embeddings"][0]
+    assert output.device == torch.device(target_device)
+    assert output.shape == tensor.shape and output.dtype == tensor.dtype
+    assert moved[0]["array"] is array
+    assert moved[1:] == ("metadata", None)
+    assert original[0]["embeddings"][0] is tensor
+    assert _move_tensors_to_cpu(original)[0]["embeddings"][0] is tensor
+
+
+@pytest.mark.parametrize(
+    ("dtype", "expected_dtype"),
+    [(torch.bfloat16, np.float32), (torch.float32, np.float32), (torch.float64, np.float64)],
+)
+def test_to_scipy_coo_preserves_sparse_values(dtype: torch.dtype, expected_dtype: type) -> None:
+    tensor = torch.sparse_coo_tensor([[1, 0, 1], [0, 2, 0]], [0.5, 1.5, 0.25], (3, 4), dtype=dtype)
+
+    result = to_scipy_coo(tensor)
+
+    assert result.dtype == expected_dtype
+    assert result.nnz == 2
+    np.testing.assert_array_equal(result.toarray(), [[0, 0, 1.5, 0], [0.75, 0, 0, 0], [0, 0, 0, 0]])
 
 
 def test_normalize_embeddings() -> None:
@@ -16,3 +60,185 @@ def test_normalize_embeddings() -> None:
         assert len(embedding) == embedding_size
         emb_norm = torch.norm(embedding)
         assert abs(emb_norm.item() - 1) < 0.0001
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32, torch.float64])
+@pytest.mark.parametrize("default_dtype", [torch.float32, torch.float64])
+def test_normalize_sparse_embeddings_preserves_dtype(dtype: torch.dtype, default_dtype: torch.dtype) -> None:
+    original_default_dtype = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(default_dtype)
+        embeddings = torch.tensor([[3.0, 4.0], [0.0, 0.0], [-4.0, 3.0]], dtype=dtype).to_sparse()
+
+        normalized = normalize_embeddings(embeddings)
+
+        assert normalized.is_sparse
+        expected = torch.tensor([[0.6, 0.8], [0.0, 0.0], [-0.8, 0.6]], dtype=dtype)
+        torch.testing.assert_close(normalized.to_dense(), expected)
+    finally:
+        torch.set_default_dtype(original_default_dtype)
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("ndim", [1, 2])
+@pytest.mark.parametrize(("size", "value"), [(4096, 1.0), (2, 300.0), (2, 1e-4)])
+def test_normalize_sparse_embeddings_half_precision(
+    device: str, dtype: torch.dtype, ndim: int, size: int, value: float
+) -> None:
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+    dense = torch.full((size,) if ndim == 1 else (1, size), value, dtype=dtype, device=device)
+    embeddings = dense.to_sparse()
+
+    normalized = normalize_embeddings(embeddings)
+
+    expected = torch.nn.functional.normalize(dense.double(), p=2, dim=-1).to(dtype)
+    assert normalized.is_sparse
+    torch.testing.assert_close(normalized.to_dense(), expected)
+    torch.testing.assert_close(embeddings.to_dense(), dense)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32, torch.float64])
+def test_normalize_sparse_embeddings_backward(dtype: torch.dtype) -> None:
+    values = torch.tensor([3.0, 4.0, -4.0, 3.0], dtype=dtype, requires_grad=True)
+    indices = torch.tensor([[0, 0, 2, 2], [0, 1, 0, 1]])
+    embeddings = torch.sparse_coo_tensor(indices, values, (3, 2))
+
+    normalize_embeddings(embeddings).to_dense().sum().backward()
+
+    expected = torch.tensor([0.032, -0.024, 0.168, 0.224], dtype=dtype)
+    torch.testing.assert_close(values.grad, expected)
+
+
+def test_normalize_embeddings_single_vector() -> None:
+    embedding = torch.tensor([3.0, -4.0, 0.0])
+    normalized = normalize_embeddings(embedding)
+
+    assert normalized.shape == embedding.shape
+    assert torch.allclose(normalized, embedding / 5.0)
+
+
+@pytest.mark.parametrize("values", [[3.0, -4.0, 0.0, 0.0], [0.0, 0.0], [], [1e-15, 0.0]])
+def test_normalize_embeddings_single_sparse_vector(values: list[float]) -> None:
+    embedding = torch.tensor(values)
+    normalized = normalize_embeddings(embedding.to_sparse())
+
+    assert normalized.is_sparse
+    assert normalized.shape == embedding.shape
+    torch.testing.assert_close(normalized.to_dense(), normalize_embeddings(embedding))
+
+
+@pytest.mark.parametrize(("array_fn", "dtype"), [(torch.tensor, torch.float32), (np.array, torch.float64)])
+def test_select_max_active_dims_keeps_top_k_without_mutating_input(array_fn, dtype: torch.dtype) -> None:
+    """The top-k values by absolute value are kept with their signs, in a new tensor, leaving the input untouched."""
+    embeddings = array_fn([[3.0, -1.0, 2.0, 0.5], [0.1, 4.0, -3.0, 1.0]])
+    original = copy.deepcopy(embeddings)
+
+    result = select_max_active_dims(embeddings, max_active_dims=2)
+
+    assert isinstance(result, torch.Tensor)
+    assert result.dtype == dtype
+    assert torch.equal(result, torch.tensor([[3.0, 0.0, 2.0, 0.0], [0.0, 4.0, -3.0, 0.0]], dtype=dtype))
+    assert (embeddings == original).all(), "select_max_active_dims must not modify its input in place"
+
+
+def test_select_max_active_dims_none_returns_input_as_is() -> None:
+    """`None` keeps all values, returning the input object itself, whether tensor or numpy array."""
+    tensor_embeddings = torch.tensor([[3.0, -1.0, 2.0, 0.5]])
+    assert select_max_active_dims(tensor_embeddings, max_active_dims=None) is tensor_embeddings
+
+    numpy_embeddings = np.array([[3.0, -1.0, 2.0, 0.5]])
+    assert select_max_active_dims(numpy_embeddings, max_active_dims=None) is numpy_embeddings
+
+
+def test_select_max_active_dims_exceeding_dim_keeps_all_values() -> None:
+    """`max_active_dims` larger than the embedding dimensionality keeps every value, still in a new tensor."""
+    embeddings = torch.tensor([[3.0, -1.0, 2.0]])
+
+    result = select_max_active_dims(embeddings, max_active_dims=10)
+
+    assert torch.equal(result, embeddings)
+    assert result is not embeddings, "select_max_active_dims must return a new tensor, not the input"
+
+
+def test_select_max_active_dims_supports_single_embedding() -> None:
+    """A 1-dimensional embedding, as returned by `encode()` for a single input, is sparsified along its only axis."""
+    embeddings = torch.tensor([3.0, -1.0, 2.0, 0.5])
+
+    result = select_max_active_dims(embeddings, max_active_dims=2)
+
+    assert torch.equal(result, torch.tensor([3.0, 0.0, 2.0, 0.0]))
+
+
+@pytest.mark.parametrize("max_active_dims", [0, -1])
+def test_select_max_active_dims_rejects_non_positive(max_active_dims: int) -> None:
+    """A non-positive `max_active_dims` is rejected, rather than silently returning all-zero embeddings."""
+    embeddings = torch.tensor([[3.0, -1.0, 2.0, 0.5]])
+
+    with pytest.raises(ValueError, match="max_active_dims must be a positive integer"):
+        select_max_active_dims(embeddings, max_active_dims=max_active_dims)
+
+
+def test_convert_to_tensor_views_numpy_without_copying() -> None:
+    """A numpy corpus is viewed, not copied: the copy costs as much as the scoring it feeds."""
+    array = np.zeros((4, 8), dtype=np.float32)
+
+    assert _convert_to_tensor(array).data_ptr() == array.__array_interface__["data"][0]
+
+
+def test_convert_to_tensor_stacks_a_list_of_arrays_without_reading_elementwise() -> None:
+    """A list of arrays (what encoding with `convert_to_numpy=True` returns) went through
+    `torch.tensor`, which reads it one element at a time. Stacking views instead is two orders of
+    magnitude faster and must land on the same tensor."""
+    arrays = [np.arange(6, dtype=np.float32).reshape(2, 3) + offset for offset in range(4)]
+
+    result = _convert_to_tensor(arrays)
+
+    assert torch.equal(result, torch.tensor(np.stack(arrays)))
+    assert result.shape == (4, 2, 3)
+
+
+def test_convert_to_tensor_negative_stride_still_rejected() -> None:
+    """Negative strides were never convertible and still are not. `torch.from_numpy` rejects them
+    with the same error `torch.tensor` raised before the view was introduced, so this is not a
+    fallback case: the error propagates straight out."""
+    with pytest.raises(ValueError, match="stride"):
+        _convert_to_tensor(np.zeros((4, 6), dtype=np.float32)[::-1])
+
+
+def test_convert_to_tensor_read_only_array_does_not_warn() -> None:
+    """Read-only buffers (memmaps, broadcast views) take the copying path instead of torch's
+    non-writable-tensor warning."""
+    array = np.zeros((4, 8), dtype=np.float32)
+    array.flags.writeable = False
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert _convert_to_tensor(array).shape == (4, 8)
+
+
+@pytest.mark.parametrize("similarity_fct", [cos_sim, dot_score, euclidean_sim, manhattan_sim, maxsim])
+def test_scoring_does_not_mutate_numpy_inputs(similarity_fct) -> None:
+    """The zero-copy view means an in-place op anywhere in a scoring path would corrupt the caller's
+    array. Every scoring function must write into fresh outputs only."""
+    rng = np.random.default_rng(0)
+    shape = (3, 5, 4) if similarity_fct is maxsim else (3, 4)
+    a = rng.standard_normal(shape, dtype=np.float32)
+    b = rng.standard_normal(shape, dtype=np.float32)
+    a_before, b_before = a.copy(), b.copy()
+
+    similarity_fct(a, b)
+
+    assert np.array_equal(a, a_before), "scoring mutated the first input array"
+    assert np.array_equal(b, b_before), "scoring mutated the second input array"
+
+
+def test_convert_to_tensor_stacks_dense_tensors_preserving_gradients() -> None:
+    embeddings = [torch.tensor([1.0, 2.0], dtype=torch.float64, requires_grad=True) for _ in range(2)]
+
+    result = _convert_to_tensor(embeddings)
+    torch.testing.assert_close(result, torch.stack(embeddings))
+    result.sum().backward()
+    for embedding in embeddings:
+        torch.testing.assert_close(embedding.grad, torch.ones_like(embedding))

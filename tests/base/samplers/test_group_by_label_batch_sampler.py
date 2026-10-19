@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import Counter
 
 import pytest
+import torch
 
 from sentence_transformers.base.sampler import GroupByLabelBatchSampler
 from sentence_transformers.util import is_datasets_available
@@ -146,7 +147,7 @@ def test_minority_labels_participate() -> None:
     all_indices = set()
     for batch in sampler:
         all_indices.update(batch)
-    # Label 2 has 3 samples (indices 1500-1502); trimmed to 2 (even), so at least 2 should appear
+    # Label 2 has 3 samples (indices 1500-1502), trimmed to 2 (even), so at least 2 should appear
     minority_in_output = all_indices & set(range(1500, 1503))
     assert len(minority_in_output) >= 2, "Minority label samples should participate in batches"
 
@@ -200,7 +201,7 @@ def test_batch_guarantees(drop_last: bool) -> None:
 
     1. Contains >= 2 distinct labels.
     2. Every label in the batch appears >= 2 times.
-    3. Non-last batches are exactly batch_size; the last may be smaller only when drop_last=False.
+    3. Non-last batches are exactly batch_size. The last may be smaller only when drop_last=False.
     """
     # Use several dataset shapes to stress-test the guarantees.
     datasets = {
@@ -236,3 +237,47 @@ def test_batch_guarantees(drop_last: bool) -> None:
                 assert count >= 2, (
                     f"{name}, drop_last={drop_last}: label {label} appears only {count} time(s) in batch {batch_idx}"
                 )
+
+
+@pytest.mark.parametrize("label_sizes, seed", [([4, 4, 4], 0), ([8, 6, 4], 2), ([6, 4, 2], 6)])
+def test_batches_spanning_shuffled_rounds_have_negative_labels(label_sizes: list[int], seed: int) -> None:
+    labels = [label for label, size in enumerate(label_sizes) for _ in range(size)]
+    dataset = Dataset.from_dict({"label": labels})
+    sampler = GroupByLabelBatchSampler(
+        dataset,
+        batch_size=4,
+        drop_last=False,
+        valid_label_columns=["label"],
+        generator=torch.Generator(),
+        seed=seed,
+    )
+    batches = list(sampler)
+    assert len(batches) == len(sampler) > 0
+    for batch in batches:
+        counts = Counter(labels[index] for index in batch)
+        assert sorted(counts.values()) == [2, 2]
+
+
+def test_odd_label_groups_do_not_permanently_exclude_samples() -> None:
+    labels = [0] * 3 + [1] * 3
+    dataset = Dataset.from_dict({"label": labels})
+    sampler = GroupByLabelBatchSampler(
+        dataset,
+        batch_size=4,
+        drop_last=True,
+        valid_label_columns=["label"],
+        generator=torch.Generator(),
+        seed=42,
+    )
+
+    seen = set()
+    for epoch in range(10):
+        sampler.set_epoch(epoch)
+        batches = list(sampler)
+        assert len(batches) == len(sampler) == 1
+        assert sorted(Counter(labels[index] for index in batches[0]).values()) == [2, 2]
+        assert len(set(batches[0])) == 4
+        seen.update(batches[0])
+        assert list(sampler) == batches
+
+    assert seen == set(range(len(dataset)))

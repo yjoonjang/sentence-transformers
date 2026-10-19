@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import Any
 
-import torch
+import torch.nn.functional as F
 from torch import Tensor
 
 from sentence_transformers.sentence_transformer.model import SentenceTransformer
@@ -53,7 +53,7 @@ class BatchHardSoftMarginTripletLoss(BatchHardTripletLoss):
             +------------------+--------+
 
         Recommendations:
-            - Use ``BatchSamplers.GROUP_BY_LABEL`` (:class:`docs <sentence_transformers.sentence_transformer.training_args.BatchSamplers>`)
+            - Use ``BatchSamplers.GROUP_BY_LABEL`` (:class:`docs <sentence_transformers.base.sampler.BatchSamplers>`)
               to ensure that each batch contains at least 2 distinct labels with at least 2 samples per label.
 
         Relations:
@@ -92,7 +92,10 @@ class BatchHardSoftMarginTripletLoss(BatchHardTripletLoss):
 
     def forward(self, sentence_features: Iterable[dict[str, Tensor]], labels: Tensor) -> Tensor:
         rep = self.sentence_embedder(sentence_features[0])["sentence_embedding"]
-        return self.batch_hard_triplet_soft_margin_loss(labels, rep)
+        return self.compute_loss_from_embeddings([rep], labels)
+
+    def compute_loss_from_embeddings(self, embeddings: list[Tensor], labels: Tensor) -> Tensor:
+        return self.batch_hard_triplet_soft_margin_loss(labels, embeddings[0])
 
     # Hard Triplet Loss with Soft Margin
     # Paper: In Defense of the Triplet Loss for Person Re-Identification, https://huggingface.co/papers/1703.07737
@@ -102,12 +105,17 @@ class BatchHardSoftMarginTripletLoss(BatchHardTripletLoss):
         Args:
             labels: labels of the batch, of size (batch_size,)
             embeddings: tensor of shape (batch_size, embed_dim)
-            squared: Boolean. If true, output is the pairwise squared euclidean distance matrix.
-                     If false, output is the pairwise euclidean distance matrix.
         Returns:
             Label_Sentence_Triplet: scalar tensor containing the triplet loss
         """
-        # Get the pairwise distance matrix
+        batch_size = embeddings.shape[0]
+        if labels.numel() != batch_size:
+            raise ValueError(
+                f"{self.__class__.__name__} expects {batch_size} labels (one per example), "
+                f"but got {labels.numel()} labels with shape {tuple(labels.shape)}."
+            )
+        labels = labels.view(-1)
+
         pairwise_dist = self.distance_metric(embeddings)
 
         # For each anchor, get the hardest positive
@@ -134,7 +142,7 @@ class BatchHardSoftMarginTripletLoss(BatchHardTripletLoss):
         # Combine biggest d(a, p) and smallest d(a, n) into final triplet loss with soft margin
         # tl = hardest_positive_dist - hardest_negative_dist + margin
         # tl[tl < 0] = 0
-        tl = torch.log1p(torch.exp(hardest_positive_dist - hardest_negative_dist))
+        tl = F.softplus(hardest_positive_dist - hardest_negative_dist)
         triplet_loss = tl.mean()
 
         return triplet_loss

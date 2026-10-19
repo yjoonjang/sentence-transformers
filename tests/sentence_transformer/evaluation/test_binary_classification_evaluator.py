@@ -4,9 +4,13 @@ Tests the correct computation of evaluation scores from BinaryClassificationEval
 
 from __future__ import annotations
 
-import numpy as np
-from sklearn.metrics import accuracy_score, f1_score
+import csv
 
+import numpy as np
+import pytest
+from sklearn.metrics import accuracy_score, f1_score, precision_recall_fscore_support
+
+from sentence_transformers import SentenceTransformer
 from sentence_transformers.sentence_transformer import evaluation
 
 
@@ -40,3 +44,142 @@ def test_BinaryClassificationEvaluator_find_best_accuracy_and_threshold() -> Non
     y_pred_labels = [1 if pred >= threshold else 0 for pred in y_pred_cosine]
     sklearn_acc = accuracy_score(y_true, y_pred_labels)
     assert np.abs(max_acc - sklearn_acc) < 1e-6
+
+
+@pytest.mark.parametrize("high_score_more_similar", [True, False])
+@pytest.mark.parametrize(
+    ("scores", "labels", "expected_accuracy", "expected_f1"),
+    [
+        pytest.param([0.5, 0.5], [1, 0], 0.5, 2 / 3, id="tied-positive-first"),
+        pytest.param([0.5, 0.5], [0, 1], 0.5, 2 / 3, id="tied-negative-first"),
+        pytest.param([0.9, 0.5, 0.5, 0.1], [1, 1, 0, 0], 0.75, 0.8, id="mixed-ties-positive-first"),
+        pytest.param([0.9, 0.5, 0.5, 0.1], [1, 0, 1, 0], 0.75, 0.8, id="mixed-ties-negative-first"),
+        pytest.param([0.9, 0.5, 0.1], [1, 1, 1], 1.0, 1.0, id="all-positive"),
+        pytest.param([0.9, 0.5, 0.1], [0, 0, 0], 1.0, 0.0, id="all-negative"),
+        pytest.param([0.5], [1], 1.0, 1.0, id="single-positive"),
+        pytest.param([0.5], [0], 1.0, 0.0, id="single-negative"),
+        pytest.param([0.9, 0.5, 0.1], [0, 0, 1], 2 / 3, 0.5, id="reversed-ranking"),
+        pytest.param(np.array([3, 2, 1]), [1, 0, 0], 1.0, 1.0, id="integer-scores"),
+        pytest.param(
+            np.array([1.0000001, 1.0000001, 1.0, 1.0], dtype=np.float32),
+            [1, 1, 0, 0],
+            1.0,
+            1.0,
+            id="adjacent-tied-groups",
+        ),
+    ],
+)
+def test_BinaryClassificationEvaluator_best_threshold_matches_predictions(
+    high_score_more_similar, scores, labels, expected_accuracy, expected_f1
+) -> None:
+    scores = np.asarray(scores)
+    if not high_score_more_similar:
+        scores = -scores
+
+    def predict(threshold):
+        return scores >= threshold if high_score_more_similar else scores <= threshold
+
+    accuracy, accuracy_threshold = evaluation.BinaryClassificationEvaluator.find_best_acc_and_threshold(
+        scores, labels, high_score_more_similar
+    )
+    assert accuracy == pytest.approx(accuracy_score(labels, predict(accuracy_threshold)))
+    f1, precision, recall, f1_threshold = evaluation.BinaryClassificationEvaluator.find_best_f1_and_threshold(
+        scores, labels, high_score_more_similar
+    )
+    assert (accuracy, f1) == pytest.approx((expected_accuracy, expected_f1))
+    assert (precision, recall, f1) == pytest.approx(
+        precision_recall_fscore_support(labels, predict(f1_threshold), average="binary", zero_division=0)[:3]
+    )
+
+
+@pytest.mark.parametrize("similarity_fn_name", ["euclidean", "manhattan"])
+@pytest.mark.parametrize("sentences_type", [list, tuple, np.array])
+def test_BinaryClassificationEvaluator_distance_metrics_direction(similarity_fn_name: str, sentences_type) -> None:
+    """The euclidean/manhattan metrics must treat smaller distances as more similar.
+
+    ``pairwise_euclidean_sim``/``pairwise_manhattan_sim`` return negative distances (i.e.
+    similarities), but were passed unnegated to the ``greater_is_better=False`` metric
+    computations, which expect positive distances. That inverted the ranking, so accuracy,
+    F1, precision, recall, AP and MCC were all computed for the opposite classifier
+    ("larger distance means similar") and the reported thresholds were negative.
+    """
+    embeddings = {
+        "a1": [0.0, 0.0],
+        "a2": [1.0, 0.0],  # distance 1 to a1, similar pair (label 1)
+        "b1": [0.0, 10.0],
+        "b2": [0.0, 12.0],  # distance 2 to b1, similar pair (label 1)
+        "c1": [0.0, 0.0],
+        "c2": [10.0, 0.0],  # distance 10 to c1, dissimilar pair (label 0)
+        "d1": [5.0, 5.0],
+        "d2": [5.0, 25.0],  # distance 20 to d1, dissimilar pair (label 0)
+    }
+
+    class MockEncoder:
+        def encode(self, sentences, **kwargs):
+            return np.array([embeddings[sentence] for sentence in sentences], dtype=np.float32)
+
+    evaluator = evaluation.BinaryClassificationEvaluator(
+        sentences1=sentences_type(["a1", "b1", "c1", "d1"]),
+        sentences2=sentences_type(["a2", "b2", "c2", "d2"]),
+        labels=[1, 1, 0, 0],
+        similarity_fn_names=[similarity_fn_name],
+    )
+    scores = evaluator.compute_metrics(MockEncoder())[similarity_fn_name]
+
+    # The similar pairs (distances 1 and 2) are perfectly separable from the
+    # dissimilar pairs (distances 10 and 20), so every metric should be perfect.
+    for metric in ["accuracy", "f1", "precision", "recall", "ap", "mcc"]:
+        assert scores[metric] == pytest.approx(1.0), f"{metric}: {scores[metric]}"
+
+    # The thresholds should be positive distances separating the similar from the
+    # dissimilar pairs: (2 + 10) / 2 = 6 for both euclidean and manhattan.
+    assert scores["accuracy_threshold"] == pytest.approx(6.0)
+    assert scores["f1_threshold"] == pytest.approx(6.0)
+
+
+@pytest.mark.parametrize(
+    "similarity_fn_names",
+    [["dot", "euclidean"], ["cosine", "dot"], ["cosine", "dot", "euclidean", "manhattan"]],
+)
+def test_BinaryClassificationEvaluator_multiple_similarity_fn_names(
+    stsb_bert_tiny_model: SentenceTransformer, similarity_fn_names: list[str]
+) -> None:
+    """Tests that the max_* aggregation does not assume that cosine was requested"""
+    model = stsb_bert_tiny_model
+    evaluator = evaluation.BinaryClassificationEvaluator(
+        sentences1=["A man is eating food.", "A cat sits outside.", "The girl plays guitar."],
+        sentences2=["A man eats something.", "The sky is blue.", "A woman plays a guitar."],
+        labels=[1, 0, 1],
+        similarity_fn_names=similarity_fn_names,
+    )
+    metrics = evaluator(model)
+
+    assert evaluator.primary_metric == "max_ap"
+    for metric in ["accuracy", "f1", "precision", "recall", "ap", "mcc"]:
+        assert metrics[f"max_{metric}"] == max(metrics[f"{name}_{metric}"] for name in similarity_fn_names)
+
+
+@pytest.mark.parametrize("similarity_fn_names", [["cosine"], ["cosine", "dot", "euclidean", "manhattan"]])
+def test_BinaryClassificationEvaluator_csv_columns_are_aligned(
+    stsb_bert_tiny_model: SentenceTransformer, tmp_path, similarity_fn_names: list[str]
+) -> None:
+    """The results CSV data row must have as many columns as the header row.
+
+    The ``*_accuracy_threshold`` and ``*_f1_threshold`` metrics contain a second underscore, so a
+    ``count("_") == 1`` filter dropped them from the data row while keeping them in the header,
+    shifting every later column and leaving the trailing ``*_ap``/``*_mcc`` columns empty.
+    """
+    model = stsb_bert_tiny_model
+    evaluator = evaluation.BinaryClassificationEvaluator(
+        sentences1=["A man is eating food.", "A cat sits outside.", "The girl plays guitar."],
+        sentences2=["A man eats something.", "The sky is blue.", "A woman plays a guitar."],
+        labels=[1, 0, 1],
+        similarity_fn_names=similarity_fn_names,
+    )
+    evaluator(model, output_path=str(tmp_path))
+
+    with open(tmp_path / evaluator.csv_file, newline="", encoding="utf-8") as f:
+        rows = list(csv.reader(f))
+
+    assert len(rows) == 2
+    assert len(rows[1]) == len(rows[0])

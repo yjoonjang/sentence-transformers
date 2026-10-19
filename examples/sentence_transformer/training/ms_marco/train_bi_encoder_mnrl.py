@@ -32,12 +32,12 @@ from sentence_transformers import (
     SentenceTransformerTrainer,
     SentenceTransformerTrainingArguments,
 )
+from sentence_transformers.base.modules import Normalize
 from sentence_transformers.base.sampler import BatchSamplers
 from sentence_transformers.sentence_transformer.evaluation import NanoBEIREvaluator
 from sentence_transformers.sentence_transformer.losses import (
     CachedMultipleNegativesRankingLoss,
 )
-from sentence_transformers.sentence_transformer.modules import Normalize
 
 logging.basicConfig(format="%(asctime)s - %(message)s", datefmt="%Y-%m-%d %H:%M:%S", level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -67,7 +67,7 @@ SYSTEMS = {
 
 def main():
     model_name = "distilbert/distilbert-base-uncased"
-    train_batch_size = 256  # In-batch negatives are the dominant signal in MNRL; larger batches help quality.
+    train_batch_size = 256  # In-batch negatives are the dominant signal in MNRL. Larger batches help quality.
     train_mini_batch_size = 32  # This controls the memory usage
     max_seq_length = 300
 
@@ -209,13 +209,13 @@ def main():
     model.save_pretrained(final_output_dir)
 
     # 11. (Optional) Push it to the Hugging Face Hub
-    # Run `huggingface-cli login` first if you haven't already.
+    # Run `hf auth login` first if you haven't already.
     try:
         model.push_to_hub(run_name)
     except Exception:
         logging.error(
             f"Error uploading model to the Hugging Face Hub. To upload it manually, run "
-            f"`huggingface-cli login`, then load with `model = SentenceTransformer({final_output_dir!r})` "
+            f"`hf auth login`, then load with `model = SentenceTransformer({final_output_dir!r})` "
             f"and call `model.push_to_hub({run_name!r})`."
         )
 

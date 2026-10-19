@@ -16,6 +16,11 @@ Once you have `installed <../../installation.html>`_ Sentence Transformers, you 
    2. :meth:`SparseEncoder.encode <sentence_transformers.sparse_encoder.model.SparseEncoder.encode>`
    3. :meth:`SparseEncoder.similarity <sentence_transformers.sparse_encoder.model.SparseEncoder.similarity>`
    4. :meth:`SparseEncoder.sparsity <sentence_transformers.sparse_encoder.model.SparseEncoder.sparsity>`
+   5. :doc:`Speeding up Inference <efficiency>`
+
+   .. tip::
+
+      Log in with ``hf auth login`` for higher Hugging Face Hub rate limits and access to private or gated models your account can read. See the `login instructions <../../installation.html#log-in-to-hugging-face>`_.
 
 ::
 
@@ -48,8 +53,7 @@ Once you have `installed <../../installation.html>`_ Sentence Transformers, you 
    print(f"Sparsity: {stats['sparsity_ratio']:.2%}")  # Typically >99% zeros
    print(f"Avg non-zero dimensions per embedding: {stats['active_dims']:.2f}")
 
-Prompts
--------
+Some Sparse Encoder models also support multimodal inputs. For example, `naver/v-splade-efficient <https://huggingface.co/naver/v-splade-efficient>`_ and `naver/v-splade-quality <https://huggingface.co/naver/v-splade-quality>`_ match text queries against document page images. Use :attr:`model.modalities <sentence_transformers.sparse_encoder.model.SparseEncoder.modalities>` and :meth:`model.supports() <sentence_transformers.sparse_encoder.model.SparseEncoder.supports>` to check modality support. See :doc:`../../input_formats` for accepted representations, metadata, and batching.
 
 Some Sparse Encoder models are trained with specific prompts for different use cases (e.g., queries vs. documents).
 You can use :meth:`SparseEncoder.encode <sentence_transformers.sparse_encoder.model.SparseEncoder.encode>` with the ``prompt_name`` parameter,
@@ -83,10 +87,9 @@ You can inspect or set the available prompts via the ``prompts`` and ``default_p
    :maxdepth: 1
    :caption: Tasks and Advanced Usage
 
+   ../../input_formats
    ../../../examples/sparse_encoder/applications/computing_embeddings/README
    ../../../examples/sparse_encoder/applications/semantic_textual_similarity/README
    ../../../examples/sparse_encoder/applications/semantic_search/README
    ../../../examples/sparse_encoder/applications/retrieve_rerank/README
    ../../../examples/sparse_encoder/evaluation/README
-   efficiency
-

@@ -7,6 +7,7 @@ import torch
 from torch import Tensor, nn
 
 from sentence_transformers import util
+from sentence_transformers.base.losses.merged_forward import embed_columns
 from sentence_transformers.sentence_transformer.model import SentenceTransformer
 
 
@@ -19,9 +20,9 @@ class CoSENTLoss(nn.Module):
 
         It computes the following loss function:
 
-        ``loss = logsum(1+exp(s(k,l)-s(i,j))+exp...)``, where ``(i,j)`` and ``(k,l)`` are any of the input pairs in the
-        batch such that the expected similarity of ``(i,j)`` is greater than ``(k,l)``. The summation is over all possible
-        pairs of input pairs in the batch that match this condition.
+        ``loss = log(1 + sum(exp(scale * (s(k,l) - s(i,j)))))``, where ``s`` is the score returned by
+        ``similarity_fct``. The sum is over all pairs of input pairs in the batch such that the similarity label of
+        ``(i,j)`` is greater than that of ``(k,l)``.
 
         Anecdotal experiments show that this loss function produces a more powerful training signal than :class:`CosineSimilarityLoss`,
         resulting in faster convergence and a final model with superior performance. Consequently, CoSENTLoss may be used
@@ -79,7 +80,7 @@ class CoSENTLoss(nn.Module):
         self.scale = scale
 
     def forward(self, sentence_features: Iterable[dict[str, Tensor]], labels: Tensor) -> Tensor:
-        embeddings = [self.model(sentence_feature)["sentence_embedding"] for sentence_feature in sentence_features]
+        embeddings = embed_columns(self.model, sentence_features)
 
         return self.compute_loss_from_embeddings(embeddings, labels)
 
@@ -94,20 +95,34 @@ class CoSENTLoss(nn.Module):
         Returns:
             Loss value
         """
+        batch_size = embeddings[0].shape[0]
+        if labels.numel() != batch_size:
+            raise ValueError(
+                f"{self.__class__.__name__} expects {batch_size} labels (one per example), "
+                f"but got {labels.numel()} labels with shape {tuple(labels.shape)}."
+            )
+        labels = labels.view(-1)
 
         scores = self.similarity_fct(embeddings[0], embeddings[1])
+        if labels.shape != scores.shape:
+            raise ValueError(f"Labels and scores must have the same shape, got {labels.shape} and {scores.shape}.")
+        if scores.dtype in (torch.float16, torch.bfloat16):
+            scores = scores.float()
         scores = scores * self.scale
-        scores = scores[:, None] - scores[None, :]
+        if labels.dtype == torch.bool:
+            labels = labels.int()
 
-        # label matrix indicating which pairs are relevant
-        labels = labels[:, None] < labels[None, :]
-        labels = labels.float()
-
-        # mask out irrelevant pairs so they are negligible after exp()
-        scores = scores - (1 - labels) * 1e12
+        labels, order = labels.sort()
+        scores = scores[order]
+        # For each score, sum exp(-score) over strictly higher labels. Group boundaries
+        # exclude ties, and logcumsumexp avoids materializing the quadratic score matrix.
+        higher_label_start = torch.searchsorted(labels, labels, right=True)
+        suffix_scores = torch.logcumsumexp(-scores.flip(0), dim=0).flip(0)
+        suffix_scores = torch.cat((suffix_scores, scores.new_full((1,), -torch.inf)))
+        scores = scores + suffix_scores[higher_label_start]
 
         # append a zero as e^0 = 1
-        scores = torch.cat((torch.zeros(1).to(scores.device), scores.view(-1)), dim=0)
+        scores = torch.cat((scores.new_zeros(1), scores), dim=0)
         loss = torch.logsumexp(scores, dim=0)
 
         return loss

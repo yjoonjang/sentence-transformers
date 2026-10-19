@@ -1,24 +1,20 @@
 from __future__ import annotations
 
 import copy
-import itertools
 import logging
 import math
-import queue
 import warnings
 from collections import OrderedDict
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
-from multiprocessing import Queue
-from typing import Any, Literal, overload
+from typing import Any, ClassVar, Literal, overload
 
 import numpy as np
-import numpy.typing as npt
 import torch
 from torch import Tensor, nn
 from tqdm.autonotebook import trange
 from transformers.utils import logging as transformers_logging
-from typing_extensions import deprecated
+from typing_extensions import TypeIs, deprecated
 
 from sentence_transformers.base.modality_types import SingleInput
 from sentence_transformers.base.model import BaseModel
@@ -28,6 +24,7 @@ from sentence_transformers.util import batch_to_device, truncate_embeddings
 from sentence_transformers.util.decorators import deprecated_kwargs
 from sentence_transformers.util.quantization import quantize_embeddings
 from sentence_transformers.util.similarity import SimilarityFunction
+from sentence_transformers.util.tensor import _tensor_to_numpy
 
 from .fit_mixin import FitMixin
 from .model_card import SentenceTransformerModelCardData
@@ -49,7 +46,8 @@ class SentenceTransformer(BaseModel, FitMixin):
         modules (list[nn.Module], optional): A list of torch modules that are called sequentially. Can be used to
             create custom SentenceTransformer models from scratch. Defaults to None.
         device (str, optional): Device (like ``"cuda"``, ``"cpu"``, ``"mps"``, ``"npu"``) that should be used for
-            computation. If None, checks if a GPU can be used. Defaults to None.
+            computation. If None, checks if a GPU can be used. If a ``device_map`` is provided via
+            ``model_kwargs``, that controls device placement and this argument is ignored. Defaults to None.
         prompts (dict[str, str], optional): A dictionary with prompts for the model. The key is the prompt name,
             the value is the prompt text. The prompt text will be prepended before any text to encode. For example:
             ``{"query": "query: ", "passage": "passage: "}``. If a model has saved prompts, you can override
@@ -66,8 +64,9 @@ class SentenceTransformer(BaseModel, FitMixin):
             commit id, for a stored model on Hugging Face. Defaults to None.
         local_files_only (bool, optional): Whether to only look at local files (i.e., do not try to download
             the model). Defaults to False.
-        token (bool or str, optional): Hugging Face authentication token to download private models.
-            Defaults to None.
+        token (bool or str, optional): Hugging Face authentication token for higher Hub rate limits and access to
+            private or gated models your account can read. Defaults to None, which uses ``HF_TOKEN`` or
+            credentials saved with ``hf auth login``, if available.
         use_auth_token (bool or str, optional): Deprecated. Use ``token`` instead.
         model_kwargs (dict[str, Any], optional): Keyword arguments passed to the underlying Hugging Face
             Transformers model via ``AutoModel.from_pretrained``. Particularly useful options include:
@@ -79,7 +78,10 @@ class SentenceTransformer(BaseModel, FitMixin):
               ``"sdpa"``, or ``"flash_attention_2"``. If you ``pip install kernels``, then
               ``"flash_attention_2"`` should work without having to install ``flash_attn``. It is
               frequently the fastest option. Defaults to ``"sdpa"`` when available (torch>=2.1.1).
-            - ``device_map``: Device map for model parallelism, e.g. ``"auto"``.
+            - ``device_map``: Controls how the model is placed across devices, e.g. ``"auto"`` for
+              model parallelism, or a single device like ``"cuda:1"`` to load the backbone directly
+              onto one GPU (useful when serving multiple models in one process). When set, it takes
+              precedence over the ``device`` argument.
             - ``provider``: For ``backend="onnx"``, the ONNX execution provider
               (e.g. ``"CUDAExecutionProvider"``).
             - ``file_name``: For ``backend="onnx"`` or ``"openvino"``, the filename to load
@@ -105,8 +107,8 @@ class SentenceTransformer(BaseModel, FitMixin):
             or ``"openvino"``. Defaults to ``"torch"``.
         similarity_fn_name (str or SimilarityFunction, optional): The name of the similarity function to use.
             Valid options are ``"cosine"``, ``"dot"``, ``"euclidean"``, and ``"manhattan"``. If not set, it is
-            automatically set to ``"cosine"`` when :attr:`similarity` or :attr:`similarity_pairwise` are first
-            accessed. Defaults to None.
+            automatically set to ``"cosine"`` when :meth:`similarity` or :meth:`similarity_pairwise` are first
+            called. Defaults to None.
         truncate_dim (int, optional): The dimension to truncate sentence embeddings to. ``None`` means no
             truncation. Defaults to None.
 
@@ -140,6 +142,13 @@ class SentenceTransformer(BaseModel, FitMixin):
     default_huggingface_organization: str | None = "sentence-transformers"
     _default_prompts: dict[str, str | None] = {"query": None, "document": None}
     model_type: str = "SentenceTransformer"
+    # Supported single-vector similarities. Multi-vector names (maxsim) would produce wrong shapes on 2D embeddings.
+    SUPPORTED_SIMILARITY_FN_NAMES: ClassVar[tuple[str, ...]] = (
+        SimilarityFunction.COSINE.value,
+        SimilarityFunction.DOT_PRODUCT.value,
+        SimilarityFunction.EUCLIDEAN.value,
+        SimilarityFunction.MANHATTAN.value,
+    )
 
     @deprecated_kwargs(tokenizer_kwargs="processor_kwargs")
     def __init__(
@@ -214,10 +223,114 @@ class SentenceTransformer(BaseModel, FitMixin):
                     "Either update the model configuration or call `model.set_pooling_include_prompt(False)` after loading the model."
                 )
 
+    @overload
+    def encode_query(
+        self,
+        inputs: Sequence[SingleInput] | SingleInput,
+        prompt_name: str | None = ...,
+        prompt: str | None = ...,
+        batch_size: int = ...,
+        show_progress_bar: bool | None = ...,
+        output_value: Literal["sentence_embedding"] = ...,
+        precision: Literal["float32", "int8", "uint8", "binary", "ubinary"] = ...,
+        convert_to_numpy: Literal[True] = ...,
+        convert_to_tensor: Literal[False] = ...,
+        device: str | list[str | torch.device] | None = ...,
+        normalize_embeddings: bool = ...,
+        truncate_dim: int | None = ...,
+        pool: dict[Literal["input", "output", "processes"], Any] | None = ...,
+        chunk_size: int | None = ...,
+        **kwargs,
+    ) -> np.ndarray: ...
+
+    @overload
+    def encode_query(
+        self,
+        inputs: Sequence[SingleInput] | SingleInput,
+        prompt_name: str | None = ...,
+        prompt: str | None = ...,
+        batch_size: int = ...,
+        show_progress_bar: bool | None = ...,
+        output_value: Literal["sentence_embedding"] = ...,
+        precision: Literal["float32", "int8", "uint8", "binary", "ubinary"] = ...,
+        convert_to_numpy: bool = ...,
+        *,
+        convert_to_tensor: Literal[True],
+        device: str | list[str | torch.device] | None = ...,
+        normalize_embeddings: bool = ...,
+        truncate_dim: int | None = ...,
+        pool: dict[Literal["input", "output", "processes"], Any] | None = ...,
+        chunk_size: int | None = ...,
+        **kwargs,
+    ) -> Tensor: ...
+
+    @overload
+    def encode_query(
+        self,
+        inputs: SingleInput,
+        prompt_name: str | None = ...,
+        prompt: str | None = ...,
+        batch_size: int = ...,
+        show_progress_bar: bool | None = ...,
+        output_value: Literal["sentence_embedding"] = ...,
+        precision: Literal["float32", "int8", "uint8", "binary", "ubinary"] = ...,
+        *,
+        convert_to_numpy: Literal[False],
+        convert_to_tensor: bool = ...,
+        device: str | list[str | torch.device] | None = ...,
+        normalize_embeddings: bool = ...,
+        truncate_dim: int | None = ...,
+        pool: dict[Literal["input", "output", "processes"], Any] | None = ...,
+        chunk_size: int | None = ...,
+        **kwargs,
+    ) -> Tensor: ...
+
+    @overload
+    def encode_query(
+        self,
+        inputs: Sequence[SingleInput],
+        prompt_name: str | None = ...,
+        prompt: str | None = ...,
+        batch_size: int = ...,
+        show_progress_bar: bool | None = ...,
+        output_value: Literal["sentence_embedding"] = ...,
+        precision: Literal["float32", "int8", "uint8", "binary", "ubinary"] = ...,
+        *,
+        convert_to_numpy: Literal[False],
+        convert_to_tensor: Literal[False] = ...,
+        device: str | list[str | torch.device] | None = ...,
+        normalize_embeddings: bool = ...,
+        truncate_dim: int | None = ...,
+        pool: dict[Literal["input", "output", "processes"], Any] | None = ...,
+        chunk_size: int | None = ...,
+        **kwargs,
+    ) -> list[Tensor]: ...
+
+    # Catch-all so calls with union-typed arguments or output_value overrides still resolve.
+    @overload
+    def encode_query(
+        self,
+        inputs: Sequence[SingleInput] | SingleInput,
+        prompt_name: str | None = ...,
+        prompt: str | None = ...,
+        batch_size: int = ...,
+        show_progress_bar: bool | None = ...,
+        output_value: Literal["sentence_embedding", "token_embeddings"] | None = ...,
+        precision: Literal["float32", "int8", "uint8", "binary", "ubinary"] = ...,
+        convert_to_numpy: bool = ...,
+        convert_to_tensor: bool = ...,
+        device: str | list[str | torch.device] | None = ...,
+        normalize_embeddings: bool = ...,
+        truncate_dim: int | None = ...,
+        pool: dict[Literal["input", "output", "processes"], Any] | None = ...,
+        chunk_size: int | None = ...,
+        **kwargs,
+    ) -> list[Tensor] | np.ndarray | Tensor | dict[str, Tensor] | list[dict[str, Tensor]]: ...
+
     @deprecated_kwargs(sentences="inputs")
     def encode_query(
         self,
-        inputs: list[SingleInput] | SingleInput,
+        inputs: Sequence[SingleInput] | SingleInput,
         prompt_name: str | None = None,
         prompt: str | None = None,
         batch_size: int = 32,
@@ -238,8 +351,8 @@ class SentenceTransformer(BaseModel, FitMixin):
 
         This method is a specialized version of :meth:`encode` that differs in exactly two ways:
 
-        1. If no ``prompt_name`` or ``prompt`` is provided, it uses a predefined "query" prompt,
-           if available in the model's ``prompts`` dictionary.
+        1. If no ``prompt_name`` or ``prompt`` is provided, it uses the ``"query"`` prompt from the model's
+           ``prompts`` dictionary. This defaults to an empty string, which prevents fallback to ``default_prompt_name``.
         2. It sets the ``task`` to "query". If the model has a :class:`~sentence_transformers.base.modules.Router`
            module, it will use the "query" task type to route the input through the appropriate submodules.
 
@@ -273,10 +386,114 @@ class SentenceTransformer(BaseModel, FitMixin):
             **kwargs,
         )
 
+    @overload
+    def encode_document(
+        self,
+        inputs: Sequence[SingleInput] | SingleInput,
+        prompt_name: str | None = ...,
+        prompt: str | None = ...,
+        batch_size: int = ...,
+        show_progress_bar: bool | None = ...,
+        output_value: Literal["sentence_embedding"] = ...,
+        precision: Literal["float32", "int8", "uint8", "binary", "ubinary"] = ...,
+        convert_to_numpy: Literal[True] = ...,
+        convert_to_tensor: Literal[False] = ...,
+        device: str | list[str | torch.device] | None = ...,
+        normalize_embeddings: bool = ...,
+        truncate_dim: int | None = ...,
+        pool: dict[Literal["input", "output", "processes"], Any] | None = ...,
+        chunk_size: int | None = ...,
+        **kwargs,
+    ) -> np.ndarray: ...
+
+    @overload
+    def encode_document(
+        self,
+        inputs: Sequence[SingleInput] | SingleInput,
+        prompt_name: str | None = ...,
+        prompt: str | None = ...,
+        batch_size: int = ...,
+        show_progress_bar: bool | None = ...,
+        output_value: Literal["sentence_embedding"] = ...,
+        precision: Literal["float32", "int8", "uint8", "binary", "ubinary"] = ...,
+        convert_to_numpy: bool = ...,
+        *,
+        convert_to_tensor: Literal[True],
+        device: str | list[str | torch.device] | None = ...,
+        normalize_embeddings: bool = ...,
+        truncate_dim: int | None = ...,
+        pool: dict[Literal["input", "output", "processes"], Any] | None = ...,
+        chunk_size: int | None = ...,
+        **kwargs,
+    ) -> Tensor: ...
+
+    @overload
+    def encode_document(
+        self,
+        inputs: SingleInput,
+        prompt_name: str | None = ...,
+        prompt: str | None = ...,
+        batch_size: int = ...,
+        show_progress_bar: bool | None = ...,
+        output_value: Literal["sentence_embedding"] = ...,
+        precision: Literal["float32", "int8", "uint8", "binary", "ubinary"] = ...,
+        *,
+        convert_to_numpy: Literal[False],
+        convert_to_tensor: bool = ...,
+        device: str | list[str | torch.device] | None = ...,
+        normalize_embeddings: bool = ...,
+        truncate_dim: int | None = ...,
+        pool: dict[Literal["input", "output", "processes"], Any] | None = ...,
+        chunk_size: int | None = ...,
+        **kwargs,
+    ) -> Tensor: ...
+
+    @overload
+    def encode_document(
+        self,
+        inputs: Sequence[SingleInput],
+        prompt_name: str | None = ...,
+        prompt: str | None = ...,
+        batch_size: int = ...,
+        show_progress_bar: bool | None = ...,
+        output_value: Literal["sentence_embedding"] = ...,
+        precision: Literal["float32", "int8", "uint8", "binary", "ubinary"] = ...,
+        *,
+        convert_to_numpy: Literal[False],
+        convert_to_tensor: Literal[False] = ...,
+        device: str | list[str | torch.device] | None = ...,
+        normalize_embeddings: bool = ...,
+        truncate_dim: int | None = ...,
+        pool: dict[Literal["input", "output", "processes"], Any] | None = ...,
+        chunk_size: int | None = ...,
+        **kwargs,
+    ) -> list[Tensor]: ...
+
+    # Catch-all so calls with union-typed arguments or output_value overrides still resolve.
+    @overload
+    def encode_document(
+        self,
+        inputs: Sequence[SingleInput] | SingleInput,
+        prompt_name: str | None = ...,
+        prompt: str | None = ...,
+        batch_size: int = ...,
+        show_progress_bar: bool | None = ...,
+        output_value: Literal["sentence_embedding", "token_embeddings"] | None = ...,
+        precision: Literal["float32", "int8", "uint8", "binary", "ubinary"] = ...,
+        convert_to_numpy: bool = ...,
+        convert_to_tensor: bool = ...,
+        device: str | list[str | torch.device] | None = ...,
+        normalize_embeddings: bool = ...,
+        truncate_dim: int | None = ...,
+        pool: dict[Literal["input", "output", "processes"], Any] | None = ...,
+        chunk_size: int | None = ...,
+        **kwargs,
+    ) -> list[Tensor] | np.ndarray | Tensor | dict[str, Tensor] | list[dict[str, Tensor]]: ...
+
     @deprecated_kwargs(sentences="inputs")
     def encode_document(
         self,
-        inputs: list[SingleInput] | SingleInput,
+        inputs: Sequence[SingleInput] | SingleInput,
         prompt_name: str | None = None,
         prompt: str | None = None,
         batch_size: int = 32,
@@ -335,31 +552,18 @@ class SentenceTransformer(BaseModel, FitMixin):
             **kwargs,
         )
 
-    # Overload signatures for type hints
-    @overload
-    def encode(
-        self,
-        inputs: SingleInput,
-        prompt_name: str | None = ...,
-        prompt: str | None = ...,
-        batch_size: int = ...,
-        show_progress_bar: bool | None = ...,
-        output_value: Literal["sentence_embedding", "token_embeddings"] = ...,
-        precision: Literal["float32", "int8", "uint8", "binary", "ubinary"] = ...,
-        convert_to_numpy: Literal[False] = ...,
-        convert_to_tensor: bool = ...,
-        device: str | list[str | torch.device] | None = ...,
-        normalize_embeddings: bool = ...,
-        truncate_dim: int | None = ...,
-        pool: dict[Literal["input", "output", "processes"], Any] | None = ...,
-        chunk_size: int | None = ...,
-        **kwargs,
-    ) -> Tensor: ...
+    def is_singular_input(self, inputs: Any) -> TypeIs[SingleInput]:
+        """Check if the input is a single example rather than a batch. Redeclared with
+        :class:`~typing_extensions.TypeIs` so type checkers narrow the branches in :meth:`encode`."""
+        return super().is_singular_input(inputs)
 
+    # Ordered overloads: the first match wins, so the all-defaults signatures come first and each
+    # deviation pins its deviating flag as a required keyword. Singular inputs precede Sequence ones
+    # so plain strings and bare conversations resolve as one input (both also match Sequence).
     @overload
     def encode(
         self,
-        inputs: list[SingleInput] | SingleInput,
+        inputs: Sequence[SingleInput] | SingleInput,
         prompt_name: str | None = ...,
         prompt: str | None = ...,
         batch_size: int = ...,
@@ -379,7 +583,7 @@ class SentenceTransformer(BaseModel, FitMixin):
     @overload
     def encode(
         self,
-        inputs: list[SingleInput] | SingleInput,
+        inputs: Sequence[SingleInput] | SingleInput,
         prompt_name: str | None = ...,
         prompt: str | None = ...,
         batch_size: int = ...,
@@ -387,7 +591,8 @@ class SentenceTransformer(BaseModel, FitMixin):
         output_value: Literal["sentence_embedding"] = ...,
         precision: Literal["float32", "int8", "uint8", "binary", "ubinary"] = ...,
         convert_to_numpy: bool = ...,
-        convert_to_tensor: Literal[True] = ...,
+        *,
+        convert_to_tensor: Literal[True],
         device: str | list[str | torch.device] | None = ...,
         normalize_embeddings: bool = ...,
         truncate_dim: int | None = ...,
@@ -399,14 +604,15 @@ class SentenceTransformer(BaseModel, FitMixin):
     @overload
     def encode(
         self,
-        inputs: list[SingleInput],
+        inputs: SingleInput,
         prompt_name: str | None = ...,
         prompt: str | None = ...,
         batch_size: int = ...,
         show_progress_bar: bool | None = ...,
-        output_value: Literal["sentence_embedding", "token_embeddings"] = ...,
+        output_value: Literal["sentence_embedding"] = ...,
         precision: Literal["float32", "int8", "uint8", "binary", "ubinary"] = ...,
-        convert_to_numpy: bool = ...,
+        *,
+        convert_to_numpy: Literal[False],
         convert_to_tensor: bool = ...,
         device: str | list[str | torch.device] | None = ...,
         normalize_embeddings: bool = ...,
@@ -414,27 +620,7 @@ class SentenceTransformer(BaseModel, FitMixin):
         pool: dict[Literal["input", "output", "processes"], Any] | None = ...,
         chunk_size: int | None = ...,
         **kwargs,
-    ) -> list[Tensor]: ...
-
-    @overload
-    def encode(
-        self,
-        inputs: list[SingleInput],
-        prompt_name: str | None = ...,
-        prompt: str | None = ...,
-        batch_size: int = ...,
-        show_progress_bar: bool | None = ...,
-        output_value: None = ...,
-        precision: Literal["float32", "int8", "uint8", "binary", "ubinary"] = ...,
-        convert_to_numpy: bool = ...,
-        convert_to_tensor: bool = ...,
-        device: str | list[str | torch.device] | None = ...,
-        normalize_embeddings: bool = ...,
-        truncate_dim: int | None = ...,
-        pool: dict[Literal["input", "output", "processes"], Any] | None = ...,
-        chunk_size: int | None = ...,
-        **kwargs,
-    ) -> list[dict[str, Tensor]]: ...
+    ) -> Tensor: ...
 
     @overload
     def encode(
@@ -444,7 +630,29 @@ class SentenceTransformer(BaseModel, FitMixin):
         prompt: str | None = ...,
         batch_size: int = ...,
         show_progress_bar: bool | None = ...,
-        output_value: None = ...,
+        *,
+        output_value: Literal["token_embeddings"],
+        precision: Literal["float32", "int8", "uint8", "binary", "ubinary"] = ...,
+        convert_to_numpy: bool = ...,
+        convert_to_tensor: bool = ...,
+        device: str | list[str | torch.device] | None = ...,
+        normalize_embeddings: bool = ...,
+        truncate_dim: int | None = ...,
+        pool: dict[Literal["input", "output", "processes"], Any] | None = ...,
+        chunk_size: int | None = ...,
+        **kwargs,
+    ) -> Tensor: ...
+
+    @overload
+    def encode(
+        self,
+        inputs: SingleInput,
+        prompt_name: str | None = ...,
+        prompt: str | None = ...,
+        batch_size: int = ...,
+        show_progress_bar: bool | None = ...,
+        *,
+        output_value: None,
         precision: Literal["float32", "int8", "uint8", "binary", "ubinary"] = ...,
         convert_to_numpy: bool = ...,
         convert_to_tensor: bool = ...,
@@ -459,12 +667,34 @@ class SentenceTransformer(BaseModel, FitMixin):
     @overload
     def encode(
         self,
-        inputs: SingleInput,
+        inputs: Sequence[SingleInput],
         prompt_name: str | None = ...,
         prompt: str | None = ...,
         batch_size: int = ...,
         show_progress_bar: bool | None = ...,
-        output_value: Literal["token_embeddings"] = ...,
+        output_value: Literal["sentence_embedding"] = ...,
+        precision: Literal["float32", "int8", "uint8", "binary", "ubinary"] = ...,
+        *,
+        convert_to_numpy: Literal[False],
+        convert_to_tensor: Literal[False] = ...,
+        device: str | list[str | torch.device] | None = ...,
+        normalize_embeddings: bool = ...,
+        truncate_dim: int | None = ...,
+        pool: dict[Literal["input", "output", "processes"], Any] | None = ...,
+        chunk_size: int | None = ...,
+        **kwargs,
+    ) -> list[Tensor]: ...
+
+    @overload
+    def encode(
+        self,
+        inputs: Sequence[SingleInput],
+        prompt_name: str | None = ...,
+        prompt: str | None = ...,
+        batch_size: int = ...,
+        show_progress_bar: bool | None = ...,
+        *,
+        output_value: Literal["token_embeddings"],
         precision: Literal["float32", "int8", "uint8", "binary", "ubinary"] = ...,
         convert_to_numpy: bool = ...,
         convert_to_tensor: bool = ...,
@@ -474,13 +704,55 @@ class SentenceTransformer(BaseModel, FitMixin):
         pool: dict[Literal["input", "output", "processes"], Any] | None = ...,
         chunk_size: int | None = ...,
         **kwargs,
-    ) -> Tensor: ...
+    ) -> list[Tensor]: ...
+
+    @overload
+    def encode(
+        self,
+        inputs: Sequence[SingleInput],
+        prompt_name: str | None = ...,
+        prompt: str | None = ...,
+        batch_size: int = ...,
+        show_progress_bar: bool | None = ...,
+        *,
+        output_value: None,
+        precision: Literal["float32", "int8", "uint8", "binary", "ubinary"] = ...,
+        convert_to_numpy: bool = ...,
+        convert_to_tensor: bool = ...,
+        device: str | list[str | torch.device] | None = ...,
+        normalize_embeddings: bool = ...,
+        truncate_dim: int | None = ...,
+        pool: dict[Literal["input", "output", "processes"], Any] | None = ...,
+        chunk_size: int | None = ...,
+        **kwargs,
+    ) -> list[dict[str, Tensor]]: ...
+
+    # Catch-all so forwarding calls with union-typed arguments (e.g. from encode_query) still resolve.
+    @overload
+    def encode(
+        self,
+        inputs: Sequence[SingleInput] | SingleInput,
+        prompt_name: str | None = ...,
+        prompt: str | None = ...,
+        batch_size: int = ...,
+        show_progress_bar: bool | None = ...,
+        output_value: Literal["sentence_embedding", "token_embeddings"] | None = ...,
+        precision: Literal["float32", "int8", "uint8", "binary", "ubinary"] = ...,
+        convert_to_numpy: bool = ...,
+        convert_to_tensor: bool = ...,
+        device: str | list[str | torch.device] | None = ...,
+        normalize_embeddings: bool = ...,
+        truncate_dim: int | None = ...,
+        pool: dict[Literal["input", "output", "processes"], Any] | None = ...,
+        chunk_size: int | None = ...,
+        **kwargs,
+    ) -> list[Tensor] | np.ndarray | Tensor | dict[str, Tensor] | list[dict[str, Tensor]]: ...
 
     @torch.inference_mode()
     @deprecated_kwargs(sentences="inputs")
     def encode(
         self,
-        inputs: list[SingleInput] | SingleInput,
+        inputs: Sequence[SingleInput] | SingleInput,
         prompt_name: str | None = None,
         prompt: str | None = None,
         batch_size: int = 32,
@@ -539,9 +811,10 @@ class SentenceTransformer(BaseModel, FitMixin):
                 - A single device string (e.g., "cuda:0", "cpu") for single-process encoding
                 - A list of device strings (e.g., ["cuda:0", "cuda:1"], ["cpu", "cpu", "cpu", "cpu"]) to distribute
                   encoding across multiple processes
-                - None to auto-detect available device for single-process encoding
+                - None to use the model's current device
 
-                If a list is provided, multi-process encoding will be used. Defaults to None.
+                A single device moves the model there, unless a `device_map` or Accelerate hooks control placement. If a list is
+                provided, multi-process encoding will be used. Defaults to None.
             normalize_embeddings (bool, optional): Whether to normalize returned vectors to have length 1.
             truncate_dim (int, optional): The dimension to truncate sentence embeddings to.
             pool (Dict[Literal["input", "output", "processes"], Any], optional): A pool created by
@@ -559,13 +832,6 @@ class SentenceTransformer(BaseModel, FitMixin):
                 array with shape [num_inputs, output_dimension] is returned. If ``output_value`` is ``None``, a list
                 of dicts (or a single dict for singular input) is returned.
         """
-        if self.device.type == "hpu" and not self.is_hpu_graph_enabled:
-            import habana_frameworks.torch as ht
-
-            if hasattr(ht, "hpu") and hasattr(ht.hpu, "wrap_in_hpu_graph"):
-                ht.hpu.wrap_in_hpu_graph(self, disable_tensor_cache=True)
-                self.is_hpu_graph_enabled = True
-
         if show_progress_bar is None:
             show_progress_bar = logger.getEffectiveLevel() in (logging.INFO, logging.DEBUG)
 
@@ -584,8 +850,10 @@ class SentenceTransformer(BaseModel, FitMixin):
         if is_singular_input:
             inputs = [inputs]
         elif not isinstance(inputs, list):
-            # Materialize e.g. datasets.Column to avoid slow Arrow deserialization on each index
-            inputs = inputs.tolist() if isinstance(inputs, np.ndarray) else list(inputs)
+            # Materialize e.g. datasets.Column to avoid slow Arrow deserialization on each index.
+            # The annotation pins ndarray.tolist()'s Any so checkers keep the narrowed input type.
+            materialized: list[SingleInput] = inputs.tolist() if isinstance(inputs, np.ndarray) else list(inputs)
+            inputs = materialized
 
         # Validate kwargs
         model_kwargs = self.get_model_kwargs()
@@ -603,48 +871,85 @@ class SentenceTransformer(BaseModel, FitMixin):
         if precision is not None and precision not in ALLOWED_PRECISIONS:
             raise ValueError(f"Precision {precision!r} is not supported, must be one of {ALLOWED_PRECISIONS}")
 
-        # If pool or a list of devices is provided, use multi-process encoding
-        if pool is not None or (isinstance(device, list) and len(device) > 0):
-            embeddings = self._multi_process(
-                inputs,
-                # Utility and post-processing parameters
-                show_progress_bar=show_progress_bar,
-                # Multi-process encoding parameters
-                pool=pool,
-                device=device,
-                chunk_size=chunk_size,
-                # Encoding parameters
-                prompt_name=prompt_name,
-                prompt=prompt,
-                batch_size=batch_size,
-                output_value=output_value,
-                precision=precision,
-                convert_to_numpy=convert_to_numpy,
-                convert_to_tensor=convert_to_tensor,
-                normalize_embeddings=normalize_embeddings,
-                truncate_dim=truncate_dim,
-                **kwargs,
-            )
-            if is_singular_input:
-                embeddings = embeddings[0]
-            return embeddings
-
         prompt = self._resolve_prompt(prompt, prompt_name)
+        truncate_dim = truncate_dim if truncate_dim is not None else self.truncate_dim
 
-        # Set device
-        if device is None:
-            device = self.device
-        self.to(device)
+        inference_kwargs = dict(
+            prompt=prompt,
+            batch_size=batch_size,
+            show_progress_bar=show_progress_bar,
+            output_value=output_value,
+            save_to_cpu=convert_to_numpy,
+            normalize_embeddings=normalize_embeddings,
+            truncate_dim=truncate_dim,
+            **kwargs,
+        )
+        use_multi_process = pool is not None or (isinstance(device, list) and len(device) > 0)
+        if use_multi_process:
+            all_embeddings = self._multi_process(
+                inputs, pool=pool, device=device, chunk_size=chunk_size, **inference_kwargs
+            )
+        elif self._distributed_inference is not None and device is None:
+            all_embeddings = self._distributed_inference(inputs, **inference_kwargs)
+        else:
+            all_embeddings = self._inference(inputs, device=device, **inference_kwargs)
+
+        if len(all_embeddings) and precision and precision != "float32":
+            all_embeddings = quantize_embeddings(all_embeddings, precision=precision)
+
+        if convert_to_tensor:
+            if isinstance(all_embeddings, Tensor) or len(all_embeddings):
+                all_embeddings = torch.as_tensor(all_embeddings)
+            else:
+                all_embeddings = torch.tensor([], device="cpu" if use_multi_process else self.device)
+        elif convert_to_numpy:
+            if not len(all_embeddings):
+                all_embeddings = np.array([])
+            elif isinstance(all_embeddings, Tensor):
+                all_embeddings = _tensor_to_numpy(all_embeddings)
+        else:
+            all_embeddings = list(
+                torch.from_numpy(all_embeddings) if isinstance(all_embeddings, np.ndarray) else all_embeddings
+            )
+
+        if is_singular_input:
+            all_embeddings = all_embeddings[0]
+
+        return all_embeddings
+
+    @torch.inference_mode()
+    def _inference(
+        self,
+        inputs: list,
+        *,
+        prompt: str | None,
+        batch_size: int,
+        show_progress_bar: bool,
+        output_value: str | None,
+        save_to_cpu: bool,
+        normalize_embeddings: bool,
+        truncate_dim: int | None,
+        device: str | torch.device | None = None,
+        **kwargs,
+    ) -> list[Tensor] | Tensor | list[dict[str, Any]]:
+        """Run local inference on normalized inputs with resolved arguments."""
+        device = self._resolve_inference_device(device)
+        is_hpu = device.type == "hpu"
+        if is_hpu and not self.is_hpu_graph_enabled:
+            import habana_frameworks.torch as ht
+
+            if hasattr(ht, "hpu") and hasattr(ht.hpu, "wrap_in_hpu_graph"):
+                ht.hpu.wrap_in_hpu_graph(self, disable_tensor_cache=True)
+                self.is_hpu_graph_enabled = True
+
         self.eval()
 
-        truncate_dim = truncate_dim if truncate_dim is not None else self.truncate_dim
         all_embeddings = []
         length_sorted_idx = np.argsort([-self._input_length(sen) for sen in inputs])
         if self._can_flatten_inputs():
             length_sorted_idx = self._interleave_sorted_indices(length_sorted_idx)
         inputs_sorted = [inputs[idx] for idx in length_sorted_idx]
 
-        is_hpu = self.device.type == "hpu"
         for start_index in trange(0, len(inputs_sorted), batch_size, desc="Batches", disable=not show_progress_bar):
             inputs_batch = inputs_sorted[start_index : start_index + batch_size]
             features = self.preprocess(inputs_batch, prompt=prompt, **kwargs)
@@ -654,7 +959,8 @@ class SentenceTransformer(BaseModel, FitMixin):
 
             features = batch_to_device(features, device)
 
-            out_features = self.forward(features, **kwargs)
+            # Route through __call__ so that model.compile() applies to the forward pass.
+            out_features = self(features, **kwargs)
             if is_hpu:
                 out_features = copy.deepcopy(out_features)
 
@@ -672,47 +978,27 @@ class SentenceTransformer(BaseModel, FitMixin):
                     embeddings.append(token_emb[: last_mask_id + 1])
             elif output_value is None:
                 embeddings = []
-                for idx in range(len(out_features["sentence_embedding"])):
+                for idx in range(len(inputs_batch)):
                     batch_item = {}
                     for name, value in out_features.items():
-                        try:
-                            batch_item[name] = value[idx]
-                        except TypeError:
-                            batch_item[name] = value
+                        is_batch_first = (
+                            isinstance(value, Tensor) and value.ndim > 0 and value.shape[0] == len(inputs_batch)
+                        )
+                        batch_item[name] = value[idx] if is_batch_first else value
                     embeddings.append(batch_item)
             else:
                 embeddings = out_features[output_value]
                 if normalize_embeddings:
                     embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
-                if convert_to_numpy:
+                if save_to_cpu:
                     embeddings = embeddings.cpu()
 
             all_embeddings.extend(embeddings)
 
         all_embeddings = [all_embeddings[idx] for idx in np.argsort(length_sorted_idx)]
 
-        if all_embeddings and precision and precision != "float32":
-            all_embeddings = quantize_embeddings(all_embeddings, precision=precision)
-
-        if convert_to_tensor:
-            if len(all_embeddings):
-                if isinstance(all_embeddings, np.ndarray):
-                    all_embeddings = torch.from_numpy(all_embeddings)
-                else:
-                    all_embeddings = torch.stack(all_embeddings)
-            else:
-                all_embeddings = torch.tensor([], device=self.device)
-        elif convert_to_numpy:
-            if not isinstance(all_embeddings, np.ndarray):
-                if all_embeddings and all_embeddings[0].dtype == torch.bfloat16:
-                    all_embeddings = np.asarray([emb.float().numpy() for emb in all_embeddings])
-                else:
-                    all_embeddings = np.asarray([emb.numpy() for emb in all_embeddings])
-        elif isinstance(all_embeddings, np.ndarray):
-            all_embeddings = [torch.from_numpy(embedding) for embedding in all_embeddings]
-
-        if is_singular_input:
-            all_embeddings = all_embeddings[0]
+        if output_value == "sentence_embedding":
+            return torch.stack(all_embeddings) if all_embeddings else torch.tensor([], device=device)
 
         return all_embeddings
 
@@ -756,46 +1042,57 @@ class SentenceTransformer(BaseModel, FitMixin):
     ) -> None:
         if isinstance(value, SimilarityFunction):
             value = value.value
+        if value is not None and value not in self.SUPPORTED_SIMILARITY_FN_NAMES:
+            hint = " Use MultiVectorEncoder for MaxSim late-interaction scoring." if value == "maxsim" else ""
+            raise ValueError(
+                f"{type(self).__name__} only supports similarity_fn_name in "
+                f"{self.SUPPORTED_SIMILARITY_FN_NAMES}, got {value!r}.{hint}"
+            )
         if value is not None:
             self._similarity = SimilarityFunction.to_similarity_fn(value)
             self._similarity_pairwise = SimilarityFunction.to_similarity_pairwise_fn(value)
         self._similarity_fn_name = value
 
-    @overload
-    def similarity(self, embeddings1: Tensor, embeddings2: Tensor) -> Tensor: ...
-
-    @overload
-    def similarity(self, embeddings1: npt.NDArray[np.float32], embeddings2: npt.NDArray[np.float32]) -> Tensor: ...
-
-    @property
-    def similarity(self) -> Callable[[Tensor | npt.NDArray[np.float32], Tensor | npt.NDArray[np.float32]], Tensor]:
+    def similarity(
+        self,
+        embeddings1: Tensor | np.ndarray | list[Tensor] | list[np.ndarray],
+        embeddings2: Tensor | np.ndarray | list[Tensor] | list[np.ndarray],
+    ) -> Tensor:
         """
-        Return a function that computes the similarity between two collections of embeddings. The output will be a
-        matrix with the similarity scores between all embeddings from the first parameter and all embeddings from the
-        second parameter.
+        Compute the similarity between two collections of embeddings. The output is a matrix with the
+        similarity scores between all embeddings from the first parameter and all embeddings from the
+        second parameter, computed with the similarity function set via ``similarity_fn_name``.
+
+        Args:
+            embeddings1 (Union[Tensor, ndarray]): [num_embeddings_1, embedding_dim] or [embedding_dim]-shaped numpy array or torch tensor.
+            embeddings2 (Union[Tensor, ndarray]): [num_embeddings_2, embedding_dim] or [embedding_dim]-shaped numpy array or torch tensor.
+
+        Returns:
+            Tensor: A [num_embeddings_1, num_embeddings_2]-shaped torch tensor with similarity scores.
         """
         # Access similarity_fn_name to trigger lazy initialization of _similarity
         self.similarity_fn_name  # noqa: B018
-        return self._similarity
+        return self._similarity(embeddings1, embeddings2)
 
-    @overload
-    def similarity_pairwise(self, embeddings1: Tensor, embeddings2: Tensor) -> Tensor: ...
-
-    @overload
-    def similarity_pairwise(
-        self, embeddings1: npt.NDArray[np.float32], embeddings2: npt.NDArray[np.float32]
-    ) -> Tensor: ...
-
-    @property
     def similarity_pairwise(
         self,
-    ) -> Callable[[Tensor | npt.NDArray[np.float32], Tensor | npt.NDArray[np.float32]], Tensor]:
+        embeddings1: Tensor | np.ndarray | list[Tensor] | list[np.ndarray],
+        embeddings2: Tensor | np.ndarray | list[Tensor] | list[np.ndarray],
+    ) -> Tensor:
         """
-        Return a function that computes the pairwise similarity between two collections of embeddings.
+        Compute the pairwise similarity between two collections of embeddings, i.e. the similarity
+        between ``embeddings1[i]`` and ``embeddings2[i]`` for each ``i``.
+
+        Args:
+            embeddings1 (Union[Tensor, ndarray]): [num_embeddings, embedding_dim] or [embedding_dim]-shaped numpy array or torch tensor.
+            embeddings2 (Union[Tensor, ndarray]): [num_embeddings, embedding_dim] or [embedding_dim]-shaped numpy array or torch tensor.
+
+        Returns:
+            Tensor: A [num_embeddings]-shaped torch tensor with pairwise similarity scores.
         """
         # Access similarity_fn_name to trigger lazy initialization of _similarity_pairwise
         self.similarity_fn_name  # noqa: B018
-        return self._similarity_pairwise
+        return self._similarity_pairwise(embeddings1, embeddings2)
 
     @deprecated(
         "The `encode_multi_process` method has been deprecated, and its functionality has been integrated into `encode`. "
@@ -834,94 +1131,6 @@ class SentenceTransformer(BaseModel, FitMixin):
             pool=pool,
             chunk_size=chunk_size,
         )
-
-    def _multi_process(
-        self,
-        inputs: list[SingleInput],
-        show_progress_bar: bool | None = True,
-        pool: dict[Literal["input", "output", "processes"], Any] | None = None,
-        device: str | list[str | torch.device] | None = None,
-        chunk_size: int | None = None,
-        **encode_kwargs,
-    ) -> list | Tensor | np.ndarray:
-        """Internal method for multi-process encoding.
-
-        Either ``pool`` or ``device`` (as a list) must be provided. If ``pool`` is ``None`` and ``device``
-        is a list, a temporary pool is created and cleaned up after encoding.
-        """
-        convert_to_tensor = encode_kwargs.get("convert_to_tensor", False)
-        convert_to_numpy = encode_kwargs.get("convert_to_numpy", False)
-        encode_kwargs["show_progress_bar"] = False
-
-        # Create a pool if not provided, but a list of devices is
-        created_pool = False
-        if pool is None and isinstance(device, list):
-            pool = self.start_multi_process_pool(device)
-            created_pool = True
-
-        try:
-            # Determine chunk size
-            if chunk_size is None:
-                chunk_size = min(math.ceil(len(inputs) / len(pool["processes"]) / 10), 5000)
-                chunk_size = max(chunk_size, 1)
-
-            input_queue: torch.multiprocessing.Queue = pool["input"]
-            output_queue: torch.multiprocessing.Queue = pool["output"]
-
-            # Send inputs to the input queue in chunks
-            chunk_id = -1
-            for chunk_id, chunk_start in enumerate(range(0, len(inputs), chunk_size)):
-                chunk = inputs[chunk_start : chunk_start + chunk_size]
-                input_queue.put([chunk_id, chunk, encode_kwargs])
-
-            # Collect results from the output queue
-            output_list = sorted(
-                [output_queue.get() for _ in trange(chunk_id + 1, desc="Chunks", disable=not show_progress_bar)],
-                key=lambda x: x[0],
-            )
-
-            # Handle the various output formats
-            embeddings = [output[1] for output in output_list]
-            if embeddings:
-                if isinstance(embeddings[0], list):
-                    embeddings = list(itertools.chain.from_iterable(embeddings))
-                elif isinstance(embeddings[0], torch.Tensor):
-                    embeddings = torch.cat(embeddings)
-                elif isinstance(embeddings[0], np.ndarray):
-                    embeddings = np.concatenate(embeddings, axis=0)
-            elif convert_to_tensor:
-                embeddings = torch.tensor([])
-            elif convert_to_numpy:
-                embeddings = np.array([])
-            return embeddings
-
-        finally:
-            if created_pool:
-                self.stop_multi_process_pool(pool)
-
-    @staticmethod
-    def _multi_process_worker(
-        target_device: str, model: SentenceTransformer, input_queue: Queue, results_queue: Queue
-    ) -> None:
-        """Internal working process to encode inputs in multi-process setup.
-
-        Workers are terminated externally via ``stop_multi_process_pool``.
-        """
-        while True:
-            try:
-                chunk_id, inputs, kwargs = input_queue.get()
-                embeddings = model.encode(inputs, device=target_device, **kwargs)
-                # Move embeddings to CPU if needed
-                if isinstance(embeddings, torch.Tensor) and embeddings.device.type != "cpu":
-                    embeddings = embeddings.cpu()
-                elif isinstance(embeddings, dict):
-                    embeddings = {
-                        key: value.cpu() if isinstance(value, torch.Tensor) and value.device.type != "cpu" else value
-                        for key, value in embeddings.items()
-                    }
-                results_queue.put([chunk_id, embeddings])
-            except queue.Empty:
-                break
 
     def set_pooling_include_prompt(self, include_prompt: bool) -> None:
         """
@@ -1085,8 +1294,11 @@ class SentenceTransformer(BaseModel, FitMixin):
 
     def _parse_model_config(self, model_config: dict[str, Any]) -> None:
         super()._parse_model_config(model_config)
-        if self._similarity_fn_name is None:
-            self.similarity_fn_name = model_config.get("similarity_fn_name", None)
+        # Inherit a supported saved similarity_fn_name unless the user overrode it (multi-vector
+        # names like "maxsim", e.g. from converted MultiVectorEncoder saves, fall through).
+        saved_similarity = model_config.get("similarity_fn_name")
+        if self._similarity_fn_name is None and saved_similarity in self.SUPPORTED_SIMILARITY_FN_NAMES:
+            self.similarity_fn_name = saved_similarity
         if self.truncate_dim is None:
             self.truncate_dim = model_config.get("truncate_dim", None)
 
@@ -1097,32 +1309,6 @@ class SentenceTransformer(BaseModel, FitMixin):
         if self.truncate_dim is not None:
             config["truncate_dim"] = self.truncate_dim
         return config
-
-    def _load_converted_modules(
-        self,
-        model_name_or_path: str,
-        token: bool | str | None,
-        cache_folder: str | None,
-        revision: str | None = None,
-        trust_remote_code: bool = False,
-        local_files_only: bool = False,
-        model_kwargs: dict[str, Any] | None = None,
-        processor_kwargs: dict[str, Any] | None = None,
-        config_kwargs: dict[str, Any] | None = None,
-        model_type: str | None = None,
-    ) -> tuple[list[nn.Module] | OrderedDict[str, nn.Module], dict[str, Any]]:
-        # Create default SentenceTransformer modules for models saved as a different model type (e.g. CrossEncoder, SparseEncoder)
-        return self._load_default_modules(
-            model_name_or_path,
-            token,
-            cache_folder,
-            revision,
-            trust_remote_code,
-            local_files_only,
-            model_kwargs,
-            processor_kwargs,
-            config_kwargs,
-        )
 
     def _push_to_hub_usage_tip(self, repo_id: str) -> str:
         class_name = self.__class__.__name__

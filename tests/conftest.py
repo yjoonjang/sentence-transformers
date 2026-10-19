@@ -1,19 +1,120 @@
 from __future__ import annotations
 
+import logging
 import os
 import tempfile
 from copy import deepcopy
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import torch
+from huggingface_hub.utils import validate_repo_id
 from tokenizers import Tokenizer
 
-from sentence_transformers import CrossEncoder, SentenceTransformer, SparseEncoder
-from sentence_transformers.sentence_transformer.modules import Pooling, StaticEmbedding, Transformer
+from sentence_transformers import CrossEncoder, MultiVectorEncoder, SentenceTransformer, SparseEncoder
+from sentence_transformers.sentence_transformer.modules import (
+    Pooling,
+    StaticEmbedding,
+    Transformer,
+    WordEmbeddings,
+)
+from sentence_transformers.sentence_transformer.modules.tokenizer import WhitespaceTokenizer
 from sentence_transformers.util import is_datasets_available
 
 if is_datasets_available():
     from datasets import DatasetDict, load_dataset
+
+
+def _clear_warning_once_cache() -> None:
+    # Nothing to clear when warning_once is not the lru_cache-wrapped transformers version, as then
+    # it does not suppress repeats in the first place.
+    cache_clear = getattr(getattr(logging.Logger, "warning_once", None), "cache_clear", None)
+    if cache_clear is not None:
+        cache_clear()
+
+
+@pytest.fixture(autouse=True)
+def clear_warning_once_cache():
+    """transformers caches ``warning_once`` globally, so without this a warning emitted by one test
+    silences it in every later test. Request the fixture by name to clear the cache again part-way
+    through a test.
+    """
+    _clear_warning_once_cache()
+    return _clear_warning_once_cache
+
+
+def _fake_model_info(model_id: str) -> SimpleNamespace:
+    validate_repo_id(model_id)
+    if os.path.exists(model_id):
+        raise ValueError(f"{model_id!r} is a local path, not a Hub model ID")
+    return SimpleNamespace(id=model_id, sha="0123456789abcdef0123456789abcdef01234567")
+
+
+def _fake_dataset_info(dataset_id: str) -> SimpleNamespace:
+    validate_repo_id(dataset_id)
+    if os.path.exists(dataset_id):
+        raise ValueError(f"{dataset_id!r} is a local path, not a Hub dataset ID")
+    return SimpleNamespace(id=dataset_id, cardData=None)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def mock_hub_info():
+    """Mock the Hub requests checking whether base models and datasets exist, e.g. to dodge rate limits in CI."""
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr("sentence_transformers.base.model_card.get_model_info", _fake_model_info)
+        monkeypatch.setattr("sentence_transformers.base.model_card.get_dataset_info", _fake_dataset_info)
+        yield
+
+
+@pytest.fixture(scope="session", autouse=True)
+def cache_hub_revision_resolution():
+    """Avoid repeatedly resolving the same Hub revision throughout the integration suite."""
+    from sentence_transformers.util import file_io
+
+    resolve_revision = file_io._hub_resolve_revision
+    if resolve_revision is None:
+        yield
+        return
+
+    resolved_revisions = {}
+
+    def cached_resolve_revision(
+        repo_id,
+        *,
+        repo_type=None,
+        revision=None,
+        cache_dir=None,
+        local_files_only=False,
+        token=None,
+    ):
+        if cache_dir is not None or local_files_only or hasattr(revision, "resolved"):
+            return resolve_revision(
+                repo_id,
+                repo_type=repo_type,
+                revision=revision,
+                cache_dir=cache_dir,
+                local_files_only=local_files_only,
+                token=token,
+            )
+
+        key = (repo_id, repo_type, revision, token)
+        if key not in resolved_revisions:
+            resolved_revisions[key] = resolve_revision(
+                repo_id,
+                repo_type=repo_type,
+                revision=revision,
+                cache_dir=cache_dir,
+                local_files_only=False,
+                token=token,
+            )
+        return resolved_revisions[key]
+
+    file_io._hub_resolve_revision = cached_resolve_revision
+    try:
+        yield
+    finally:
+        file_io._hub_resolve_revision = resolve_revision
 
 
 # Sentence Transformers
@@ -21,8 +122,6 @@ if is_datasets_available():
 def _stsb_bert_tiny_model() -> SentenceTransformer:
     model_id = "sentence-transformers-testing/stsb-bert-tiny-safetensors"
     model = SentenceTransformer(model_id)
-    if not model.model_card_data.base_model:
-        model.model_card_data.base_model = model_id
     model.model_card_data.generate_widget_examples = False  # Disable widget examples generation for testing
     return model
 
@@ -33,42 +132,29 @@ def stsb_bert_tiny_model(_stsb_bert_tiny_model: SentenceTransformer) -> Sentence
 
 
 @pytest.fixture(scope="session")
-def _avg_word_embeddings_levy() -> SentenceTransformer:
-    model_id = "sentence-transformers/average_word_embeddings_levy_dependency"
-    model = SentenceTransformer(model_id)
-    if not model.model_card_data.base_model:
-        model.model_card_data.base_model = model_id
+def _word_embeddings_model() -> SentenceTransformer:
+    # The pretrained word embedding models on the Hub are hundreds of megabytes and no test depends on
+    # their actual vectors, so this stand-in is built locally instead.
+    vocab = ["hello", "world", "sentence", "transformers", "embedding", "model", "text", "vector"]
+    generator = torch.Generator().manual_seed(12)
+    word_embeddings = WordEmbeddings(
+        tokenizer=WhitespaceTokenizer(vocab=vocab),
+        embedding_weights=torch.rand(len(vocab), 300, generator=generator),
+    )
+    model = SentenceTransformer(modules=[word_embeddings, Pooling(300, "mean")])
     model.model_card_data.generate_widget_examples = False  # Disable widget examples generation for testing
     return model
 
 
 @pytest.fixture()
-def avg_word_embeddings_levy(_avg_word_embeddings_levy: SentenceTransformer) -> SentenceTransformer:
-    return deepcopy(_avg_word_embeddings_levy)
-
-
-@pytest.fixture()
-def stsb_bert_tiny_model_onnx() -> SentenceTransformer:
-    return SentenceTransformer("sentence-transformers-testing/stsb-bert-tiny-onnx")
-
-
-@pytest.fixture()
-def stsb_bert_tiny_model_openvino() -> SentenceTransformer:
-    return SentenceTransformer("sentence-transformers-testing/stsb-bert-tiny-openvino")
-
-
-@pytest.fixture()
-def paraphrase_distilroberta_base_v1_model() -> SentenceTransformer:
-    return SentenceTransformer("sentence-transformers/paraphrase-distilroberta-base-v1")
+def word_embeddings_model(_word_embeddings_model: SentenceTransformer) -> SentenceTransformer:
+    return deepcopy(_word_embeddings_model)
 
 
 @pytest.fixture(scope="session")
 def _static_retrieval_mrl_en_v1_model() -> SentenceTransformer:
     model_id = "sentence-transformers/static-retrieval-mrl-en-v1"
-    model = SentenceTransformer(model_id)
-    if not model.model_card_data.base_model:
-        model.model_card_data.base_model = model_id
-    return model
+    return SentenceTransformer(model_id)
 
 
 @pytest.fixture()
@@ -102,8 +188,6 @@ def distilbert_base_uncased_model(_distilbert_base_uncased_model: SentenceTransf
 def _reranker_bert_tiny_model() -> CrossEncoder:
     model_id = "cross-encoder-testing/reranker-bert-tiny-gooaq-bce"
     model = CrossEncoder(model_id)
-    if not model.model_card_data.base_model:
-        model.model_card_data.base_model = model_id
     model.model_card_data.generate_widget_examples = False  # Disable widget examples generation for testing
     return model
 
@@ -118,8 +202,6 @@ def reranker_bert_tiny_model(_reranker_bert_tiny_model) -> CrossEncoder:
 def _splade_bert_tiny_model() -> SparseEncoder:
     model_id = "sparse-encoder-testing/splade-bert-tiny-nq"
     model = SparseEncoder(model_id)
-    if not model.model_card_data.base_model:
-        model.model_card_data.base_model = model_id
     model.model_card_data.generate_widget_examples = False  # Disable widget examples generation for testing
     return model
 
@@ -129,12 +211,24 @@ def splade_bert_tiny_model(_splade_bert_tiny_model: SparseEncoder) -> SparseEnco
     return deepcopy(_splade_bert_tiny_model)
 
 
+# Multi Vector Encoders
+@pytest.fixture(scope="session")
+def _mve_bert_tiny_model() -> MultiVectorEncoder:
+    model_id = "multi-vector-encoder-testing/bert-tiny-multi-vector"
+    model = MultiVectorEncoder(model_id)
+    model.model_card_data.generate_widget_examples = False  # Disable widget examples generation for testing
+    return model
+
+
+@pytest.fixture()
+def mve_bert_tiny_model(_mve_bert_tiny_model: MultiVectorEncoder) -> MultiVectorEncoder:
+    return deepcopy(_mve_bert_tiny_model)
+
+
 @pytest.fixture(scope="session")
 def _inference_free_splade_bert_tiny_model() -> SparseEncoder:
     model_id = "sparse-encoder-testing/inference-free-splade-bert-tiny-nq"
     model = SparseEncoder(model_id)
-    if not model.model_card_data.base_model:
-        model.model_card_data.base_model = model_id
     model.model_card_data.generate_widget_examples = False  # Disable widget examples generation for testing
     return model
 
@@ -148,8 +242,6 @@ def inference_free_splade_bert_tiny_model(_inference_free_splade_bert_tiny_model
 def _csr_bert_tiny_model() -> SparseEncoder:
     model_id = "sentence-transformers-testing/stsb-bert-tiny-safetensors"
     model = SparseEncoder(model_id)
-    if not model.model_card_data.base_model:
-        model.model_card_data.base_model = model_id
     model[-1].k = 16
     model[-1].k_aux = 32
     model.model_card_data.generate_widget_examples = False  # Disable widget examples generation for testing
@@ -163,8 +255,13 @@ def csr_bert_tiny_model(_csr_bert_tiny_model: SparseEncoder) -> SparseEncoder:
 
 # Tokenization & Datasets
 @pytest.fixture(scope="session")
-def tokenizer() -> Tokenizer:
+def _tokenizer() -> Tokenizer:
     return Tokenizer.from_pretrained("google-bert/bert-base-uncased")
+
+
+@pytest.fixture()
+def tokenizer(_tokenizer: Tokenizer) -> Tokenizer:
+    return deepcopy(_tokenizer)
 
 
 @pytest.fixture

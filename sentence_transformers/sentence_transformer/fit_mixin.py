@@ -11,7 +11,6 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import torch
 import transformers
-from packaging import version
 from torch import Tensor, nn
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LambdaLR
@@ -174,7 +173,7 @@ class FitMixin:
         save_best_model: bool = True,
         max_grad_norm: float = 1,
         use_amp: bool = False,
-        callback: Callable[[float, int, int], None] = None,
+        callback: Callable[[float, int, int], None] | None = None,
         show_progress_bar: bool = True,
         checkpoint_path: str | None = None,
         checkpoint_save_steps: int = 500,
@@ -264,7 +263,16 @@ class FitMixin:
             elif hasattr(data_loader, "dataset") and isinstance(data_loader.dataset, SentenceLabelDataset):
                 batch_sampler = BatchSamplers.GROUP_BY_LABEL
 
-            batch_size = getattr(data_loader, "batch_size", batch_size)
+            loader_batch_size = getattr(data_loader, "batch_size", batch_size)
+            if loader_batch_size is None:
+                # PyTorch sets `DataLoader.batch_size` to None when a custom `batch_sampler` is passed
+                loader_batch_size = getattr(data_loader.batch_sampler, "batch_size", None) or batch_size
+                logger.warning(
+                    f"The DataLoader for training objective {loader_idx} uses a custom `batch_sampler`, whose "
+                    "batch grouping `fit()` does not preserve. We recommend using `SentenceTransformerTrainer` "
+                    "instead, or `old_fit()` if your script was written for Sentence Transformers v2."
+                )
+            batch_size = loader_batch_size
             texts = []
             labels = []
             for batch in data_loader:
@@ -308,12 +316,6 @@ class FitMixin:
                 )
                 steps_per_epoch = None
 
-        # Transformers renamed `evaluation_strategy` to `eval_strategy` in v4.41.0
-        eval_strategy_key = (
-            "eval_strategy"
-            if version.parse(transformers.__version__) >= version.parse("4.41.0")
-            else "evaluation_strategy"
-        )
         args = SentenceTransformerTrainingArguments(
             output_dir=checkpoint_path or _default_checkpoint_dir(),
             batch_sampler=batch_sampler,
@@ -322,9 +324,7 @@ class FitMixin:
             per_device_eval_batch_size=batch_size,
             num_train_epochs=epochs,
             max_steps=max_steps,
-            **{
-                eval_strategy_key: "steps" if evaluation_steps is not None and evaluation_steps > 0 else "no",
-            },
+            eval_strategy="steps" if evaluation_steps is not None and evaluation_steps > 0 else "no",
             eval_steps=evaluation_steps,
             max_grad_norm=max_grad_norm,
             fp16=use_amp,
@@ -336,10 +336,10 @@ class FitMixin:
 
         if steps_per_epoch is None or steps_per_epoch == 0:
             steps_per_epoch = min([len(train_dataset) // batch_size for train_dataset in train_dataset_dict.values()])
-        num_train_steps = int(steps_per_epoch * epochs)
+        num_train_steps = max_steps if max_steps > 0 else int(steps_per_epoch * epochs) * len(loss_fns)
 
         # Prepare optimizer & scheduler
-        param_optimizer = list(self.named_parameters())
+        param_optimizer = list(nn.ModuleDict({"model": self, **loss_fn_dict}).named_parameters())
 
         no_decay = ["bias", "LayerNorm.bias", "LayerNorm.weight"]
         optimizer_grouped_parameters = [
@@ -478,7 +478,7 @@ class FitMixin:
         save_best_model: bool = True,
         max_grad_norm: float = 1,
         use_amp: bool = False,
-        callback: Callable[[float, int, int], None] = None,
+        callback: Callable[[float, int, int], None] | None = None,
         show_progress_bar: bool = True,
         checkpoint_path: str | None = None,
         checkpoint_save_steps: int = 500,

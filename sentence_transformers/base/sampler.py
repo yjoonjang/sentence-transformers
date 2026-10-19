@@ -1,17 +1,19 @@
 from __future__ import annotations
 
-import logging
+import hashlib
 import os
+import pickle
 from abc import ABC, abstractmethod
 from collections import defaultdict, deque
-from collections.abc import Iterator
-from itertools import accumulate, cycle
+from collections.abc import Callable, Iterator
+from itertools import accumulate
 from typing import Any
 
 import numpy as np
 import torch
 from torch.utils.data import BatchSampler, ConcatDataset, SubsetRandomSampler
 from transformers.utils import ExplicitEnum
+from transformers.utils import logging as transformers_logging
 
 try:
     import xxhash
@@ -23,11 +25,15 @@ from sentence_transformers.util import is_datasets_available
 if is_datasets_available():
     from datasets import Dataset
 
-logger = logging.getLogger(__name__)
+# NOTE: transformers wraps the regular logging module for e.g. warning_once
+logger = transformers_logging.get_logger(__name__)
 
 _XXHASH_INT64_MAX = 1 << 63
 _XXHASH_UINT64_MAX = 1 << 64
 _EXCLUDE_DATASET_COLUMNS = {"dataset_name"}
+
+# Extra shuffled passes that NoDuplicatesBatchSampler.__iter__ may run to reach __len__ batches.
+_MAX_RESAMPLE_PASSES = 2
 
 
 class BatchSamplers(ExplicitEnum):
@@ -39,9 +45,9 @@ class BatchSamplers(ExplicitEnum):
 
     - ``BatchSamplers.BATCH_SAMPLER``: **[default]** Uses :class:`~sentence_transformers.base.sampler.DefaultBatchSampler`, the default
       PyTorch batch sampler.
-    - ``BatchSamplers.NO_DUPLICATES``: Uses :class:`~sentence_transformers.sampler.NoDuplicatesBatchSampler`,
+    - ``BatchSamplers.NO_DUPLICATES``: Uses :class:`~sentence_transformers.base.sampler.NoDuplicatesBatchSampler`,
       ensuring no duplicate samples in a batch.
-    - ``BatchSamplers.NO_DUPLICATES_HASHED``: Uses :class:`~sentence_transformers.sampler.NoDuplicatesBatchSampler`
+    - ``BatchSamplers.NO_DUPLICATES_HASHED``: Uses :class:`~sentence_transformers.base.sampler.NoDuplicatesBatchSampler`
       with ``precompute_hashes=True``, a variant that precomputes hashes for faster duplicate checks at a small memory cost.
       Requires the ``xxhash`` library to be installed.
 
@@ -54,7 +60,7 @@ class BatchSamplers(ExplicitEnum):
         - :class:`~sentence_transformers.sentence_transformer.losses.MegaBatchMarginLoss`
         - :class:`~sentence_transformers.sentence_transformer.losses.GISTEmbedLoss`
         - :class:`~sentence_transformers.sentence_transformer.losses.CachedGISTEmbedLoss`
-    - ``BatchSamplers.GROUP_BY_LABEL``: Uses :class:`~sentence_transformers.sampler.GroupByLabelBatchSampler`,
+    - ``BatchSamplers.GROUP_BY_LABEL``: Uses :class:`~sentence_transformers.base.sampler.GroupByLabelBatchSampler`,
       which constructs each batch by drawing at least 2 samples from each of at least 2 distinct labels.
       This guarantees every batch contains multiple classes, which is required for in-batch triplet mining.
       Recommended for:
@@ -282,11 +288,7 @@ class GroupByLabelBatchSampler(DefaultBatchSampler):
         for sample_idx, label in enumerate(labels):
             groups[label].append(sample_idx)
 
-        # Keep labels with >= 2 samples; trim each to an even count so every
-        # label contributes complete pairs in the interleaving.
-        self.groups = {
-            label: indices[: len(indices) // 2 * 2] for label, indices in groups.items() if len(indices) >= 2
-        }
+        self.groups = {label: indices for label, indices in groups.items() if len(indices) >= 2}
         if len(self.groups) < 2:
             raise ValueError(
                 "GroupByLabelBatchSampler requires at least 2 distinct labels with >= 2 samples each, "
@@ -312,26 +314,31 @@ class GroupByLabelBatchSampler(DefaultBatchSampler):
         if self.generator and self.seed is not None:
             self.generator.manual_seed(self.seed + self.epoch)
 
-        # Shuffle samples within each label
+        # Shuffle samples within each label, then trim to complete pairs (e.g. even count).
         queues: dict[Any, deque[int]] = {}
         for label, indices in self.groups.items():
-            perm = torch.randperm(len(indices), generator=self.generator)
+            perm = torch.randperm(len(indices), generator=self.generator)[: len(indices) // 2 * 2]
             queues[label] = deque(indices[i] for i in perm)
 
-        # Round-robin: each label emits 2 samples per round; stop when < 2 labels remain.
+        # Round-robin: each label emits 2 samples per round. Stop when < 2 labels remain.
         # The label visit order is reshuffled every round for diverse batches.
         remaining_labels = list(queues)
         batch: list[int] = []
+        last_label = None
         while len(remaining_labels) >= 2:
             remaining_labels = [
                 remaining_labels[i] for i in torch.randperm(len(remaining_labels), generator=self.generator)
             ]
+            # Keep consecutive pairs within a batch from sharing a label.
+            if batch and remaining_labels[0] == last_label:
+                remaining_labels[0], remaining_labels[1] = remaining_labels[1], remaining_labels[0]
             for label in remaining_labels:
                 batch.append(queues[label].popleft())
                 batch.append(queues[label].popleft())
                 if len(batch) >= self.batch_size:
                     yield batch[: self.batch_size]
                     batch = batch[self.batch_size :]
+            last_label = remaining_labels[-1]
             remaining_labels = [label for label in remaining_labels if queues[label]]
 
         # Due to the round-robin loading, at least 4 elements ensures >= 2 distinct labels, each with >= 2 samples.
@@ -345,9 +352,36 @@ class GroupByLabelBatchSampler(DefaultBatchSampler):
         return n
 
 
+_PLAIN_VALUE_TYPES = (str, int, float, bool, bytes, type(None), np.integer, np.floating, np.bool_)
+
+
+def _sample_value_str(value: Any) -> str:
+    # Plain python values keep their exact str(), the historical dedup key. Other objects (PIL
+    # images, audio arrays, media decoders) often embed a memory address in str(), fresh on every
+    # dataset access, so their pickled content is digested instead. Values that fail to pickle
+    # fall back to str() and simply never match, as before.
+    if isinstance(value, _PLAIN_VALUE_TYPES):
+        return str(value)
+    if isinstance(value, (list, tuple)):
+        if all(isinstance(item, _PLAIN_VALUE_TYPES) for item in value):
+            return str(value)
+        return "[" + ", ".join(_sample_value_str(item) for item in value) + "]"
+    if isinstance(value, dict):
+        return "{" + ", ".join(f"{key!r}: {_sample_value_str(item)}" for key, item in value.items()) + "}"
+    # Audio / Video decoders pickle a torch storage key taken from the object address, fresh on
+    # every access. They carry the encoded source datasets itself re-encodes from, so digest that.
+    encoded = getattr(value, "_hf_encoded", None)
+    if encoded is not None:
+        value = encoded
+    try:
+        return hashlib.sha256(pickle.dumps(value)).hexdigest()
+    except Exception:
+        return str(value)
+
+
 def _xxhash_int64(value: str) -> int:
     # Convert uint64 -> int64 to keep values compatible with Arrow int64 storage.
-    hashed = xxhash.xxh64_intdigest(value)
+    hashed = xxhash.xxh64_intdigest(value.encode("utf-8"))
     if hashed >= _XXHASH_INT64_MAX:
         hashed -= _XXHASH_UINT64_MAX
     return hashed
@@ -369,7 +403,7 @@ def _hash_batch(
             value = batch[column][row_idx]
             # Keep semantics aligned with the non-hash path, which compares
             # stringified per-column values (including list values as a whole).
-            row_hashes.append(_xxhash_int64(str(value)))
+            row_hashes.append(_xxhash_int64(_sample_value_str(value)))
         hashes.append(row_hashes)
     return {"__hashes": hashes}
 
@@ -416,7 +450,10 @@ class NoDuplicatesBatchSampler(DefaultBatchSampler):
                 fields using ``datasets.map`` to speed up duplicate checks. Requires ``xxhash`` to
                 be installed and uses additional memory: in theory roughly
                 ``len(dataset) * num_columns * 8`` bytes for the dense int64 hash matrix,
-                although actual memory usage may therefore differ in practice. Defaults to False.
+                although actual memory usage may therefore differ in practice. Especially
+                recommended for media (image / audio) datasets: without precomputation, every
+                duplicate check re-reads its row from the dataset, which re-decodes the media.
+                Defaults to False.
             precompute_num_proc (int, optional): Number of processes for hashing with ``datasets.map``.
                 If set to ``None``, defaults to ``min(8, cpu_count - 1)`` when ``precompute_hashes``
                 is True.
@@ -501,6 +538,13 @@ class NoDuplicatesBatchSampler(DefaultBatchSampler):
         Iterate over the remaining non-yielded indices. For each index, check if the sample values are already in the
         batch. If not, add the sample values to the batch keep going until the batch is full. If the batch is full, yield
         the batch indices and continue with the next batch.
+
+        When a full pass over the dataset yields fewer batches than :meth:`__len__` (possible with
+        ``drop_last=True`` and many duplicate values), the dataset is reshuffled and sampling
+        continues until the advertised length is reached, for a limited number of extra passes.
+        Batches added this way redraw samples that already appeared earlier in the epoch, and a
+        warning is logged once. This keeps the number of batches in line with the length promised
+        to the DataLoader and the learning rate scheduler.
         """
         if self.generator and self.seed is not None:
             self.generator.manual_seed(self.seed + self.epoch)
@@ -516,7 +560,9 @@ class NoDuplicatesBatchSampler(DefaultBatchSampler):
 
             def get_sample_values(index: int) -> set[str] | np.ndarray:
                 return {
-                    str(value) for key, value in self.dataset[index].items() if key not in _EXCLUDE_DATASET_COLUMNS
+                    _sample_value_str(value)
+                    for key, value in self.dataset[index].items()
+                    if key not in _EXCLUDE_DATASET_COLUMNS
                 }
 
         def _has_overlap(sample_values: set[str] | np.ndarray, batch_values: set[str | np.int64]) -> bool:
@@ -529,6 +575,47 @@ class NoDuplicatesBatchSampler(DefaultBatchSampler):
         num_rows = len(self.dataset)
         if num_rows == 0:
             return
+
+        expected_num_batches = len(self)
+        num_yielded = 0
+
+        # Never truncate the first pass, as drop_last=False may legitimately yield more
+        # (smaller) batches than ``__len__``.
+        for batch_indices in self._iter_one_pass(get_sample_values, _has_overlap):
+            yield batch_indices
+            num_yielded += 1
+
+        if num_yielded >= expected_num_batches:
+            return
+
+        if num_yielded > 0:
+            shortfall = expected_num_batches - num_yielded
+            logger.warning_once(
+                f"NoDuplicatesBatchSampler produced only {num_yielded} of the expected "
+                f"{expected_num_batches} batches in a full pass over the dataset. The remaining "
+                f"{shortfall} batches are resampled, so at most {shortfall / expected_num_batches:.1%} "
+                "of this epoch's samples are repeats from earlier batches."
+            )
+            for _ in range(_MAX_RESAMPLE_PASSES):
+                for batch_indices in self._iter_one_pass(get_sample_values, _has_overlap):
+                    yield batch_indices
+                    num_yielded += 1
+                    if num_yielded >= expected_num_batches:
+                        return
+
+        logger.warning_once(
+            f"NoDuplicatesBatchSampler yielded only {num_yielded} of the expected "
+            f"{expected_num_batches} batches. The dataset has too few distinct values for this "
+            "batch size. Consider lowering it."
+        )
+
+    def _iter_one_pass(
+        self,
+        get_sample_values: Callable[[int], set[str] | np.ndarray],
+        has_overlap: Callable[[set[str] | np.ndarray, set[str | np.int64]], bool],
+    ) -> Iterator[list[int]]:
+        """Yield batches from a single shuffle of the dataset without resampling."""
+        num_rows = len(self.dataset)
 
         # Create a random numpy permutation using int32 (or int64 if necessary)
         index_dtype = torch.int32 if num_rows <= np.iinfo(np.int32).max else torch.int64
@@ -551,7 +638,7 @@ class NoDuplicatesBatchSampler(DefaultBatchSampler):
                 next_position = int(next_positions[current_position])
                 index = int(remaining_indices[current_position])
                 sample_values = get_sample_values(index)
-                if _has_overlap(sample_values, batch_values):
+                if has_overlap(sample_values, batch_values):
                     # Defer conflicting samples to later batches instead of reordering them.
                     previous_position = current_position
                     current_position = next_position
@@ -577,14 +664,15 @@ class NoDuplicatesBatchSampler(DefaultBatchSampler):
                     yield batch_indices
 
     def __len__(self) -> int:
-        """Return the approximate number of batches.
+        """Return the number of batches advertised to the DataLoader.
 
-        .. note::
-
-            This is an upper-bound estimate. The actual number of batches
-            yielded by :meth:`__iter__` may be smaller when the dataset
-            contains many duplicate values, because those samples are
-            deferred or skipped rather than placed into a batch.
+        This is a cheap estimate based only on the dataset and batch sizes, as
+        computing the exact count would require running the full no-duplicates
+        pass before training. When a single pass cannot fill this many batches,
+        :meth:`__iter__` reshuffles and continues sampling until this length is
+        reached, within a limited number of extra passes. A dataset with very
+        few distinct values can still fall short, in which case a warning is
+        logged.
         """
         if self.drop_last:
             return len(self.dataset) // self.batch_size
@@ -620,6 +708,12 @@ class MultiDatasetDefaultBatchSampler(SetEpochMixin, BatchSampler, ABC):
         self.generator = generator
         self.seed = seed
 
+    def set_epoch(self, epoch: int) -> None:
+        super().set_epoch(epoch)
+        for sampler in self.batch_samplers:
+            if hasattr(sampler, "set_epoch"):
+                sampler.set_epoch(epoch)
+
     @abstractmethod
     def __iter__(self) -> Iterator[list[int]]:
         """Yield batches from the underlying datasets in a specific order."""
@@ -652,15 +746,12 @@ class RoundRobinBatchSampler(MultiDatasetDefaultBatchSampler):
         sample_offsets = [0] + list(accumulate(num_samples))
 
         batch_samplers = [iter(sampler) for sampler in self.batch_samplers]
-        for dataset_idx in cycle(range(len(batch_samplers))):
-            sample_offset = sample_offsets[dataset_idx]
-            try:
-                yield [idx + sample_offset for idx in next(batch_samplers[dataset_idx])]
-            except StopIteration:
-                # current iterator is apparently exhausted
-                break
+        for batches in zip(*batch_samplers):
+            for sample_offset, batch in zip(sample_offsets, batches):
+                yield [idx + sample_offset for idx in batch]
 
     def __len__(self) -> int:
+        """Return the number of batches, estimated when child sampler lengths are estimates."""
         return min(len(sampler) for sampler in self.batch_samplers) * len(self.batch_samplers)
 
 

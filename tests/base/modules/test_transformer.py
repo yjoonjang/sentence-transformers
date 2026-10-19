@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import sys
 from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -13,8 +15,9 @@ import torch
 from packaging.version import Version
 from packaging.version import parse as parse_version
 from tokenizers.normalizers import NFC, Lowercase, Sequence
-from transformers import AutoModel, AutoProcessor
+from transformers import AutoConfig, AutoModel, AutoProcessor, MimiConfig, PretrainedConfig, Qwen3Config, Qwen3VLConfig
 from transformers import __version__ as transformers_version
+from transformers.utils import is_peft_available, is_torchvision_available, is_vision_available
 
 from sentence_transformers.base.modules import Transformer
 from sentence_transformers.base.modules.transformer import (
@@ -27,12 +30,40 @@ from sentence_transformers.util import batch_to_device
 transformer_module = sys.modules[Transformer.__module__]
 
 TINY_BERT = "sentence-transformers-testing/stsb-bert-tiny-safetensors"
+TINY_LLAMA = "hf-internal-testing/tiny-random-LlamaForCausalLM"
+TINY_LLAVA = "hf-internal-testing/tiny-random-LlavaForConditionalGeneration"
+TINY_XLMR = "hf-internal-testing/tiny-xlm-roberta"
+TINY_ALTCLIP = "hf-internal-testing/tiny-random-AltCLIPModel"
+
+# Uneven lengths, so that padding is actually applied and the padded side is observable.
+RAGGED_BATCH = ["hi", "a considerably longer sentence than the other one"]
 
 
 @pytest.fixture()
 def bert_tiny_transformer(stsb_bert_tiny_model) -> Transformer:
     """A lightweight BERT Transformer for reuse across tests."""
     return stsb_bert_tiny_model[0]
+
+
+def test_infer_flatten_position_offset(bert_tiny_transformer):
+    """RoBERTa-family embeddings compute positions starting at padding_idx + 1, so flattened
+    inputs need their collator-produced 0-based position_ids shifted. The submodule scan keys on
+    an int padding_idx next to a learned position_embeddings table: BERT-style embeddings store
+    neither, rotary decoders store padding_idx on the Model class without position_embeddings,
+    and multimodal wrappers nest the offset embeddings below ``.embeddings``."""
+    assert bert_tiny_transformer._infer_flatten_position_offset() == 0
+
+    def offset_of(model) -> int:
+        return Transformer._infer_flatten_position_offset(SimpleNamespace(model=model))
+
+    # The scan only reads module structure, so build from config alone: these repos' weight files
+    # predate safetensors, and loading them trips the torch.load guard on torch < 2.6.
+    xlmr = AutoModel.from_config(AutoConfig.from_pretrained(TINY_XLMR))
+    assert xlmr.embeddings.padding_idx == 1
+    assert offset_of(xlmr) == 2
+
+    assert offset_of(AutoModel.from_config(AutoConfig.from_pretrained(TINY_LLAMA))) == 0
+    assert offset_of(AutoModel.from_config(AutoConfig.from_pretrained(TINY_ALTCLIP))) == 2
 
 
 def test_preprocess_unsupported_modality_uses_shared_error(bert_tiny_transformer):
@@ -76,6 +107,12 @@ class TestSetTemporaryClassAttrs:
 
 
 class TestTransformerInit:
+    @pytest.mark.parametrize("use_cache", [None, False, True])
+    def test_use_cache_default_and_override(self, use_cache):
+        config_kwargs = {} if use_cache is None else {"use_cache": use_cache}
+        transformer = Transformer(TINY_BERT, config_kwargs=config_kwargs)
+        assert transformer.config.use_cache is (use_cache is True)
+
     def test_invalid_transformer_task(self):
         with pytest.raises(ValueError, match="Unsupported transformer_task"):
             Transformer(TINY_BERT, transformer_task="nonexistent-task")
@@ -180,16 +217,6 @@ class TestTransformerInit:
         else:
             assert str(norm_default) == str(norm_none)
 
-    @pytest.mark.skipif(
-        parse_version(transformers_version) >= parse_version("5.0.0"),
-        reason="Transformers v5 only has fast tokenizers",
-    )
-    def test_do_lower_case_slow_tokenizer_fallback(self):
-        """For slow tokenizers, do_lower_case should set processor.do_lower_case."""
-        transformer = Transformer(TINY_BERT, do_lower_case=True, processor_kwargs={"use_fast": False})
-        assert transformer.tokenizer.is_fast is False
-        assert transformer.processor.do_lower_case is True
-
     def test_do_lower_case_tokenizer_persisted_after_save_load(self, tmp_path):
         """The Lowercase normalizer added to the tokenizer should persist after save/load."""
         transformer = Transformer(TINY_BERT, do_lower_case=True)
@@ -240,6 +267,117 @@ class TestTransformerInit:
         assert transformer is not None
 
 
+class TestUseCache:
+    @pytest.fixture(
+        params=[
+            pytest.param(("qwen3", {}, False), id="qwen3-default"),
+            pytest.param(("qwen3", {"use_cache": False}, False), id="qwen3-disabled"),
+            pytest.param(("qwen3", {"use_cache": True}, True), id="qwen3-enabled"),
+            pytest.param(("qwen3_vl", {}, False), id="qwen3-vl-default"),
+            pytest.param(("qwen3_vl", {"use_cache": False}, False), id="qwen3-vl-disabled"),
+            pytest.param(("qwen3_vl", {"use_cache": True}, True), id="qwen3-vl-enabled"),
+            pytest.param(("qwen3_vl", {"text_config": {"use_cache": True}}, True), id="qwen3-vl-text-enabled"),
+            pytest.param(
+                ("qwen3_vl", {"use_cache": True, "text_config": {"use_cache": False}}, False),
+                id="qwen3-vl-text-overrides-enabled",
+            ),
+            pytest.param(
+                ("qwen3_vl", {"use_cache": False, "text_config": {"use_cache": True}}, True),
+                id="qwen3-vl-text-overrides-disabled",
+            ),
+        ]
+    )
+    def decoder_cache_model(self, request, tmp_path, monkeypatch, bert_tiny_transformer):
+        model_type, config_kwargs, expected = request.param
+        text_config = {
+            "vocab_size": 32,
+            "hidden_size": 32,
+            "intermediate_size": 64,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 8,
+        }
+        if model_type == "qwen3_vl":
+            config = Qwen3VLConfig(
+                text_config=text_config,
+                vision_config={
+                    "depth": 1,
+                    "hidden_size": 32,
+                    "intermediate_size": 64,
+                    "num_heads": 4,
+                    "out_hidden_size": 32,
+                    "deepstack_visual_indexes": [],
+                },
+            )
+        else:
+            config = Qwen3Config(**text_config)
+        AutoModel.from_config(config).save_pretrained(tmp_path)
+        monkeypatch.setattr(AutoProcessor, "from_pretrained", lambda *args, **kwargs: bert_tiny_transformer.processor)
+        original_kwargs = deepcopy(config_kwargs)
+
+        transformer = Transformer(str(tmp_path), config_kwargs=config_kwargs)
+        assert config_kwargs == original_kwargs
+        return transformer, expected
+
+    def test_decoder_cache_config(self, decoder_cache_model):
+        transformer, expected = decoder_cache_model
+        assert transformer.config.get_text_config().use_cache is expected
+        if isinstance(transformer.config, Qwen3VLConfig):
+            assert not hasattr(transformer.config.vision_config, "use_cache")
+
+    @pytest.mark.skipif(
+        parse_version(torch.__version__) < Version("2.4"),
+        reason="Qwen rotary embeddings call torch.is_autocast_enabled(device_type), which requires torch>=2.4.",
+    )
+    def test_decoder_cache_forward(self, decoder_cache_model):
+        transformer, expected = decoder_cache_model
+        with torch.no_grad():
+            outputs = transformer.model(input_ids=torch.tensor([[1, 2, 3]]))
+            uncached_outputs = transformer.model(input_ids=torch.tensor([[1, 2, 3]]), use_cache=False)
+        assert (outputs.past_key_values is not None) is expected
+        torch.testing.assert_close(outputs.last_hidden_state, uncached_outputs.last_hidden_state)
+
+    @pytest.mark.parametrize("use_cache", [False, True])
+    def test_nested_audio_config(self, use_cache):
+        class AudioConfig(PretrainedConfig):
+            sub_configs = {"codec_config": MimiConfig}
+
+        class CompositeConfig(PretrainedConfig):
+            sub_configs = {"audio_config": AudioConfig}
+
+        config = CompositeConfig(audio_config=AudioConfig(codec_config=MimiConfig(use_cache=True)))
+        Transformer._configure_use_cache(config, {"use_cache": use_cache})
+        assert config.audio_config.codec_config.use_cache is use_cache
+        assert not hasattr(config, "use_cache")
+        assert not hasattr(config.audio_config, "use_cache")
+
+    def test_config_object_override(self):
+        config = Qwen3VLConfig(text_config={"use_cache": True})
+        text_config = config.text_config
+        original_config = text_config.to_dict()
+        Transformer._configure_use_cache(config, {"use_cache": False, "text_config": text_config})
+        assert config.text_config.use_cache is True
+        assert text_config.to_dict() == original_config
+
+    @pytest.mark.parametrize(
+        ("config_kwargs", "vision_cache", "text_cache"),
+        [
+            ({}, False, False),
+            ({"use_cache": True}, True, True),
+            ({"use_cache": True, "vision_config": {"encoder_config": {"use_cache": False}}}, False, True),
+            ({"vision_config": {"encoder_config": {"use_cache": True}}}, True, False),
+        ],
+    )
+    def test_vision_encoder_cache(self, config_kwargs, vision_cache, text_cache):
+        deepseek_ocr2 = pytest.importorskip("transformers.models.deepseek_ocr2.configuration_deepseek_ocr2")
+        config = deepseek_ocr2.DeepseekOcr2Config()
+        Transformer._configure_use_cache(config, config_kwargs)
+        assert config.vision_config.encoder_config.use_cache is vision_cache
+        assert config.text_config.use_cache is text_cache
+        assert not hasattr(config.vision_config.sam_config, "use_cache")
+
+
 class TestWarnOnUnsupportedAttentionConfig:
     """Warn when the config requests attention settings not supported by the installed transformers version."""
 
@@ -267,7 +405,6 @@ class TestWarnOnUnsupportedAttentionConfig:
         self,
         caplog,
         monkeypatch,
-        bert_tiny_transformer,
         param,
         value,
         support_flag,
@@ -277,14 +414,17 @@ class TestWarnOnUnsupportedAttentionConfig:
         expect_warn,
     ):
         monkeypatch.setattr(transformer_module, support_flag, supports)
-        config = bert_tiny_transformer.config
+        config = PretrainedConfig()
         if set_on == "main":
             setattr(config, param, value)
         elif set_on == "sub":
-            sub = deepcopy(config)
+
+            class CompositeConfig(PretrainedConfig):
+                sub_configs = {"text_config": PretrainedConfig}
+
+            sub = PretrainedConfig()
             setattr(sub, param, value)
-            config.sub_configs = {"text_config": type(sub)}
-            config.text_config = sub
+            config = CompositeConfig(text_config=sub)
 
         with caplog.at_level(logging.WARNING):
             Transformer._warn_on_unsupported_attention_config(config)
@@ -470,12 +610,12 @@ class TestPreprocess:
         assert isinstance(next_result["input_ids"], torch.Tensor)
 
     def test_preprocess_per_call_merges_with_instance_processing_kwargs(self):
-        """Per-call values override matching instance values; non-overridden settings are preserved."""
+        """Per-call values override matching instance values. Non-overridden settings are preserved."""
         transformer = Transformer(
             TINY_BERT,
             processing_kwargs={"text": {"max_length": 5, "truncation": True}},
         )
-        # Per-call only changes max_length; truncation from the instance must still apply
+        # Per-call only changes max_length. Truncation from the instance must still apply
         result = transformer.preprocess(
             ["this is a longer sentence that should get truncated"],
             processing_kwargs={"text": {"max_length": 8}},
@@ -499,6 +639,138 @@ class TestPreprocess:
             processing_kwargs={"text": {"max_length": 5, "truncation": True}},
         )
         assert bert_tiny_transformer.processing_kwargs == before
+
+    def test_causal_task_left_pads_by_default(self):
+        """The module sets padding_side to "left" on load, so a ragged batch ends in real tokens."""
+        transformer = Transformer(TINY_LLAMA, transformer_task="text-generation")
+        features = transformer.preprocess(RAGGED_BATCH)
+        assert transformer.processor.padding_side == "left"
+        assert features["attention_mask"][:, -1].all()
+
+    @pytest.mark.skipif(
+        parse_version(torch.__version__) < Version("2.4"),
+        reason="Llama rotary embeddings call torch.is_autocast_enabled(device_type), which requires torch>=2.4.",
+    )
+    @pytest.mark.parametrize("logits_to_keep", [0, 3])
+    def test_causal_logits_processing_kwargs(self, tmp_path, logits_to_keep):
+        transformer = Transformer(
+            TINY_LLAMA,
+            transformer_task="text-generation",
+            processing_kwargs={"text": {"logits_to_keep": logits_to_keep}},
+        ).eval()
+        features = transformer.preprocess(RAGGED_BATCH)
+        assert features["logits_to_keep"] == logits_to_keep
+        with torch.no_grad():
+            all_logits = transformer.model(
+                input_ids=features["input_ids"], attention_mask=features["attention_mask"], logits_to_keep=0
+            ).logits
+            expected = all_logits[:, -logits_to_keep:]
+            torch.testing.assert_close(transformer(deepcopy(features))["causal_logits"], expected)
+
+        transformer.save(str(tmp_path))
+        loaded = Transformer.load(str(tmp_path)).eval()
+        with torch.no_grad():
+            torch.testing.assert_close(loaded(loaded.preprocess(RAGGED_BATCH))["causal_logits"], expected)
+        override = {"text": {"logits_to_keep": 1}}
+        assert loaded.preprocess(RAGGED_BATCH, processing_kwargs=override)["logits_to_keep"] == 1
+        assert (
+            loaded.processing_kwargs == transformer.processing_kwargs == {"text": {"logits_to_keep": logits_to_keep}}
+        )
+        assert override == {"text": {"logits_to_keep": 1}}
+        with pytest.raises(ValueError, match="ends in a padding token"):
+            loaded.preprocess(RAGGED_BATCH, processing_kwargs={"text": {"padding_side": "right"}})
+
+    @pytest.mark.parametrize("logits_to_keep", [-1, 1.5, "1", None, True])
+    def test_causal_invalid_logits_processing_kwargs(self, logits_to_keep):
+        transformer = Transformer(TINY_LLAMA, transformer_task="text-generation")
+        with pytest.raises(ValueError, match="logits_to_keep must be a non-negative integer"):
+            transformer.preprocess(RAGGED_BATCH, processing_kwargs={"text": {"logits_to_keep": logits_to_keep}})
+
+    def test_causal_right_padding_via_attribute_raises(self):
+        """padding_side is set to "left" on load, so reaching this means it was mutated afterwards."""
+        transformer = Transformer(TINY_LLAMA, transformer_task="text-generation")
+        transformer.processor.padding_side = "right"
+        with pytest.raises(ValueError) as exc_info:
+            transformer.preprocess(RAGGED_BATCH)
+        message = str(exc_info.value)
+        assert "ends in a padding token" in message
+        assert 'processor.padding_side = "left"' in message
+
+    def test_causal_right_padding_via_processing_kwargs_raises(self):
+        """processing_kwargs overrides the attribute at call time, so the attribute alone can't be trusted:
+        it still reads "left" here while the processor pads right."""
+        transformer = Transformer(TINY_LLAMA, transformer_task="text-generation")
+        with pytest.raises(ValueError) as exc_info:
+            transformer.preprocess(RAGGED_BATCH, processing_kwargs={"text": {"padding_side": "right"}})
+        assert transformer.processor.padding_side == "left"
+        message = str(exc_info.value)
+        assert "ends in a padding token" in message
+        assert "processing_kwargs" in message
+
+    @pytest.mark.parametrize("bucket", ["text", "common"])
+    def test_causal_right_padding_via_processing_kwargs_raises_without_message_modality(self, bucket):
+        """TINY_LLAMA has a chat template, so text normally routes through apply_chat_template, which only
+        forwards the "text" bucket. Without a "message" modality the tokenizer is called directly and the
+        "common" bucket reaches it as well, so both buckets must be caught."""
+        transformer = Transformer(
+            TINY_LLAMA,
+            transformer_task="text-generation",
+            modality_config={"text": {"method": "forward", "method_output_name": "logits"}},
+            module_output_name="causal_logits",
+        )
+        assert "message" not in transformer.modality_config
+        with pytest.raises(ValueError) as exc_info:
+            transformer.preprocess(RAGGED_BATCH, processing_kwargs={bucket: {"padding_side": "right"}})
+        message = str(exc_info.value)
+        assert "ends in a padding token" in message
+        assert "processing_kwargs" in message
+
+    def test_causal_padding_check_ignores_unpadded_batches(self):
+        """A batch with nothing to pad has no last-token problem, whatever padding_side says."""
+        transformer = Transformer(TINY_LLAMA, transformer_task="text-generation")
+        transformer.processor.padding_side = "right"
+        transformer.preprocess(["same length here"])
+
+    @pytest.mark.skipif(
+        Version(transformers_version) < Version("5.0.0"), reason="any-to-any requires transformers v5+"
+    )
+    @pytest.mark.skipif(
+        not (is_vision_available() and is_torchvision_available()),
+        reason="Loading the Llava processor requires Pillow and torchvision",
+    )
+    def test_causal_right_padding_via_multimodal_tokenizer_raises(self):
+        """A multimodal processor pads via its tokenizer and has no padding_side of its own, so the
+        tokenizer attribute is the only one that can be wrong, and the only one worth reporting."""
+        transformer = Transformer(TINY_LLAVA, transformer_task="any-to-any")
+        assert not hasattr(transformer.processor, "padding_side")
+        assert transformer.processor.tokenizer.padding_side == "left"
+
+        transformer.processor.tokenizer.padding_side = "right"
+        with pytest.raises(ValueError) as exc_info:
+            transformer.preprocess(RAGGED_BATCH)
+        message = str(exc_info.value)
+        assert "ends in a padding token" in message
+        assert 'processor.tokenizer.padding_side = "left"' in message
+
+    @pytest.mark.skipif(
+        Version(transformers_version) < Version("5.0.0"), reason="any-to-any requires transformers v5+"
+    )
+    @pytest.mark.skipif(
+        not (is_vision_available() and is_torchvision_available()),
+        reason="Loading the Llava processor requires Pillow and torchvision",
+    )
+    @pytest.mark.parametrize("training", [True, False])
+    def test_num_images_per_sample_without_image_grid(self, training):
+        """Custom training loops need image counts without constructing a Trainer."""
+        from PIL import Image
+
+        transformer = Transformer(TINY_LLAVA, transformer_task="any-to-any")
+        transformer.train(training)
+        image = Image.new("RGB", (32, 32), "red")
+        features = transformer.preprocess(
+            [{"text": "a", "image": image}, {"text": "text only"}, {"text": "b", "image": [image, image]}]
+        )
+        assert features["num_images_per_sample"].tolist() == [1, 0, 2]
 
 
 class TestForward:
@@ -580,6 +852,253 @@ class TestForward:
         embedding = result[model.module_output_name]
         assert embedding.ndim == 3
         assert embedding.shape[-1] == model.config.hidden_size
+
+    def test_model_forward_params_matches_kwargs_support(self, bert_tiny_transformer):
+        """``model_forward_params`` is ``None`` exactly when forward accepts ``**kwargs`` (the denylist
+        path). Otherwise it is an allowlist set seeded with the common safety-net names."""
+        model = bert_tiny_transformer
+        accepts_kwargs = any(
+            param.kind is inspect.Parameter.VAR_KEYWORD
+            for param in inspect.signature(model.model.forward).parameters.values()
+        )
+        if accepts_kwargs:
+            assert model.model_forward_params is None
+        else:
+            assert isinstance(model.model_forward_params, set)
+            assert {"input_ids", "attention_mask"} <= model.model_forward_params
+
+    def test_document_length_applies_to_document_task_only(self, bert_tiny_transformer, monkeypatch):
+        """Tasks are ``"query"`` / ``"document"`` throughout the library: ``document_length`` only
+        truncates ``task="document"`` batches, any other task falls through untouched."""
+        transformer = bert_tiny_transformer
+        monkeypatch.setattr(transformer, "document_length", 6)
+        long_text = "a rather long document with clearly more than six tokens in it"
+        assert transformer.preprocess([long_text], task="document")["input_ids"].shape[1] == 6
+        for task in ("query", None):
+            assert transformer.preprocess([long_text], task=task)["input_ids"].shape[1] > 6
+
+    def test_expansion_pad_contract_survives_processing_kwargs(self, bert_tiny_transformer, monkeypatch):
+        """A processing_kwargs padding/max_length override must not silently break the expansion's
+        fixed width (which would make query embeddings depend on batch composition): the expansion
+        contract is re-applied with a warning."""
+        import sentence_transformers.base.modules.transformer as transformer_module
+
+        transformer = bert_tiny_transformer
+        monkeypatch.setattr(transformer, "query_expansion", {"strategy": "fixed", "token": None, "length": 16})
+        warnings: list[str] = []
+        monkeypatch.setattr(transformer_module.logger, "warning_once", warnings.append)
+
+        features = transformer.preprocess(
+            ["short", "a somewhat longer query"], task="query", processing_kwargs={"text": {"padding": True}}
+        )
+        assert features["input_ids"].shape[1] == 16
+        assert warnings and "fixed width" in warnings[0]
+
+    def test_min_expansion_pads_short_queries_to_floor(self, bert_tiny_transformer, monkeypatch):
+        transformer = bert_tiny_transformer
+        monkeypatch.setattr(transformer, "query_expansion", {"strategy": "min", "token": None, "length": 8})
+        features = transformer.preprocess(["short"], task="query")
+        assert features["input_ids"].shape[1] == 8
+        positions = features["query_expansion_positions"]
+        # bert-tiny tokenizes "short" to [CLS] short [SEP]: 3 real tokens, 5 expansion positions.
+        assert positions.sum().item() == 5
+        assert (features["input_ids"][positions] == transformer.tokenizer.mask_token_id).all()
+        assert features["attention_mask"][positions].eq(0).all()
+
+    def test_min_expansion_leaves_long_queries_untruncated(self, bert_tiny_transformer, monkeypatch):
+        import sentence_transformers.base.modules.transformer as transformer_module
+
+        transformer = bert_tiny_transformer
+        monkeypatch.setattr(transformer, "query_expansion", {"strategy": "min", "token": None, "length": 8})
+        warnings: list[str] = []
+        monkeypatch.setattr(transformer_module.logger, "warning_once", warnings.append)
+        features = transformer.preprocess(
+            ["a very verbose query with clearly more than eight tokens worth of content in it"], task="query"
+        )
+        assert features["input_ids"].shape[1] > 8
+        assert not features["query_expansion_positions"].any()
+        assert not warnings
+
+    def test_min_expansion_mixed_batch_positions_per_row(self, bert_tiny_transformer, monkeypatch):
+        transformer = bert_tiny_transformer
+        monkeypatch.setattr(transformer, "query_expansion", {"strategy": "min", "token": None, "length": 8})
+        features = transformer.preprocess(
+            ["short", "a very verbose query with clearly more than eight tokens worth of content in it"],
+            task="query",
+        )
+        positions = features["query_expansion_positions"]
+        assert features["input_ids"].shape[1] > 8
+        assert positions[0].sum().item() == 5
+        assert positions[0, 8:].eq(False).all()
+        assert not positions[1].any()
+        # The short row's trailing pads beyond the floor stay real pads, excluded from scoring.
+        assert features["attention_mask"][0, 8:].eq(0).all()
+
+    def test_min_expansion_ceiling_via_max_length(self, bert_tiny_transformer, monkeypatch):
+        transformer = bert_tiny_transformer
+        monkeypatch.setattr(transformer, "query_expansion", {"strategy": "min", "token": None, "length": 8})
+        features = transformer.preprocess(
+            ["a very verbose query with clearly more than twelve tokens worth of content in it"],
+            task="query",
+            max_length=12,
+        )
+        assert features["input_ids"].shape[1] == 12
+
+    def test_min_expansion_attend_scopes_to_expansion_positions(self, bert_tiny_transformer, monkeypatch):
+        transformer = bert_tiny_transformer
+        monkeypatch.setattr(
+            transformer, "query_expansion", {"strategy": "min", "attend": True, "token": None, "length": 8}
+        )
+        features = transformer.preprocess(
+            ["short", "a very verbose query with clearly more than eight tokens worth of content in it"],
+            task="query",
+        )
+        assert features["attention_mask"][0, :8].eq(1).all()
+        assert features["attention_mask"][0, 8:].eq(0).all()
+
+    def test_fixed_expansion_warns_on_truncated_queries(self, bert_tiny_transformer, monkeypatch):
+        """strategy='fixed' silently loses content past the expansion length (the width is fixed in
+        both directions), so the first such batch must warn. strategy='min' never truncates."""
+        import sentence_transformers.base.modules.transformer as transformer_module
+
+        transformer = bert_tiny_transformer
+        monkeypatch.setattr(transformer, "query_expansion", {"strategy": "fixed", "token": None, "length": 8})
+        warnings: list[str] = []
+        monkeypatch.setattr(transformer_module.logger, "warning_once", warnings.append)
+
+        features = transformer.preprocess(["short query"], task="query")
+        assert features["input_ids"].shape[1] == 8
+        assert not warnings
+
+        features = transformer.preprocess(
+            ["a very verbose query with clearly more than eight tokens worth of content in it"], task="query"
+        )
+        assert features["input_ids"].shape[1] == 8
+        assert warnings and "truncated" in warnings[0]
+
+    def test_retrieval_task_warns_on_text_documents(self, bert_tiny_transformer, monkeypatch):
+        """`*ForRetrieval` processors always render text as a query: asking for document treatment
+        on text inputs must warn instead of silently query-formatting the documents."""
+        import sentence_transformers.base.modules.transformer as transformer_module
+
+        transformer = bert_tiny_transformer
+        monkeypatch.setattr(transformer, "transformer_task", "retrieval")
+        warnings: list[str] = []
+        monkeypatch.setattr(transformer_module.logger, "warning_once", warnings.append)
+
+        transformer.preprocess(["a text document"], task="document")
+        assert warnings and "renders text as a query" in warnings[0]
+
+        warnings.clear()
+        transformer.preprocess(["a query"], task="query")
+        transformer.preprocess(["taskless text"])
+        assert not warnings
+
+    def test_kwargs_forward_excludes_bookkeeping_keys(self, bert_tiny_transformer, monkeypatch):
+        """When forward accepts ``**kwargs`` (``model_forward_params is None``), forward() passes the real
+        model inputs but drops ST bookkeeping and tokenizer-only extras, even though ``**kwargs`` would
+        otherwise swallow them silently."""
+        model = bert_tiny_transformer
+        if model.model_forward_params is not None:
+            pytest.skip("bert-tiny forward does not accept **kwargs in this transformers version")
+
+        features = batch_to_device(model.preprocess(["hello world"]), model.model.device)
+        # Inject every key that must never reach the model, regardless of whether preprocess added it.
+        seq_len = features["input_ids"].shape[1]
+        features.update(
+            {
+                "modality": "text",
+                "num_images_per_sample": torch.zeros(1, dtype=torch.long),
+                "num_videos_per_sample": torch.zeros(1, dtype=torch.long),
+                "prompt_length": 1,
+                "query_expansion_positions": torch.zeros_like(features["input_ids"], dtype=torch.bool),
+                "task": "document",
+                "offset_mapping": torch.zeros(1, seq_len, 2, dtype=torch.long),
+                "overflow_to_sample_mapping": torch.zeros(1, dtype=torch.long),
+                "special_tokens_mask": torch.zeros_like(features["input_ids"]),
+            }
+        )
+
+        captured = {}
+        original_forward = model.model.forward
+
+        def spy(**kwargs):
+            captured.update(kwargs)
+            return original_forward(**kwargs)
+
+        monkeypatch.setattr(model.model, "forward", spy)
+        with torch.no_grad():
+            model.forward(features)
+
+        assert {"input_ids", "attention_mask"} <= captured.keys()
+        for banned in (
+            "modality",
+            "num_images_per_sample",
+            "num_videos_per_sample",
+            "prompt_length",
+            "query_expansion_positions",
+            "task",
+            "offset_mapping",
+            "overflow_to_sample_mapping",
+            "special_tokens_mask",
+        ):
+            assert banned not in captured, f"{banned} must not be forwarded to the model"
+
+    def test_kwargs_forward_keeps_bookkeeping_keys_the_model_declares(self, monkeypatch):
+        """A custom model whose forward names a bookkeeping key wants it (e.g. task adapters keyed on
+        ``task``), so the denylist must yield to an explicit declaration even though ``**kwargs`` is
+        also present. Keys it does not declare stay blocked."""
+
+        class TaskAwareModel(torch.nn.Module):
+            def __init__(self, inner):
+                super().__init__()
+                self.inner = inner
+                self.config = inner.config
+
+            def forward(self, task=None, modality=None, **kwargs):
+                self.seen = (task, modality)
+                self.blocked = "prompt_length" in kwargs
+                return self.inner(**kwargs)
+
+        original_load = Transformer._load_model
+        monkeypatch.setattr(
+            Transformer,
+            "_load_model",
+            lambda self, *args, **kwargs: TaskAwareModel(original_load(self, *args, **kwargs)),
+        )
+        model = Transformer("sentence-transformers-testing/stsb-bert-tiny-safetensors")
+        assert model.model_forward_params is None, "declaring **kwargs must select the denylist branch"
+
+        features = batch_to_device(model.preprocess(["hello world"]), next(model.model.parameters()).device)
+        features.update({"task": "document", "prompt_length": 1})
+        with torch.no_grad():
+            model.forward(features)
+
+        assert model.model.seen == ("document", "text")
+        assert not model.model.blocked, "prompt_length is undeclared, so it stays denied"
+
+    def test_allowlist_forward_filters_unknown_kwargs(self, bert_tiny_transformer, monkeypatch):
+        """When forward does not accept ``**kwargs`` (``model_forward_params`` is a set), forward() drops
+        any feature key outside the allowlist."""
+        model = bert_tiny_transformer
+        model.model_forward_params = {"input_ids", "attention_mask", "token_type_ids", "return_dict"}
+
+        features = batch_to_device(model.preprocess(["hello world"]), model.model.device)
+        features["pixel_values"] = torch.zeros(1, 3, 4, 4)  # not in the allowlist, must be dropped
+
+        captured = {}
+        original_forward = model.model.forward
+
+        def spy(**kwargs):
+            captured.update(kwargs)
+            return original_forward(**kwargs)
+
+        monkeypatch.setattr(model.model, "forward", spy)
+        with torch.no_grad():
+            model.forward(features)
+
+        assert "input_ids" in captured
+        assert "pixel_values" not in captured
 
 
 class TestGetEmbeddingDimension:
@@ -676,6 +1195,77 @@ class TestCallProcessor:
         assert "input_ids" in result
 
 
+def make_char_chat_template_mock(suffix, captured_kwargs=None):
+    """Chat-template mock: one token per content character plus ``suffix``, honoring truncation/max_length
+    and return_tensors ("pt", "np", or ragged lists)."""
+
+    def mock_apply_chat_template(messages, **kwargs):
+        if captured_kwargs is not None:
+            captured_kwargs.append(kwargs)
+        text = "".join(str(message["content"]) for message in messages[0])
+        ids = [ord(char) for char in text] + suffix
+        # Like real tokenizers, max_length truncates unless truncation is explicitly disabled.
+        if kwargs.get("max_length") and kwargs.get("truncation") not in (False, "do_not_truncate"):
+            ids = ids[: kwargs["max_length"]]
+        if kwargs.get("return_tensors") == "pt":
+            return {"input_ids": torch.tensor([ids]), "attention_mask": torch.ones(1, len(ids), dtype=torch.long)}
+        if kwargs.get("return_tensors") == "np":
+            return {"input_ids": np.array([ids]), "attention_mask": np.ones((1, len(ids)), dtype=np.int64)}
+        return {"input_ids": [ids]}
+
+    return mock_apply_chat_template
+
+
+def make_modality_kwargs(**text_kwargs):
+    """Modality kwargs for _process_chat_messages with only the text bucket populated."""
+    return {"text": text_kwargs, "audio": {}, "image": {}, "video": {}}
+
+
+class TestApplyChatTemplate:
+    @pytest.mark.parametrize("use_processor_kwargs", [False, True])
+    @pytest.mark.parametrize("video_flag", [None, False, True])
+    @pytest.mark.parametrize("chat_flag", [None, False, True])
+    def test_load_audio_from_video_routing(self, monkeypatch, video_flag, chat_flag, use_processor_kwargs):
+        monkeypatch.setattr(
+            transformer_module, "_TRANSFORMERS_APPLY_CHAT_TEMPLATE_RECOMMENDS_PROCESSOR_KWARGS", use_processor_kwargs
+        )
+        processor = MagicMock(spec=transformer_module.ProcessorMixin)
+        model = SimpleNamespace(processor=processor)
+        messages = [[{"role": "user", "content": [{"type": "video", "video": "clip.mp4"}]}]]
+        modality_kwargs = make_modality_kwargs(padding=True)
+        modality_kwargs["video"] = {"num_frames": 2}
+        chat_kwargs = {"add_generation_prompt": False}
+        if video_flag is not None:
+            modality_kwargs["video"]["load_audio_from_video"] = video_flag
+        if chat_flag is not None:
+            chat_kwargs["load_audio_from_video"] = chat_flag
+        common_kwargs = {"return_tensors": "pt"}
+        original_kwargs = deepcopy((modality_kwargs, common_kwargs, chat_kwargs))
+
+        result = Transformer._apply_chat_template(model, messages, modality_kwargs, common_kwargs, chat_kwargs)
+
+        expected_flag = chat_flag if chat_flag is not None else bool(video_flag)
+        expected_processor_kwargs = {
+            "text_kwargs": {"padding": True},
+            "images_kwargs": {},
+            "audio_kwargs": {},
+            "videos_kwargs": {"num_frames": 2},
+            "common_kwargs": {"return_tensors": "pt"},
+        }
+        if use_processor_kwargs:
+            expected_processor_kwargs = {"processor_kwargs": expected_processor_kwargs, "return_tensors": "pt"}
+        processor.apply_chat_template.assert_called_once_with(
+            messages,
+            tokenize=True,
+            return_dict=True,
+            load_audio_from_video=expected_flag,
+            add_generation_prompt=False,
+            **expected_processor_kwargs,
+        )
+        assert result is processor.apply_chat_template.return_value
+        assert (modality_kwargs, common_kwargs, chat_kwargs) == original_kwargs
+
+
 class TestProcessChatMessages:
     def test_unsupported_message_modality(self, bert_tiny_transformer):
         """Should raise ValueError when 'message' modality is not in modality_config."""
@@ -723,14 +1313,428 @@ class TestProcessChatMessages:
         )
         assert captured_kwargs["add_generation_prompt"] is True
 
+    def test_chat_truncation_restores_chat_template_suffix(self, bert_tiny_transformer, monkeypatch):
+        model = bert_tiny_transformer
+        # Suffix preservation is task-independent: the default feature-extraction task confirms it benefits
+        # embedders (e.g. last-token pooling), not just causal-LM rerankers.
+        model.modality_config["message"] = {"method": "forward", "method_output_name": "logits"}
+
+        # A chat template appends a fixed scoring suffix (e.g. the assistant prefill) that right-truncation
+        # cuts off first. The mock mimics this: one token per content character, then ``suffix``.
+        suffix = [101, 102, 103]
+        monkeypatch.setattr(model.processor, "apply_chat_template", make_char_chat_template_mock(suffix))
+
+        def run(content, max_length, truncation=True):
+            return model._process_chat_messages(
+                messages=[[{"role": "user", "content": content}]],
+                modality_kwargs=make_modality_kwargs(padding=True, truncation=truncation, max_length=max_length),
+                common_kwargs={"return_tensors": "pt"},
+            )
+
+        # The mock tokenizes one token per character, so this 13-token content is truncated at max_length=8,
+        # dropping the suffix. The restore puts it back on the tail (head kept), with an auto-derived length.
+        long_content = "abcdefghijklm"
+        ids = run(long_content, max_length=8)["input_ids"].tolist()[0]
+        assert len(ids) == 8  # max_length is respected
+        assert ids[-3:] == suffix  # the scoring suffix is back at the tail
+        assert ids[:5] == [ord(char) for char in long_content[:5]]  # the head is preserved
+
+        # Short content fits, so no truncation happened and the row is returned untouched (no-op restore).
+        assert run("ab", max_length=8)["input_ids"].tolist()[0] == [ord("a"), ord("b")] + suffix
+
+        # Escape hatch: with truncation disabled the full sequence (suffix intact) is returned as-is.
+        for truncation in (False, "do_not_truncate"):
+            assert (
+                run(long_content, max_length=8, truncation=truncation)["input_ids"].tolist()[0]
+                == [ord(char) for char in long_content] + suffix
+            )
+
+        # Flattening path (feature-extraction + can_flatten_inputs): return_tensors is dropped, so the
+        # processor returns ragged unpadded lists. The list branch restores the suffix the same way.
+        list_ids = model._process_chat_messages(
+            messages=[[{"role": "user", "content": long_content}]],
+            modality_kwargs=make_modality_kwargs(truncation=True, max_length=8),
+            common_kwargs={},
+        )["input_ids"][0]
+        assert len(list_ids) == 8 and list_ids[-3:] == suffix and list_ids[:5] == [ord(c) for c in long_content[:5]]
+
+    def test_chat_truncation_restore_can_be_disabled(self, bert_tiny_transformer, monkeypatch):
+        # The restore is on by default, but ``chat_template_kwargs["restore_suffix"]=False`` (set via
+        # ``processing_kwargs["chat_template"]``) turns it off. The flag is a Sentence Transformers concept,
+        # so it must be popped and never forwarded to apply_chat_template.
+        model = bert_tiny_transformer
+        model.modality_config["message"] = {"method": "forward", "method_output_name": "logits"}
+        suffix = [201, 202, 203]
+        forwarded_kwargs = []
+        monkeypatch.setattr(
+            model.processor, "apply_chat_template", make_char_chat_template_mock(suffix, forwarded_kwargs)
+        )
+
+        def run(restore_suffix):
+            return model._process_chat_messages(
+                messages=[[{"role": "user", "content": "abcdefghij"}]],
+                modality_kwargs=make_modality_kwargs(padding=True, truncation=True, max_length=8),
+                common_kwargs={"return_tensors": "pt"},
+                chat_template_kwargs={"restore_suffix": restore_suffix},
+            )["input_ids"].tolist()[0]
+
+        # Default behaviour (restore on): the template suffix is put back at the tail.
+        assert run(True)[-3:] == suffix
+        # Disabled: the raw truncated tail (content tokens, no suffix) is left untouched.
+        assert run(False) == [ord(char) for char in "abcdefghij"][:8]
+        # restore_suffix is a ST-only flag, so it is never leaked into the apply_chat_template call(s).
+        assert forwarded_kwargs and all("restore_suffix" not in kwargs for kwargs in forwarded_kwargs)
+
+    def test_chat_truncation_restore_leaves_non_torch_tensors_untouched(self, bert_tiny_transformer, monkeypatch):
+        # The restore only supports torch tensors and token lists. Other containers (e.g. numpy arrays from
+        # ``return_tensors="np"``) must be returned untouched, not crash on ndarray truthiness.
+        model = bert_tiny_transformer
+        model.modality_config["message"] = {"method": "forward", "method_output_name": "logits"}
+
+        monkeypatch.setattr(model.processor, "apply_chat_template", make_char_chat_template_mock([101, 102, 103]))
+        features = model._process_chat_messages(
+            messages=[[{"role": "user", "content": "abcdefghijklm"}]],
+            modality_kwargs=make_modality_kwargs(padding=True, truncation=True, max_length=8),
+            common_kwargs={"return_tensors": "np"},
+        )
+        # The truncated numpy row keeps its raw tail (content tokens, no suffix): numpy is not restored.
+        assert features["input_ids"].tolist() == [[ord(char) for char in "abcdefghijklm"][:8]]
+
+    def test_chat_truncation_restore_reads_chat_template_bucket_kwargs(self, bert_tiny_transformer, monkeypatch):
+        # truncation/max_length can also ride in the chat_template bucket (apply_chat_template accepts them
+        # top level). The restore gate must see them there, and the skeleton renders must not inherit them.
+        model = bert_tiny_transformer
+        model.modality_config["message"] = {"method": "forward", "method_output_name": "logits"}
+        suffix = [101, 102, 103]
+        monkeypatch.setattr(model.processor, "apply_chat_template", make_char_chat_template_mock(suffix))
+        ids = model._process_chat_messages(
+            messages=[[{"role": "user", "content": "abcdefghijklm"}]],
+            modality_kwargs=make_modality_kwargs(padding=True),
+            common_kwargs={"return_tensors": "pt"},
+            chat_template_kwargs={"truncation": True, "max_length": 8},
+        )["input_ids"].tolist()[0]
+        assert len(ids) == 8 and ids[-3:] == suffix
+
+        # The chat bucket also wins over an existing text value (preprocess always sets a default text
+        # truncation, which previously collided with an explicit chat-bucket one as a duplicate kwarg).
+        ids = model._process_chat_messages(
+            messages=[[{"role": "user", "content": "abcdefghijklm"}]],
+            modality_kwargs=make_modality_kwargs(padding=True, truncation="longest_first"),
+            common_kwargs={"return_tensors": "pt"},
+            chat_template_kwargs={"truncation": True, "max_length": 8},
+        )["input_ids"].tolist()[0]
+        assert len(ids) == 8 and ids[-3:] == suffix
+
+    def test_chat_truncation_restore_handles_implicit_truncation(self, bert_tiny_transformer, monkeypatch):
+        # Tokenizers truncate when max_length is set even if truncation was merely left unset (None), so the
+        # restore gate must treat that as truncation-on.
+        model = bert_tiny_transformer
+        model.modality_config["message"] = {"method": "forward", "method_output_name": "logits"}
+        suffix = [101, 102, 103]
+        monkeypatch.setattr(model.processor, "apply_chat_template", make_char_chat_template_mock(suffix))
+        ids = model._process_chat_messages(
+            messages=[[{"role": "user", "content": "abcdefghijklm"}]],
+            modality_kwargs=make_modality_kwargs(padding=False, truncation=None, max_length=8),
+            common_kwargs={"return_tensors": "pt"},
+        )["input_ids"].tolist()[0]
+        assert len(ids) == 8 and ids[-3:] == suffix
+
+    def test_restore_chat_template_suffix_handles_both_padding_sides(self, bert_tiny_transformer, monkeypatch):
+        # The restore must locate the real tail via the attention mask (not a fixed [-keep:] slice), so it is
+        # correct whether the batch is left- or right-padded. In each batch row 0 was truncated (full width,
+        # suffix cut) and row 1 fits (real tokens end with the suffix, the remainder is padding).
+        model = bert_tiny_transformer
+        suffix = [101, 102, 103]
+        monkeypatch.setattr(model, "_chat_template_suffix_ids", lambda *args, **kwargs: suffix)
+        messages = [[{"role": "user", "content": "a"}], [{"role": "user", "content": "b"}]]
+
+        # Right padding: real tokens left-aligned, pad on the right. The fit row's pad must stay untouched.
+        features = {
+            "input_ids": torch.tensor([[10, 11, 12, 13, 14, 15], [20, 21, 101, 102, 103, 0]]),
+            "attention_mask": torch.tensor([[1, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 0]]),
+        }
+        model._restore_chat_template_suffix(features, messages, {}, {})
+        assert features["input_ids"].tolist() == [[10, 11, 12, 101, 102, 103], [20, 21, 101, 102, 103, 0]]
+
+        # Left padding: pad on the left, real tokens right-aligned.
+        features = {
+            "input_ids": torch.tensor([[10, 11, 12, 13, 14, 15], [0, 20, 21, 101, 102, 103]]),
+            "attention_mask": torch.tensor([[1, 1, 1, 1, 1, 1], [0, 1, 1, 1, 1, 1]]),
+        }
+        model._restore_chat_template_suffix(features, messages, {}, {})
+        assert features["input_ids"].tolist() == [[10, 11, 12, 101, 102, 103], [0, 20, 21, 101, 102, 103]]
+
+    def test_restore_chat_template_suffix_when_truncated_row_is_padded(self, bert_tiny_transformer, monkeypatch):
+        # pad_to_multiple_of can pad a truncated row past max_length, so a truncated row may itself carry
+        # padding. The real tail is read from the mask, so the suffix still lands on real tokens (pad intact).
+        model = bert_tiny_transformer
+        suffix = [101, 102, 103]
+        monkeypatch.setattr(model, "_chat_template_suffix_ids", lambda *args, **kwargs: suffix)
+        messages = [[{"role": "user", "content": "x"}]]
+
+        # Right padding: 5 real tokens (suffix cut by truncation) then 3 trailing pads.
+        features = {
+            "input_ids": torch.tensor([[10, 11, 12, 13, 14, 0, 0, 0]]),
+            "attention_mask": torch.tensor([[1, 1, 1, 1, 1, 0, 0, 0]]),
+        }
+        model._restore_chat_template_suffix(features, messages, {}, {})
+        assert features["input_ids"].tolist() == [[10, 11, 101, 102, 103, 0, 0, 0]]
+
+        # Left padding: 3 leading pads then the 5 real tokens.
+        features = {
+            "input_ids": torch.tensor([[0, 0, 0, 10, 11, 12, 13, 14]]),
+            "attention_mask": torch.tensor([[0, 0, 0, 1, 1, 1, 1, 1]]),
+        }
+        model._restore_chat_template_suffix(features, messages, {}, {})
+        assert features["input_ids"].tolist() == [[0, 0, 0, 10, 11, 101, 102, 103]]
+
+    def test_restore_skipped_when_nothing_reached_max_length(self, bert_tiny_transformer, monkeypatch):
+        # Rows shorter than max_length were not truncated, so they are skipped without deriving any suffix.
+        model = bert_tiny_transformer
+        derived = []
+        monkeypatch.setattr(model, "_chat_template_suffix_ids", lambda *a, **k: derived.append(True) or [1, 2, 3])
+        messages = [[{"role": "user", "content": "x"}]]
+        features = {
+            "input_ids": torch.tensor([[10, 11, 12, 0, 0, 0]]),
+            "attention_mask": torch.tensor([[1, 1, 1, 0, 0, 0]]),  # real length 3
+        }
+        # real length (3) < max_length (8): not truncated -> skipped, no derivation, untouched.
+        model._restore_chat_template_suffix(features, messages, {}, {}, max_length=8)
+        assert derived == [] and features["input_ids"].tolist() == [[10, 11, 12, 0, 0, 0]]
+
+    def test_restore_only_touches_rows_that_reached_max_length(self, bert_tiny_transformer, monkeypatch):
+        # The truncation check is per row: in a batch where one row was truncated (real length equals
+        # max_length), shorter rows kept their tail and must be skipped entirely (no derivation, no write).
+        model = bert_tiny_transformer
+        derived = []
+        monkeypatch.setattr(
+            model, "_chat_template_suffix_ids", lambda *a, **k: derived.append(True) or [101, 102, 103]
+        )
+        messages = [[{"role": "user", "content": "a"}], [{"role": "user", "content": "b"}]]
+        features = {
+            "input_ids": torch.tensor([[10, 11, 12, 13, 14, 15], [20, 21, 22, 0, 0, 0]]),
+            "attention_mask": torch.tensor([[1, 1, 1, 1, 1, 1], [1, 1, 1, 0, 0, 0]]),
+        }
+        model._restore_chat_template_suffix(features, messages, {}, {}, max_length=6)
+        # Row 0 (length 6 == max_length) is restored, row 1 (length 3) is left untouched and underived.
+        assert features["input_ids"].tolist() == [[10, 11, 12, 101, 102, 103], [20, 21, 22, 0, 0, 0]]
+        assert len(derived) == 1
+
+    def test_restore_skips_tensor_batches_without_attention_mask(self, bert_tiny_transformer, monkeypatch):
+        # Without a mask, real tokens can't be told apart from padding, so the restore must leave the batch
+        # untouched rather than stamp the suffix over what may be padding.
+        model = bert_tiny_transformer
+        derived = []
+        monkeypatch.setattr(model, "_chat_template_suffix_ids", lambda *a, **k: derived.append(True) or [101, 102])
+        features = {"input_ids": torch.tensor([[10, 11, 12, 13]])}
+        model._restore_chat_template_suffix(features, [[{"role": "user", "content": "x"}]], {}, {})
+        assert derived == [] and features["input_ids"].tolist() == [[10, 11, 12, 13]]
+
+    def test_restore_handles_float_attention_mask(self, bert_tiny_transformer, monkeypatch):
+        # Some processors emit float masks: the real lengths must still be ints for the tensor slicing.
+        model = bert_tiny_transformer
+        monkeypatch.setattr(model, "_chat_template_suffix_ids", lambda *a, **k: [101, 102, 103])
+        features = {
+            "input_ids": torch.tensor([[10, 11, 12, 13, 14, 15]]),
+            "attention_mask": torch.ones(1, 6),  # float32
+        }
+        model._restore_chat_template_suffix(features, [[{"role": "user", "content": "a"}]], {}, {})
+        assert features["input_ids"].tolist() == [[10, 11, 12, 101, 102, 103]]
+
+    def test_chat_template_suffix_ids_tolerates_unhashable_kwargs(self, bert_tiny_transformer, monkeypatch):
+        # chat_template_kwargs may carry unhashable values (e.g. a ``tools`` list). repr() in the cache key
+        # keeps the lookup from raising TypeError, so derivation still runs (and caches).
+        model = bert_tiny_transformer
+        monkeypatch.setattr(model.processor, "apply_chat_template", make_char_chat_template_mock([99]))
+        suffix = model._chat_template_suffix_ids([{"role": "user", "content": "x"}], {"tools": [{"name": "f"}]}, {})
+        assert suffix == [99]  # no crash from the unhashable kwarg. The fixed marker is the derived suffix
+
+    def test_chat_template_suffix_ids_skips_uninspectable_messages(self, bert_tiny_transformer, monkeypatch):
+        # Some templates accept shapes the text-only check can't inspect (a non-dict message, or a content
+        # list of plain strings). The restore must skip them (no suffix), not raise AttributeError.
+        model = bert_tiny_transformer
+        monkeypatch.setattr(
+            model.processor, "apply_chat_template", lambda messages, **kwargs: {"input_ids": [[1, 2, 3]]}
+        )
+        assert model._chat_template_suffix_ids([{"role": "user", "content": "x"}, "not a message"], {}, {}) == []
+        assert model._chat_template_suffix_ids([{"role": "user", "content": ["chunk a", "chunk b"]}], {}, {}) == []
+
+    def test_chat_template_suffix_ids_returns_empty_without_variable_content(self, bert_tiny_transformer, monkeypatch):
+        # With only kept (system) content there's nothing to vary, so the two renders are identical and there
+        # is no reliable suffix boundary -> return [] rather than treating the whole render as the suffix.
+        model = bert_tiny_transformer
+        monkeypatch.setattr(model.processor, "apply_chat_template", make_char_chat_template_mock([]))
+        assert model._chat_template_suffix_ids([{"role": "system", "content": "only a prompt"}], {}, {}) == []
+
+    def test_chat_template_suffix_cache_is_bounded(self, bert_tiny_transformer, monkeypatch):
+        # The cache key includes the prompt, so a workload with many distinct prompts must stay bounded.
+        model = bert_tiny_transformer
+        monkeypatch.setattr("sentence_transformers.base.modules.transformer._CHAT_TEMPLATE_SUFFIX_CACHE_SIZE", 3)
+        monkeypatch.setattr(
+            model.processor, "apply_chat_template", lambda messages, **kwargs: {"input_ids": [[1, 2, 3]]}
+        )
+        for index in range(10):
+            model._chat_template_suffix_ids([{"role": "system", "content": f"prompt {index}"}], {}, {})
+        assert len(model._chat_template_suffix_cache) == 3
+
+    def test_chat_template_suffix_ids_captures_prompt_rendered_in_tail(self, bert_tiny_transformer, monkeypatch):
+        # When the template renders the system prompt in the tail, keeping it fixed (not fillered) lets the
+        # diff capture it, so a truncated trailing prompt can be restored. Different prompts -> different keys.
+        model = bert_tiny_transformer
+
+        def mock_apply_chat_template(messages, **kwargs):
+            # Render the (fillered) non-system content, then the kept system prompt, then a fixed marker (99).
+            body = "".join(str(m["content"]) for m in messages[0] if m.get("role") != "system")
+            prompt = "".join(str(m["content"]) for m in messages[0] if m.get("role") == "system")
+            return {"input_ids": [[ord(c) for c in body] + [ord(c) for c in prompt] + [99]]}
+
+        monkeypatch.setattr(model.processor, "apply_chat_template", mock_apply_chat_template)
+        # "PQ" (80, 81) is kept fixed and lands in the tail, so it plus the marker (99) form the suffix.
+        assert model._chat_template_suffix_ids(
+            [{"role": "system", "content": "PQ"}, {"role": "user", "content": "x"}], {}, {}
+        ) == [80, 81, 99]
+        # A different prompt gets its own cache entry and its own suffix.
+        assert model._chat_template_suffix_ids(
+            [{"role": "system", "content": "RS"}, {"role": "user", "content": "x"}], {}, {}
+        ) == [82, 83, 99]
+
+    def test_chat_template_suffix_ids_keys_on_non_content_fields(self, bert_tiny_transformer, monkeypatch):
+        # The skeleton keeps non-content message fields (e.g. ``name``, ``tool_calls``) verbatim and a
+        # template may render them, so they are part of the cache key: the same role layout with different
+        # fields must not share a cached suffix.
+        model = bert_tiny_transformer
+
+        def mock_apply_chat_template(messages, **kwargs):
+            # Render the (fillered) content, then the kept ``name`` field, then a fixed marker (99).
+            body = "".join(str(m["content"]) for m in messages[0])
+            name = "".join(str(m.get("name", "")) for m in messages[0])
+            return {"input_ids": [[ord(c) for c in body] + [ord(c) for c in name] + [99]]}
+
+        monkeypatch.setattr(model.processor, "apply_chat_template", mock_apply_chat_template)
+        conv_a = [{"role": "user", "content": "x", "name": "AB"}]
+        conv_b = [{"role": "user", "content": "x", "name": "CD"}]
+        assert model._chat_template_suffix_ids(conv_a, {}, {}) == [65, 66, 99]  # "AB" + marker
+        assert model._chat_template_suffix_ids(conv_b, {}, {}) == [67, 68, 99]  # "CD", not A's cached suffix
+
+    def test_chat_template_suffix_ids_mirrors_common_kwargs(self, bert_tiny_transformer, monkeypatch):
+        # Common kwargs can change tokenization (a ProcessorMixin spreads them into the text kwargs), so the
+        # skeleton renders must receive them and the cache must key on them.
+        model = bert_tiny_transformer
+
+        def mock_apply_chat_template(messages, **kwargs):
+            # Emit a different fixed tail depending on a tokenization-affecting common kwarg.
+            marker = 98 if kwargs.get("common_kwargs", {}).get("add_special_tokens") is False else 99
+            body = "".join(str(m["content"]) for m in messages[0])
+            return {"input_ids": [[ord(c) for c in body] + [marker]]}
+
+        monkeypatch.setattr(model.processor, "apply_chat_template", mock_apply_chat_template)
+        conversation = [{"role": "user", "content": "x"}]
+        assert model._chat_template_suffix_ids(conversation, {}, {}, {"add_special_tokens": False}) == [98]
+        assert model._chat_template_suffix_ids(conversation, {}, {}, {}) == [99]
+
+    def test_restore_chat_template_suffix_is_per_row_and_skips_multimodal(self, bert_tiny_transformer, monkeypatch):
+        # A heterogeneous batch: the text-only row is restored per-row, while the multimodal row is left
+        # untouched (its trailing suffix can't be isolated from a text skeleton, so it returns []).
+        model = bert_tiny_transformer
+        suffix = [101, 102, 103]
+
+        def mock_apply_chat_template(messages, **kwargs):
+            # Skeleton content is the filler string, so emit one content token plus the fixed suffix.
+            text = "".join(str(message["content"]) for message in messages[0])
+            return {"input_ids": [[ord(text[0])] + suffix]}
+
+        monkeypatch.setattr(model.processor, "apply_chat_template", mock_apply_chat_template)
+        messages = [
+            [{"role": "user", "content": "text"}],
+            [{"role": "user", "content": [{"type": "text", "text": "t"}, {"type": "image", "image": "img"}]}],
+        ]
+        features = {
+            "input_ids": torch.tensor([[10, 11, 12, 13, 14, 15], [20, 21, 22, 23, 24, 25]]),
+            "attention_mask": torch.ones(2, 6, dtype=torch.long),
+        }
+        model._restore_chat_template_suffix(features, messages, {}, {})
+        assert features["input_ids"][0].tolist() == [10, 11, 12, 101, 102, 103]  # text row restored
+        assert features["input_ids"][1].tolist() == [20, 21, 22, 23, 24, 25]  # multimodal row untouched
+
+    @pytest.mark.slow
+    def test_chat_truncation_restores_suffix_with_real_chat_template(self):
+        # Integration check against a real chat-template model (the other suffix tests mock the tokenizer), so
+        # it exercises the real apply_chat_template dispatch and two-filler derivation. The Llama-2 template
+        # ends the user turn with `[/INST]`, which truncation drops and the restore must put back.
+        model = Transformer(TINY_LLAMA, transformer_task="feature-extraction")
+        tokenizer = model.tokenizer
+
+        def process(max_length, restore_suffix=True):
+            return model._process_chat_messages(
+                messages=[[{"role": "user", "content": "word " * 50}]],
+                modality_kwargs=make_modality_kwargs(padding=True, truncation="longest_first", max_length=max_length),
+                common_kwargs={"return_tensors": "pt"},
+                chat_template_kwargs={"add_generation_prompt": True, "restore_suffix": restore_suffix},
+            )["input_ids"][0].tolist()
+
+        # The conversation overflows max_length=16, so `[/INST]` is truncated off and then restored.
+        restored = process(16)
+        decoded = tokenizer.decode(restored)
+        assert len(restored) == 16  # truncation is still respected
+        assert decoded.rstrip().endswith("[/INST]")  # the template suffix is back at the tail
+        assert "word" in decoded  # real content is kept at the head, not overwritten wholesale
+
+        # With the restore disabled the same input ends on a content token: the bug this feature fixes.
+        assert not tokenizer.decode(process(16, restore_suffix=False)).rstrip().endswith("[/INST]")
+
+
+class ResolvedRevisionStub(str):
+    initial = "branch"
+    resolved = "0123456789abcdef0123456789abcdef01234567"
+
 
 class TestModelLoading:
+    @staticmethod
+    def _processor_revision(monkeypatch, **kwargs):
+        """Return the revision that the processor would be loaded with, without loading anything."""
+
+        class StopLoading(Exception):
+            pass
+
+        captured = {}
+
+        def capture_processor(model_name_or_path, **processor_kwargs):
+            captured.update(processor_kwargs)
+            raise StopLoading
+
+        monkeypatch.setattr(Transformer, "_load_config", lambda *args, **kwargs: (PretrainedConfig(), False))
+        monkeypatch.setattr(Transformer, "_load_model", lambda *args, **kwargs: torch.nn.Linear(2, 2))
+        monkeypatch.setattr(transformer_module.AutoProcessor, "from_pretrained", capture_processor)
+
+        with pytest.raises(StopLoading):
+            Transformer("some-org/some-model", **kwargs)
+        return captured["revision"]
+
+    def test_separate_processor_repository_is_not_pinned_to_model_revision(self, monkeypatch):
+        processor_kwargs = {"revision": ResolvedRevisionStub("branch")}
+        revision = self._processor_revision(
+            monkeypatch,
+            tokenizer_name_or_path="some-org/some-tokenizer",
+            processor_kwargs=processor_kwargs,
+        )
+
+        assert revision == "branch"
+        assert not isinstance(revision, ResolvedRevisionStub)
+        assert isinstance(processor_kwargs["revision"], ResolvedRevisionStub)
+
+    def test_same_repository_processor_keeps_resolved_revision(self, monkeypatch):
+        processor_kwargs = {"revision": ResolvedRevisionStub("branch")}
+        revision = self._processor_revision(monkeypatch, processor_kwargs=processor_kwargs)
+
+        assert isinstance(revision, ResolvedRevisionStub)
+
     def test_invalid_backend_error(self):
         with pytest.raises(ValueError, match="Unsupported backend"):
             Transformer(TINY_BERT, backend="invalid_backend")
 
-    def test_peft_seq_classification_no_architectures(self, monkeypatch):
-        """PeftConfig has no 'architectures' attr; sequence-classification init should not crash."""
+    @pytest.mark.skipif(not is_peft_available(), reason="PEFT must be available to test PEFT support.")
+    def test_peft_seq_classification_resolves_base_config(self, monkeypatch):
+        """A PeftConfig has no 'architectures', so the base model's config decides `num_labels`."""
 
         class FakePeftConfig:
             """Minimal stand-in for PeftConfig that intentionally lacks 'architectures'."""
@@ -748,10 +1752,25 @@ class TestModelLoading:
 
         monkeypatch.setattr(peft, "PeftConfig", FakePeftConfig)
 
-        # PeftConfig lacks 'architectures', so the sequence-classification guard
-        # (which accesses config.architectures) will raise AttributeError.
-        with pytest.raises(AttributeError):
-            Transformer(TINY_BERT, transformer_task="sequence-classification")
+        module = Transformer(TINY_BERT, transformer_task="sequence-classification")
+        assert module.model.config.num_labels == 1
+
+    @pytest.mark.skipif(not is_peft_available(), reason="PEFT must be available to test PEFT support.")
+    def test_peft_seq_classification_roundtrip(self, tmp_path):
+        """A saved adapter checkpoint reloads as a sequence-classification model with one label."""
+        from peft import LoraConfig, TaskType
+
+        module = Transformer(TINY_BERT, transformer_task="sequence-classification")
+        module.model.add_adapter(LoraConfig(target_modules=["query", "value"], task_type=TaskType.SEQ_CLS, r=8))
+        module.save(str(tmp_path))
+        # The adapter checkpoint carries no config.json, so loading has to resolve the base model's.
+        assert not (tmp_path / "config.json").exists()
+        assert (tmp_path / "adapter_config.json").exists()
+
+        reloaded = Transformer(str(tmp_path), transformer_task="sequence-classification")
+        assert reloaded.model.config.num_labels == 1
+        assert reloaded.model.classifier.out_features == 1
+        assert reloaded.model._hf_peft_config_loaded
 
     def test_peft_non_torch_backend_error(self, monkeypatch):
         """PEFT models should raise an error for non-torch backends."""
@@ -1204,10 +2223,16 @@ class TestCanFlattenInputs:
         except ImportError:
             pytest.skip("kernels library not available")
 
-        transformer = Transformer(
-            TINY_BERT,
-            model_kwargs={"attn_implementation": "flash_attention_2", "torch_dtype": torch.bfloat16},
-        )
+        try:
+            transformer = Transformer(
+                TINY_BERT,
+                model_kwargs={"attn_implementation": "flash_attention_2", "torch_dtype": torch.bfloat16},
+            )
+        except (ValueError, FileNotFoundError, ImportError) as exc:
+            # The kernels hub ships no build variant for every platform (e.g. Windows).
+            if "flash" in str(exc).lower() or "build variant" in str(exc).lower():
+                pytest.skip(f"no flash-attn2 kernel build for this platform: {exc}")
+            raise
         assert transformer._can_flatten_inputs() is True
         assert transformer.can_flatten_inputs is True
         assert transformer.data_collator is not None
@@ -1252,10 +2277,11 @@ class TestConditionalFlattening:
     """Test that preprocess only flattens text-only inputs, even when can_flatten_inputs is True."""
 
     @pytest.fixture()
-    def flatten_ready_transformer(self):
+    def flatten_ready_transformer(self, bert_tiny_transformer):
         """A BERT transformer with can_flatten_inputs=True and a mock data_collator."""
-        transformer = Transformer(TINY_BERT)
+        transformer = bert_tiny_transformer
         transformer.can_flatten_inputs = True
+        transformer._flatten_position_offset = transformer._infer_flatten_position_offset()
         transformer.data_collator = MagicMock(
             return_value={"input_ids": torch.tensor([1, 2, 3]), "position_ids": torch.tensor([0, 1, 2])}
         )
@@ -1266,9 +2292,9 @@ class TestConditionalFlattening:
         flatten_ready_transformer.preprocess(["hello world", "another sentence"])
         flatten_ready_transformer.data_collator.assert_called_once()
 
-    def test_text_inputs_not_flattened_when_disabled(self):
+    def test_text_inputs_not_flattened_when_disabled(self, bert_tiny_transformer):
         """Text inputs should NOT be flattened when can_flatten_inputs is False."""
-        transformer = Transformer(TINY_BERT)
+        transformer = bert_tiny_transformer
         assert transformer.can_flatten_inputs is False
         transformer.data_collator = MagicMock()
         transformer.preprocess(["hello world"])
@@ -1327,15 +2353,6 @@ class TestConditionalFlattening:
 
         transformer.preprocess(["dummy"])
         transformer.data_collator.assert_called_once()
-
-
-@pytest.mark.skipif(
-    Version(transformers_version) >= Version("5.0.0"),
-    reason="Test only applies to transformers v4",
-)
-def test_any_to_any_requires_transformers_v5():
-    with pytest.raises(ImportError, match="transformers v5"):
-        Transformer("hf-internal-testing/tiny-random-LlamaForCausalLM", transformer_task="any-to-any")
 
 
 class TestCountMediaPerSample:

@@ -1,15 +1,10 @@
 from __future__ import annotations
 
-import itertools
 import logging
-import math
-import queue
-from collections.abc import Callable
-from multiprocessing import Queue
-from typing import Any, Literal, overload
+from collections import OrderedDict
+from typing import Any, ClassVar, Literal, overload
 
 import numpy as np
-import numpy.typing as npt
 import torch
 from torch import Tensor, nn
 from tqdm import trange
@@ -43,7 +38,8 @@ class SparseEncoder(BaseModel):
         modules (list[nn.Module], optional): A list of torch modules that are called sequentially. Can be used to
             create custom SparseEncoder models from scratch. Defaults to None.
         device (str, optional): Device (like ``"cuda"``, ``"cpu"``, ``"mps"``, ``"npu"``) that should be used for
-            computation. If None, checks if a GPU can be used. Defaults to None.
+            computation. If None, checks if a GPU can be used. If a ``device_map`` is provided via
+            ``model_kwargs``, that controls device placement and this argument is ignored. Defaults to None.
         prompts (dict[str, str], optional): A dictionary with prompts for the model. The key is the prompt name,
             the value is the prompt text. The prompt text will be prepended before any text to encode. For example:
             ``{"query": "query: ", "passage": "passage: "}``. If a model has saved prompts, you can override
@@ -60,8 +56,9 @@ class SparseEncoder(BaseModel):
             commit id, for a stored model on Hugging Face. Defaults to None.
         local_files_only (bool, optional): Whether to only look at local files (i.e., do not try to download
             the model). Defaults to False.
-        token (bool or str, optional): Hugging Face authentication token to download private models.
-            Defaults to None.
+        token (bool or str, optional): Hugging Face authentication token for higher Hub rate limits and access to
+            private or gated models your account can read. Defaults to None, which uses ``HF_TOKEN`` or
+            credentials saved with ``hf auth login``, if available.
         model_kwargs (dict[str, Any], optional): Keyword arguments passed to the underlying Hugging Face
             Transformers model via ``AutoModel.from_pretrained``. Particularly useful options include:
 
@@ -72,7 +69,10 @@ class SparseEncoder(BaseModel):
               ``"sdpa"``, or ``"flash_attention_2"``. If you ``pip install kernels``, then
               ``"flash_attention_2"`` should work without having to install ``flash_attn``. It is
               frequently the fastest option. Defaults to ``"sdpa"`` when available (torch>=2.1.1).
-            - ``device_map``: Device map for model parallelism, e.g. ``"auto"``.
+            - ``device_map``: Controls how the model is placed across devices, e.g. ``"auto"`` for
+              model parallelism, or a single device like ``"cuda:1"`` to load the backbone directly
+              onto one GPU (useful when serving multiple models in one process). When set, it takes
+              precedence over the ``device`` argument.
             - ``provider``: For ``backend="onnx"``, the ONNX execution provider
               (e.g. ``"CUDAExecutionProvider"``).
             - ``file_name``: For ``backend="onnx"`` or ``"openvino"``, the filename to load
@@ -98,11 +98,10 @@ class SparseEncoder(BaseModel):
             or ``"openvino"``. Defaults to ``"torch"``.
         similarity_fn_name (str or SimilarityFunction, optional): The name of the similarity function to use.
             Valid options are ``"cosine"``, ``"dot"``, ``"euclidean"``, and ``"manhattan"``. If not set, it is
-            automatically set to ``"cosine"`` when :attr:`similarity` or :attr:`similarity_pairwise` are first
-            accessed. Defaults to None.
-        max_active_dims (int, optional): The maximum number of active (non-zero) dimensions in the output of the
-            model. ``None`` means no limit, which can be slow or memory-intensive if your model wasn't (yet)
-            finetuned to high sparsity. Defaults to None.
+            automatically set to ``"cosine"`` when :meth:`similarity` or :meth:`similarity_pairwise` are first
+            called. Defaults to None.
+        max_active_dims (int, optional): Maximum number of active (non-zero) output dimensions. Can be overridden during
+            encoding and is saved and loaded with the model. Defaults to None (use the model's default).
 
     Example:
         ::
@@ -135,6 +134,13 @@ class SparseEncoder(BaseModel):
     _default_prompts: dict[str, str | None] = {"query": None, "document": None}
     _model_card_model_id_placeholder = "sparse_encoder_model_id"
     model_type: str = "SparseEncoder"
+    # Supported single-vector similarities. Multi-vector names (maxsim) would produce wrong shapes on 2D embeddings.
+    SUPPORTED_SIMILARITY_FN_NAMES: ClassVar[tuple[str, ...]] = (
+        SimilarityFunction.COSINE.value,
+        SimilarityFunction.DOT_PRODUCT.value,
+        SimilarityFunction.EUCLIDEAN.value,
+        SimilarityFunction.MANHATTAN.value,
+    )
 
     @deprecated_kwargs(tokenizer_kwargs="processor_kwargs")
     def __init__(
@@ -161,6 +167,7 @@ class SparseEncoder(BaseModel):
     ) -> None:
         # Set before super().__init__() so _parse_model_config can check these
         self.similarity_fn_name = similarity_fn_name
+        self.max_active_dims = max_active_dims
 
         super().__init__(
             model_name_or_path=model_name_or_path,
@@ -182,14 +189,93 @@ class SparseEncoder(BaseModel):
         # Narrow the type from BaseModelCardData
         self.model_card_data: SparseEncoderModelCardData
 
-        if max_active_dims is not None and max_active_dims <= 0:
-            raise ValueError(f"max_active_dims must be a positive integer, got {max_active_dims}.")
-        self.max_active_dims = max_active_dims
-        if max_active_dims is None:
+        if self.max_active_dims is not None and (
+            isinstance(self.max_active_dims, bool)
+            or not isinstance(self.max_active_dims, int)
+            or self.max_active_dims <= 0
+        ):
+            raise ValueError(f"max_active_dims must be a positive integer, got {self.max_active_dims}.")
+        if self.max_active_dims is None:
             for module in self._modules.values():
                 if isinstance(module, SparseAutoEncoder):
                     self.max_active_dims = module.k
                     break
+
+    # Ordered overloads: the first match wins, so the all-defaults signatures come first and the
+    # convert_to_tensor=False deviation pins its flag as a required keyword.
+    @overload
+    def encode_query(
+        self,
+        inputs: TextInput,
+        prompt_name: str | None = ...,
+        prompt: str | None = ...,
+        batch_size: int = ...,
+        show_progress_bar: bool | None = ...,
+        convert_to_tensor: bool = ...,
+        convert_to_sparse_tensor: bool = ...,
+        save_to_cpu: bool = ...,
+        device: str | torch.device | list[str | torch.device] | None = ...,
+        max_active_dims: int | None = ...,
+        pool: dict[Literal["input", "output", "processes"], Any] | None = ...,
+        chunk_size: int | None = ...,
+        **kwargs: Any,
+    ) -> Tensor: ...
+
+    @overload
+    def encode_query(
+        self,
+        inputs: list[TextInput],
+        prompt_name: str | None = ...,
+        prompt: str | None = ...,
+        batch_size: int = ...,
+        show_progress_bar: bool | None = ...,
+        convert_to_tensor: Literal[True] = ...,
+        convert_to_sparse_tensor: bool = ...,
+        save_to_cpu: bool = ...,
+        device: str | torch.device | list[str | torch.device] | None = ...,
+        max_active_dims: int | None = ...,
+        pool: dict[Literal["input", "output", "processes"], Any] | None = ...,
+        chunk_size: int | None = ...,
+        **kwargs: Any,
+    ) -> Tensor: ...
+
+    @overload
+    def encode_query(
+        self,
+        inputs: list[TextInput],
+        prompt_name: str | None = ...,
+        prompt: str | None = ...,
+        batch_size: int = ...,
+        show_progress_bar: bool | None = ...,
+        *,
+        convert_to_tensor: Literal[False],
+        convert_to_sparse_tensor: bool = ...,
+        save_to_cpu: bool = ...,
+        device: str | torch.device | list[str | torch.device] | None = ...,
+        max_active_dims: int | None = ...,
+        pool: dict[Literal["input", "output", "processes"], Any] | None = ...,
+        chunk_size: int | None = ...,
+        **kwargs: Any,
+    ) -> list[Tensor]: ...
+
+    # Catch-all so forwarding calls with union-typed arguments (e.g. from evaluators) still resolve.
+    @overload
+    def encode_query(
+        self,
+        inputs: list[TextInput] | TextInput,
+        prompt_name: str | None = ...,
+        prompt: str | None = ...,
+        batch_size: int = ...,
+        show_progress_bar: bool | None = ...,
+        convert_to_tensor: bool = ...,
+        convert_to_sparse_tensor: bool = ...,
+        save_to_cpu: bool = ...,
+        device: str | torch.device | list[str | torch.device] | None = ...,
+        max_active_dims: int | None = ...,
+        pool: dict[Literal["input", "output", "processes"], Any] | None = ...,
+        chunk_size: int | None = ...,
+        **kwargs: Any,
+    ) -> list[Tensor] | Tensor: ...
 
     @deprecated_kwargs(sentences="inputs")
     def encode_query(
@@ -213,8 +299,8 @@ class SparseEncoder(BaseModel):
 
         This method is a specialized version of :meth:`encode` that differs in exactly two ways:
 
-        1. If no ``prompt_name`` or ``prompt`` is provided, it uses a predefined "query" prompt,
-           if available in the model's ``prompts`` dictionary.
+        1. If no ``prompt_name`` or ``prompt`` is provided, it uses the ``"query"`` prompt from the model's
+           ``prompts`` dictionary. This defaults to an empty string, which prevents fallback to ``default_prompt_name``.
         2. It sets the ``task`` to "query". If the model has a :class:`~sentence_transformers.base.modules.Router`
            module, it will use the "query" task type to route the input through the appropriate submodules.
 
@@ -263,6 +349,80 @@ class SparseEncoder(BaseModel):
             task="query",
             **kwargs,
         )
+
+    @overload
+    def encode_document(
+        self,
+        inputs: TextInput,
+        prompt_name: str | None = ...,
+        prompt: str | None = ...,
+        batch_size: int = ...,
+        show_progress_bar: bool | None = ...,
+        convert_to_tensor: bool = ...,
+        convert_to_sparse_tensor: bool = ...,
+        save_to_cpu: bool = ...,
+        device: str | torch.device | list[str | torch.device] | None = ...,
+        max_active_dims: int | None = ...,
+        pool: dict[Literal["input", "output", "processes"], Any] | None = ...,
+        chunk_size: int | None = ...,
+        **kwargs: Any,
+    ) -> Tensor: ...
+
+    @overload
+    def encode_document(
+        self,
+        inputs: list[TextInput],
+        prompt_name: str | None = ...,
+        prompt: str | None = ...,
+        batch_size: int = ...,
+        show_progress_bar: bool | None = ...,
+        convert_to_tensor: Literal[True] = ...,
+        convert_to_sparse_tensor: bool = ...,
+        save_to_cpu: bool = ...,
+        device: str | torch.device | list[str | torch.device] | None = ...,
+        max_active_dims: int | None = ...,
+        pool: dict[Literal["input", "output", "processes"], Any] | None = ...,
+        chunk_size: int | None = ...,
+        **kwargs: Any,
+    ) -> Tensor: ...
+
+    @overload
+    def encode_document(
+        self,
+        inputs: list[TextInput],
+        prompt_name: str | None = ...,
+        prompt: str | None = ...,
+        batch_size: int = ...,
+        show_progress_bar: bool | None = ...,
+        *,
+        convert_to_tensor: Literal[False],
+        convert_to_sparse_tensor: bool = ...,
+        save_to_cpu: bool = ...,
+        device: str | torch.device | list[str | torch.device] | None = ...,
+        max_active_dims: int | None = ...,
+        pool: dict[Literal["input", "output", "processes"], Any] | None = ...,
+        chunk_size: int | None = ...,
+        **kwargs: Any,
+    ) -> list[Tensor]: ...
+
+    # Catch-all so forwarding calls with union-typed arguments (e.g. from evaluators) still resolve.
+    @overload
+    def encode_document(
+        self,
+        inputs: list[TextInput] | TextInput,
+        prompt_name: str | None = ...,
+        prompt: str | None = ...,
+        batch_size: int = ...,
+        show_progress_bar: bool | None = ...,
+        convert_to_tensor: bool = ...,
+        convert_to_sparse_tensor: bool = ...,
+        save_to_cpu: bool = ...,
+        device: str | torch.device | list[str | torch.device] | None = ...,
+        max_active_dims: int | None = ...,
+        pool: dict[Literal["input", "output", "processes"], Any] | None = ...,
+        chunk_size: int | None = ...,
+        **kwargs: Any,
+    ) -> list[Tensor] | Tensor: ...
 
     @deprecated_kwargs(sentences="inputs")
     def encode_document(
@@ -340,6 +500,80 @@ class SparseEncoder(BaseModel):
             **kwargs,
         )
 
+    @overload
+    def encode(
+        self,
+        inputs: TextInput,
+        prompt_name: str | None = ...,
+        prompt: str | None = ...,
+        batch_size: int = ...,
+        show_progress_bar: bool | None = ...,
+        convert_to_tensor: bool = ...,
+        convert_to_sparse_tensor: bool = ...,
+        save_to_cpu: bool = ...,
+        device: str | torch.device | list[str | torch.device] | None = ...,
+        max_active_dims: int | None = ...,
+        pool: dict[Literal["input", "output", "processes"], Any] | None = ...,
+        chunk_size: int | None = ...,
+        **kwargs: Any,
+    ) -> Tensor: ...
+
+    @overload
+    def encode(
+        self,
+        inputs: list[TextInput],
+        prompt_name: str | None = ...,
+        prompt: str | None = ...,
+        batch_size: int = ...,
+        show_progress_bar: bool | None = ...,
+        convert_to_tensor: Literal[True] = ...,
+        convert_to_sparse_tensor: bool = ...,
+        save_to_cpu: bool = ...,
+        device: str | torch.device | list[str | torch.device] | None = ...,
+        max_active_dims: int | None = ...,
+        pool: dict[Literal["input", "output", "processes"], Any] | None = ...,
+        chunk_size: int | None = ...,
+        **kwargs: Any,
+    ) -> Tensor: ...
+
+    @overload
+    def encode(
+        self,
+        inputs: list[TextInput],
+        prompt_name: str | None = ...,
+        prompt: str | None = ...,
+        batch_size: int = ...,
+        show_progress_bar: bool | None = ...,
+        *,
+        convert_to_tensor: Literal[False],
+        convert_to_sparse_tensor: bool = ...,
+        save_to_cpu: bool = ...,
+        device: str | torch.device | list[str | torch.device] | None = ...,
+        max_active_dims: int | None = ...,
+        pool: dict[Literal["input", "output", "processes"], Any] | None = ...,
+        chunk_size: int | None = ...,
+        **kwargs: Any,
+    ) -> list[Tensor]: ...
+
+    # Catch-all so forwarding calls with union-typed arguments (e.g. from encode_query) still resolve.
+    @overload
+    def encode(
+        self,
+        inputs: list[TextInput] | TextInput,
+        prompt_name: str | None = ...,
+        prompt: str | None = ...,
+        batch_size: int = ...,
+        show_progress_bar: bool | None = ...,
+        convert_to_tensor: bool = ...,
+        convert_to_sparse_tensor: bool = ...,
+        save_to_cpu: bool = ...,
+        device: str | torch.device | list[str | torch.device] | None = ...,
+        max_active_dims: int | None = ...,
+        pool: dict[Literal["input", "output", "processes"], Any] | None = ...,
+        chunk_size: int | None = ...,
+        **kwargs: Any,
+    ) -> list[Tensor] | Tensor: ...
+
     @deprecated_kwargs(sentences="inputs")
     def encode(
         self,
@@ -402,9 +636,10 @@ class SparseEncoder(BaseModel):
                 - A single device string (e.g., "cuda:0", "cpu") for single-process encoding
                 - A list of device strings (e.g., ["cuda:0", "cuda:1"], ["cpu", "cpu", "cpu", "cpu"]) to distribute
                   encoding across multiple processes
-                - None to auto-detect available device for single-process encoding
+                - None to use the model's current device
 
-                If a list is provided, multi-process encoding will be used. Defaults to None.
+                A single device moves the model there, unless a `device_map` or Accelerate hooks control placement. If a list is
+                provided, multi-process encoding will be used. Defaults to None.
             max_active_dims (int, optional): The maximum number of active (non-zero) dimensions in the output of the
                 model. ``None`` means the value from the model's config will be used. Defaults to None. If also None in
                 the model's config, there will be no limit on the number of active dimensions, which can be slow or
@@ -475,39 +710,59 @@ class SparseEncoder(BaseModel):
                 )
             )
 
-        # If pool or a list of devices is provided, use multi-process encoding
-        if pool is not None or (isinstance(device, list) and len(device) > 0):
-            embeddings = self._multi_process(
-                inputs=inputs,
-                # Utility and post-processing parameters
-                show_progress_bar=show_progress_bar,
-                # Multi-process encoding parameters
-                pool=pool,
-                device=device,
-                chunk_size=chunk_size,
-                # Encoding parameters
-                prompt_name=prompt_name,
-                prompt=prompt,
-                batch_size=batch_size,
-                convert_to_tensor=convert_to_tensor,
-                convert_to_sparse_tensor=convert_to_sparse_tensor,
-                save_to_cpu=True,  # Move all embeddings to CPU to allow for concatenation
-                max_active_dims=max_active_dims,
-                **kwargs,
-            )
-            if is_singular_input:
-                embeddings = embeddings[0]
-            return embeddings
-
         prompt = self._resolve_prompt(prompt, prompt_name)
-
-        if device is None:
-            device = self.device
-
-        self.to(device)
-        self.eval()
-
         max_active_dims = max_active_dims if max_active_dims is not None else self.max_active_dims
+
+        inference_kwargs = dict(
+            prompt=prompt,
+            batch_size=batch_size,
+            show_progress_bar=show_progress_bar,
+            convert_to_sparse_tensor=convert_to_sparse_tensor,
+            save_to_cpu=save_to_cpu,
+            max_active_dims=max_active_dims,
+            **kwargs,
+        )
+        use_multi_process = pool is not None or (isinstance(device, list) and len(device) > 0)
+        if use_multi_process:
+            inference_kwargs["save_to_cpu"] = True
+            all_embeddings = self._multi_process(
+                inputs, pool=pool, device=device, chunk_size=chunk_size, **inference_kwargs
+            )
+        elif self._distributed_inference is not None and device is None:
+            all_embeddings = self._distributed_inference(inputs, **inference_kwargs)
+        else:
+            all_embeddings = self._inference(inputs, device=device, **inference_kwargs)
+
+        if convert_to_tensor:
+            if not isinstance(all_embeddings, Tensor):
+                output_device = "cpu" if save_to_cpu or use_multi_process else self.device
+                all_embeddings = torch.tensor([], device=output_device)
+                if convert_to_sparse_tensor:
+                    all_embeddings = all_embeddings.to_sparse()
+        else:
+            all_embeddings = list(all_embeddings)
+
+        if is_singular_input:
+            all_embeddings = all_embeddings[0]
+
+        return all_embeddings
+
+    def _inference(
+        self,
+        inputs: list,
+        *,
+        prompt: str | None,
+        batch_size: int,
+        show_progress_bar: bool,
+        convert_to_sparse_tensor: bool,
+        save_to_cpu: bool,
+        max_active_dims: int | None,
+        device: str | torch.device | None = None,
+        **kwargs,
+    ) -> Tensor:
+        """Run local inference on normalized inputs with resolved arguments."""
+        device = self._resolve_inference_device(device)
+        self.eval()
 
         forward_kwargs = dict(kwargs)
         if max_active_dims is not None:
@@ -525,7 +780,8 @@ class SparseEncoder(BaseModel):
             features = batch_to_device(features, device)
 
             with torch.inference_mode():
-                embeddings = self.forward(features, **forward_kwargs)["sentence_embedding"]
+                # Route through __call__ so that model.compile() applies to the forward pass.
+                embeddings = self(features, **forward_kwargs)["sentence_embedding"]
 
                 if max_active_dims is not None:
                     embeddings = select_max_active_dims(embeddings, max_active_dims=max_active_dims)
@@ -539,30 +795,31 @@ class SparseEncoder(BaseModel):
 
         all_embeddings = [all_embeddings[idx] for idx in np.argsort(length_sorted_idx)]
 
-        if convert_to_tensor:
-            if len(all_embeddings) == 0:
-                all_embeddings = torch.tensor([], device=self.device)
-                if convert_to_sparse_tensor:
-                    all_embeddings = all_embeddings.to_sparse()
-                if save_to_cpu:
-                    all_embeddings = all_embeddings.cpu()
-            else:
-                all_embeddings = torch.stack(all_embeddings)
+        if all_embeddings:
+            return torch.stack(all_embeddings)
 
-        if is_singular_input:
-            all_embeddings = all_embeddings[0]
-
+        all_embeddings = torch.tensor([], device="cpu" if save_to_cpu else device)
+        if convert_to_sparse_tensor:
+            all_embeddings = all_embeddings.to_sparse()
         return all_embeddings
 
     def _get_model_config(self) -> dict[str, Any]:
-        return super()._get_model_config() | {
+        config = super()._get_model_config() | {
             "similarity_fn_name": self._similarity_fn_name,
         }
+        if self.max_active_dims is not None:
+            config["max_active_dims"] = self.max_active_dims
+        return config
 
     def _parse_model_config(self, model_config: dict[str, Any]) -> None:
         super()._parse_model_config(model_config)
-        if self._similarity_fn_name is None:
-            self.similarity_fn_name = model_config.get("similarity_fn_name", None)
+        # Inherit a supported saved similarity_fn_name unless the user overrode it (multi-vector
+        # names like "maxsim", e.g. from converted MultiVectorEncoder saves, fall through).
+        saved_similarity = model_config.get("similarity_fn_name")
+        if self._similarity_fn_name is None and saved_similarity in self.SUPPORTED_SIMILARITY_FN_NAMES:
+            self.similarity_fn_name = saved_similarity
+        if self.max_active_dims is None:
+            self.max_active_dims = model_config.get("max_active_dims", None)
 
     @property
     def similarity_fn_name(self) -> Literal["cosine", "dot", "euclidean", "manhattan"]:
@@ -588,6 +845,12 @@ class SparseEncoder(BaseModel):
     ) -> None:
         if isinstance(value, SimilarityFunction):
             value = value.value
+        if value is not None and value not in self.SUPPORTED_SIMILARITY_FN_NAMES:
+            hint = " Use MultiVectorEncoder for MaxSim late-interaction scoring." if value == "maxsim" else ""
+            raise ValueError(
+                f"{type(self).__name__} only supports similarity_fn_name in "
+                f"{self.SUPPORTED_SIMILARITY_FN_NAMES}, got {value!r}.{hint}"
+            )
         self._similarity_fn_name = value
 
         if value is not None:
@@ -606,14 +869,11 @@ class SparseEncoder(BaseModel):
                 module.include_prompt = include_prompt
                 break
 
-    @overload
-    def similarity(self, embeddings1: Tensor, embeddings2: Tensor) -> Tensor: ...
-
-    @overload
-    def similarity(self, embeddings1: npt.NDArray[np.float32], embeddings2: npt.NDArray[np.float32]) -> Tensor: ...
-
-    @property
-    def similarity(self) -> Callable[[Tensor | npt.NDArray[np.float32], Tensor | npt.NDArray[np.float32]], Tensor]:
+    def similarity(
+        self,
+        embeddings1: Tensor | np.ndarray | list[Tensor] | list[np.ndarray],
+        embeddings2: Tensor | np.ndarray | list[Tensor] | list[np.ndarray],
+    ) -> Tensor:
         """
         Compute the similarity between two collections of embeddings. The output will be a matrix with the similarity
         scores between all embeddings from the first parameter and all embeddings from the second parameter. This
@@ -654,20 +914,13 @@ class SparseEncoder(BaseModel):
         """
         # Access the property to trigger lazy initialization if needed
         self.similarity_fn_name  # noqa: B018
-        return self._similarity
+        return self._similarity(embeddings1, embeddings2)
 
-    @overload
-    def similarity_pairwise(self, embeddings1: Tensor, embeddings2: Tensor) -> Tensor: ...
-
-    @overload
-    def similarity_pairwise(
-        self, embeddings1: npt.NDArray[np.float32], embeddings2: npt.NDArray[np.float32]
-    ) -> Tensor: ...
-
-    @property
     def similarity_pairwise(
         self,
-    ) -> Callable[[Tensor | npt.NDArray[np.float32], Tensor | npt.NDArray[np.float32]], Tensor]:
+        embeddings1: Tensor | np.ndarray | list[Tensor] | list[np.ndarray],
+        embeddings2: Tensor | np.ndarray | list[Tensor] | list[np.ndarray],
+    ) -> Tensor:
         """
         Compute the similarity between two collections of embeddings. The output will be a vector with the similarity
         scores between each pair of embeddings.
@@ -701,97 +954,7 @@ class SparseEncoder(BaseModel):
         """
         # Access the property to trigger lazy initialization if needed
         self.similarity_fn_name  # noqa: B018
-        return self._similarity_pairwise
-
-    def _multi_process(
-        self,
-        inputs: list[TextInput],
-        show_progress_bar: bool | None = True,
-        pool: dict[Literal["input", "output", "processes"], Any] | None = None,
-        device: str | torch.device | list[str | torch.device] | None = None,
-        chunk_size: int | None = None,
-        **encode_kwargs,
-    ) -> list[Tensor] | Tensor:
-        """Internal method for multi-process encoding.
-
-        Distributes encoding across multiple processes using the provided pool or list of devices.
-        If a pool is not provided but ``device`` is a list, a pool is created and cleaned up automatically.
-        """
-        convert_to_tensor = encode_kwargs.get("convert_to_tensor", False)
-        encode_kwargs["show_progress_bar"] = False
-
-        # Create a pool if not provided, but a list of devices is
-        created_pool = False
-        if pool is None and isinstance(device, list):
-            pool = self.start_multi_process_pool(device)
-            created_pool = True
-
-        try:
-            if chunk_size is None:
-                chunk_size = min(math.ceil(len(inputs) / len(pool["processes"]) / 10), 5000)
-                chunk_size = max(chunk_size, 1)
-
-            input_queue: torch.multiprocessing.Queue = pool["input"]
-            output_queue: torch.multiprocessing.Queue = pool["output"]
-
-            num_chunks = math.ceil(len(inputs) / chunk_size) if inputs else 0
-            for chunk_id in range(num_chunks):
-                chunk_start = chunk_id * chunk_size
-                chunk = inputs[chunk_start : chunk_start + chunk_size]
-                input_queue.put([chunk_id, chunk, encode_kwargs])
-
-            output_list = sorted(
-                [output_queue.get() for _ in trange(num_chunks, desc="Chunks", disable=not show_progress_bar)],
-                key=lambda x: x[0],
-            )
-
-            # Check for errors from worker processes
-            for output in output_list:
-                if isinstance(output[1], Exception):
-                    raise output[1]
-
-            # Handle the various output formats
-            embeddings = [output[1] for output in output_list]
-            if embeddings:
-                if isinstance(embeddings[0], list):
-                    embeddings = list(itertools.chain.from_iterable(embeddings))
-                elif isinstance(embeddings[0], torch.Tensor):
-                    embeddings = torch.cat(embeddings)
-                elif isinstance(embeddings[0], np.ndarray):
-                    embeddings = np.concatenate(embeddings, axis=0)
-            elif convert_to_tensor:
-                embeddings = torch.Tensor()
-            return embeddings
-
-        finally:
-            if created_pool:
-                self.stop_multi_process_pool(pool)
-
-    @staticmethod
-    def _multi_process_worker(
-        target_device: str, model: SparseEncoder, input_queue: Queue, results_queue: Queue
-    ) -> None:
-        """Internal working process to encode sentences in multi-process setup.
-
-        Workers are terminated externally via ``stop_multi_process_pool``.
-        """
-        while True:
-            try:
-                chunk_id, inputs, kwargs = input_queue.get()
-                embeddings = model.encode(inputs, device=target_device, **kwargs)
-                if isinstance(embeddings, torch.Tensor) and embeddings.device.type != "cpu":
-                    embeddings = embeddings.cpu()
-                results_queue.put([chunk_id, embeddings])
-
-            except queue.Empty:
-                break
-            except Exception as e:
-                logger.error(f"Error in worker process on {target_device}: {e}")
-                try:
-                    results_queue.put([chunk_id, e])
-                except Exception:
-                    pass
-                break
+        return self._similarity_pairwise(embeddings1, embeddings2)
 
     def get_embedding_dimension(self) -> int | None:
         """
@@ -852,7 +1015,6 @@ class SparseEncoder(BaseModel):
             model_kwargs (Optional[Dict[str, Any]], optional): Additional keyword arguments for the model. Defaults to None.
             processor_kwargs (Optional[Dict[str, Any]], optional): Additional keyword arguments for the processor/tokenizer. Defaults to None.
             config_kwargs (Optional[Dict[str, Any]], optional): Additional keyword arguments for the config. Defaults to None.
-            has_modules (bool, optional): Whether the model has modules.json. Defaults to False.
 
         Returns:
             tuple[list[nn.Module], dict[str, Any]]: The modules and an empty kwargs dict.
@@ -926,14 +1088,14 @@ class SparseEncoder(BaseModel):
         processor_kwargs: dict[str, Any] | None = None,
         config_kwargs: dict[str, Any] | None = None,
         model_type: str | None = None,
-    ) -> tuple[list[nn.Module], dict[str, Any]]:
+    ) -> tuple[list[nn.Module] | OrderedDict[str, nn.Module], dict[str, Any]]:
         """Converts a non-SparseEncoder model into a SparseEncoder by appending a SparseAutoEncoder.
 
         If ``model_type`` is ``"SentenceTransformer"``, loads the SentenceTransformer modules and appends a
-        SparseAutoEncoder on top. Otherwise, falls back to :meth:`_load_default_modules`.
+        SparseAutoEncoder on top. Otherwise, falls back to :meth:`BaseModel._load_converted_modules`.
         """
         if model_type != "SentenceTransformer":
-            return self._load_default_modules(
+            return super()._load_converted_modules(
                 model_name_or_path,
                 token=token,
                 cache_folder=cache_folder,
@@ -943,6 +1105,7 @@ class SparseEncoder(BaseModel):
                 model_kwargs=model_kwargs,
                 processor_kwargs=processor_kwargs,
                 config_kwargs=config_kwargs,
+                model_type=model_type,
             )
 
         shared_kwargs = {
@@ -1189,7 +1352,7 @@ class SparseEncoder(BaseModel):
         if embeddings_2.ndim == 1:
             intersection = embeddings_1 * embeddings_2
         elif embeddings_2.ndim == 2:
-            # Element-wise multiplication per row; Python loop is required as sparse broadcasting is limited
+            # Element-wise multiplication per row. Python loop is required as sparse broadcasting is limited
             intersection = torch.stack([embeddings_1 * embedding for embedding in embeddings_2])
         else:
             raise ValueError(f"Expected 1D or 2D tensor for embeddings_2, but got {embeddings_2.shape} shape.")

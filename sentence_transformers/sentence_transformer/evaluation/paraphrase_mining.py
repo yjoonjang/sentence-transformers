@@ -121,6 +121,8 @@ class ParaphraseMiningEvaluator(BaseEvaluator):
         self.max_pairs = max_pairs
         self.top_k = top_k
         self.truncate_dim = truncate_dim
+        # Store the flag under a private name, as `self.add_transitive_closure` refers to the static method
+        self._add_transitive_closure = add_transitive_closure
 
         self.duplicates = duplicates_dict if duplicates_dict is not None else defaultdict(lambda: defaultdict(bool))
         if duplicates_list is not None:
@@ -185,6 +187,7 @@ class ParaphraseMiningEvaluator(BaseEvaluator):
 
         # Compute F1 score and Average Precision
         n_extract = n_correct = 0
+        previous_correct = 0
         threshold = 0
         best_f1 = best_recall = best_precision = 0
 
@@ -199,15 +202,19 @@ class ParaphraseMiningEvaluator(BaseEvaluator):
             n_extract += 1
             if self.duplicates[id1][id2] or self.duplicates[id2][id1]:
                 n_correct += 1
+            if idx + 1 < len(pairs_list) and pairs_list[idx + 1][0] == score:
+                continue
+            if n_correct > previous_correct:
                 precision = n_correct / n_extract
                 recall = n_correct / self.total_num_duplicates if self.total_num_duplicates > 0 else 0.0
                 f1 = 2 * precision * recall / (precision + recall)
-                average_precision += precision
+                average_precision += precision * (n_correct - previous_correct)
                 if f1 > best_f1:
                     best_f1 = f1
                     best_precision = precision
                     best_recall = recall
                     threshold = (pairs_list[idx][0] + pairs_list[min(idx + 1, len(pairs_list) - 1)][0]) / 2
+            previous_correct = n_correct
 
         average_precision = average_precision / self.total_num_duplicates if self.total_num_duplicates > 0 else 0
 
@@ -270,7 +277,7 @@ class ParaphraseMiningEvaluator(BaseEvaluator):
 
     def get_config_dict(self):
         config_dict = {
-            "add_transitive_closure": self.add_transitive_closure,
+            "add_transitive_closure": self._add_transitive_closure,
             "max_pairs": self.max_pairs,
             "top_k": self.top_k,
         }

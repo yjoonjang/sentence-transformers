@@ -10,7 +10,7 @@ from sentence_transformers.sparse_encoder.model import SparseEncoder
 
 
 class SparseCoSENTLoss(CoSENTLoss):
-    def __init__(self, model: SparseEncoder, scale: float = 20.0, similarity_fct=util.cos_sim) -> None:
+    def __init__(self, model: SparseEncoder, scale: float = 20.0, similarity_fct=util.pairwise_cos_sim) -> None:
         """
         This class implements CoSENT (Cosine Sentence).
         It expects that each of the inputs consists of a pair of inputs (e.g., texts) and a float valued label,
@@ -18,9 +18,9 @@ class SparseCoSENTLoss(CoSENTLoss):
 
         It computes the following loss function:
 
-        ``loss = logsum(1+exp(s(i,j)-s(k,l))+exp...)``, where ``(i,j)`` and ``(k,l)`` are any of the input pairs in the
-        batch such that the expected similarity of ``(i,j)`` is greater than ``(k,l)``. The summation is over all possible
-        pairs of input pairs in the batch that match this condition.
+        ``loss = log(1 + sum(exp(scale * (s(k,l) - s(i,j)))))``, where ``s`` is the score returned by
+        ``similarity_fct``. The sum is over all pairs of input pairs in the batch such that the similarity label of
+        ``(i,j)`` is greater than that of ``(k,l)``.
 
         Args:
             model: SparseEncoder

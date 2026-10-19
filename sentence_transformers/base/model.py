@@ -3,14 +3,19 @@ from __future__ import annotations
 import importlib
 import inspect
 import json
+import math
 import os
+import pickle
+import queue
 import shutil
 import sys
 import tempfile
 import traceback
 from abc import ABC, abstractmethod
 from collections import OrderedDict
-from collections.abc import Sequence
+from collections.abc import Callable, Mapping, Sequence
+from functools import cached_property
+from itertools import chain
 from multiprocessing import Queue
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
@@ -27,27 +32,32 @@ import transformers
 from huggingface_hub import CardData, HfApi
 from packaging import version
 from torch import Tensor, nn
+from tqdm.autonotebook import trange
 from transformers import PreTrainedModel, is_datasets_available, is_torch_npu_available
 from transformers.dynamic_module_utils import get_relative_import_files
 from transformers.utils import logging as transformers_logging
 
 from sentence_transformers import __version__
 from sentence_transformers.base.evaluation import BaseEvaluator
-from sentence_transformers.base.modality import infer_batch_modality, raise_unsupported_modality_error
+from sentence_transformers.base.modality import infer_batch_modality, is_message_dict, raise_unsupported_modality_error
 from sentence_transformers.base.modality_types import Modality, PairInput, SingleInput
 from sentence_transformers.base.model_card import BaseModelCardData, generate_model_card
 from sentence_transformers.base.modules import Module, Router, Transformer
 from sentence_transformers.base.peft_mixin import PeftAdapterMixin
 from sentence_transformers.util import (
+    _move_tensors_to_cpu,
+    check_version_requirements,
     get_device_name,
     import_module_class,
     load_dir_path,
     load_file_path,
     save_to_hub_args_decorator,
 )
+from sentence_transformers.util.file_io import _resolve_model_revision, _validate_relative_path
 from sentence_transformers.util.misc import ORIGINAL_TRANSFORMER_MODELS
 
 if TYPE_CHECKING:
+    from accelerate.hooks import ModelHook
     from transformers import PretrainedConfig
 
 logger = transformers_logging.get_logger(__name__)
@@ -75,14 +85,19 @@ class BaseModel(nn.Sequential, PeftAdapterMixin, ABC):
     # The default Hugging Face organization to prepend to short model names.
     default_huggingface_organization: str | None = None
     # Default prompts to initialize for new model instances. Use None as the value for prompts
-    # that should be filled by the saved model config; empty string "" means intentionally blank.
+    # that should be filled by the saved model config. Empty string "" means intentionally blank.
     _default_prompts: dict[str, str | None] = {}
     # The placeholder model ID in model card templates that gets replaced with the actual model ID.
     _model_card_model_id_placeholder: str = "sentence_transformers_model_id"
     # The archetype identifier written to `config_sentence_transformers.json` and used to
     # discriminate which loader path runs (see `_load_modules`). Subclasses inherit the
-    # archetype value by default; override on a subclass to opt out of that identity.
+    # archetype value by default. Override on a subclass to opt out of that identity.
     model_type: str
+    # Set per instance by `_load_with_module_classes` before `__init__` runs the loading, never mutated.
+    _module_classes: Mapping[str, type[nn.Module]] = {}
+    _distributed_inference: Callable | None = None
+    # The `device_map` this model was loaded with, if any. Set per instance by `__init__`.
+    _device_map: str | dict[str, Any] | None = None
 
     def __init__(
         self,
@@ -113,7 +128,8 @@ class BaseModel(nn.Sequential, PeftAdapterMixin, ABC):
             modules (list[nn.Module], optional): A list of torch modules that are called sequentially. Can be used
                 to create custom models from scratch. Defaults to None.
             device (str, optional): Device (like ``"cuda"``, ``"cpu"``, ``"mps"``, ``"npu"``) that should be used
-                for computation. If None, checks if a GPU can be used. Defaults to None.
+                for computation. If None, checks if a GPU can be used. If a ``device_map`` is provided via
+                ``model_kwargs``, that controls device placement and this argument is ignored. Defaults to None.
             prompts (dict[str, str], optional): A dictionary with prompts for the model. The key is the prompt
                 name, the value is the prompt text. The prompt text will be prepended before any text during inference.
                 For example: ``{"query": "query: ", "passage": "passage: "}``. If a model has saved prompts, you
@@ -130,8 +146,9 @@ class BaseModel(nn.Sequential, PeftAdapterMixin, ABC):
                 a commit id, for a stored model on Hugging Face. Defaults to None.
             local_files_only (bool, optional): Whether to only look at local files (i.e., do not try to download
                 the model). Defaults to False.
-            token (bool or str, optional): Hugging Face authentication token to download private models.
-                Defaults to None.
+            token (bool or str, optional): Hugging Face authentication token for higher Hub rate limits and access to
+                private or gated models your account can read. Defaults to None, which uses ``HF_TOKEN`` or
+                credentials saved with ``hf auth login``, if available.
             model_kwargs (dict[str, Any], optional): Keyword arguments passed to the underlying Hugging Face
                 Transformers model via ``AutoModel.from_pretrained``. Particularly useful options include:
 
@@ -142,7 +159,10 @@ class BaseModel(nn.Sequential, PeftAdapterMixin, ABC):
                   ``"sdpa"``, or ``"flash_attention_2"``. If you ``pip install kernels``, then
                   ``"flash_attention_2"`` should work without having to install ``flash_attn``. It is
                   frequently the fastest option. Defaults to ``"sdpa"`` when available (torch>=2.1.1).
-                - ``device_map``: Device map for model parallelism, e.g. ``"auto"``.
+                - ``device_map``: Controls how the model is placed across devices, e.g. ``"auto"`` for
+                  model parallelism, or a single device like ``"cuda:1"`` to load the backbone directly
+                  onto one GPU (useful when serving multiple models in one process). When set, it takes
+                  precedence over the ``device`` argument.
                 - ``provider``: For ``backend="onnx"``, the ONNX execution provider
                   (e.g. ``"CUDAExecutionProvider"``).
                 - ``file_name``: For ``backend="onnx"`` or ``"openvino"``, the filename to load
@@ -183,10 +203,16 @@ class BaseModel(nn.Sequential, PeftAdapterMixin, ABC):
         if cache_folder is None:
             cache_folder = os.getenv("SENTENCE_TRANSFORMERS_HOME")
 
-        # Determine device
-        if device is None:
+        # A `device_map` in `model_kwargs` makes accelerate control placement (not `device`), so we detect it
+        # here to skip the `self.to(device)` below that would otherwise pull a `device_map="cuda:1"` model to cuda:0.
+        device_map = None
+        if backend == "torch" and model_name_or_path and model_kwargs:
+            device_map = model_kwargs.get("device_map")
+        if device is None and device_map is None:
             device = get_device_name()
             logger.info(f"No device provided, using {device}")
+        elif device is not None and device_map is not None:
+            logger.warning(f"Ignoring `device={device}` because `model_kwargs['device_map']` takes priority.")
 
         if device == "hpu" and importlib.util.find_spec("optimum") is not None:
             from optimum.habana.transformers.modeling_utils import adapt_transformers_to_gaudi
@@ -194,7 +220,13 @@ class BaseModel(nn.Sequential, PeftAdapterMixin, ABC):
             adapt_transformers_to_gaudi()
 
         # Load model
-        if model_name_or_path and not os.path.exists(model_name_or_path):
+        if model_name_or_path and not os.path.isdir(model_name_or_path):
+            if os.path.isfile(model_name_or_path):
+                raise NotADirectoryError(
+                    f"Path {model_name_or_path} is a file, not a directory. `model_name_or_path` must be a "
+                    f"local directory containing a model, or a Hugging Face Hub model ID."
+                )
+
             # Not a local path, load from hub
             if (os.sep == "\\" and "\\" in model_name_or_path) or model_name_or_path.count("/") > 1:
                 raise FileNotFoundError(f"Path {model_name_or_path} not found")
@@ -206,6 +238,19 @@ class BaseModel(nn.Sequential, PeftAdapterMixin, ABC):
             ):
                 model_name_or_path = f"{self.default_huggingface_organization}/{model_name_or_path}"
 
+            revision = _resolve_model_revision(
+                model_name_or_path,
+                revision,
+                token=token,
+                cache_folder=cache_folder,
+                local_files_only=local_files_only,
+            )
+
+        if model_name_or_path and modules is not None:
+            logger.warning(
+                "Both `model_name_or_path` and `modules` were provided. The modules are loaded from "
+                "`model_name_or_path`, so the `modules` argument is ignored."
+            )
         if model_name_or_path:
             modules, self.module_kwargs = self._load_modules(
                 model_name_or_path,
@@ -230,23 +275,79 @@ class BaseModel(nn.Sequential, PeftAdapterMixin, ABC):
 
         super().__init__(modules)
 
-        # Cast non-input modules to match the first module's dtype for consistency.
-        # The first module (e.g. Transformer) is the dtype source of truth and downstream
-        # modules (Dense, Pooling, etc.) should match it.
-        first_param = next(self[0].parameters(), None)
-        if first_param is not None:
-            first_dtype = first_param.dtype
-            for module in list(self.children())[1:]:
-                module.to(first_dtype)
-
-        self.to(device)
+        self._device_map = device_map
+        self._modules_placed = False
+        if self._placement_is_delegated:
+            self._place_modules()
+        else:
+            first_param = next(self[0].parameters(), None)
+            if first_param is not None:
+                for module in list(self.children())[1:]:
+                    module.to(first_param.dtype)
+            self.to(device)
         self.is_hpu_graph_enabled = False
+
+        requested_dtype = (model_kwargs or {}).get("dtype") or (model_kwargs or {}).get("torch_dtype")
+        config_dtype = (config_kwargs or {}).get("dtype") or (config_kwargs or {}).get("torch_dtype")
+        if (
+            model_name_or_path
+            and backend == "torch"
+            and requested_dtype in (None, "auto")
+            and config_dtype in (None, "auto")
+            and self.transformers_model is not None
+            and self.dtype in (torch.float16, torch.bfloat16)
+            and self.device.type == "cpu"
+            and all(parameter.device.type == "cpu" for parameter in self.parameters())
+        ):
+            logger.warning_once(
+                f"This model was loaded in {self.dtype} on CPU. Depending on your CPU, inference may be significantly "
+                "slower than with torch.float32. Consider comparing inference speeds by loading with "
+                '`model_kwargs={"dtype": torch.float32}`.'
+            )
 
         # Validate prompts after model loading (which may have merged config prompts)
         self._validate_prompts()
 
         # Pass the model to the model card data for later use
         self.model_card_data.register_model(self)
+
+        self._post_init()
+
+    @classmethod
+    def _load_with_module_classes(
+        cls, model_name_or_path: str, module_classes: Mapping[str, type[nn.Module]], **kwargs: Any
+    ) -> Self:
+        """
+        Load a saved model, resolving the ``modules.json`` types listed in ``module_classes`` to those
+        classes rather than importing them. Types left out resolve as usual, ``trust_remote_code`` gate
+        included.
+
+        Private on purpose: for models the normal path cannot reload (one that is already in memory, or a
+        repository whose stale custom code would break a ``trust_remote_code=True`` reload now that
+        ``transformers`` integrates the architecture natively), not as a way around the flag.
+
+        Args:
+            model_name_or_path: Hub repo id or local directory to load the model from.
+            module_classes: Maps a ``modules.json`` ``type`` to an already imported class.
+            **kwargs: Passed on to the model's ``__init__``.
+
+        Returns:
+            The loaded model.
+        """
+        model = cls.__new__(cls)
+        # Must precede __init__, which is what reads modules.json and resolves the class refs.
+        model._module_classes = module_classes
+        model.__init__(model_name_or_path, **kwargs)
+        return model
+
+    def _post_init(self) -> None:
+        """Final construction step, called at the end of ``__init__``: fires every module's
+        :meth:`~sentence_transformers.base.modules.Module.on_model_ready` hook. Families override
+        it to run extra construction work first (e.g. legacy checkpoint fixups that add or replace
+        modules) and then call ``super()._post_init()``."""
+        for module in self._modules.values():
+            if isinstance(module, Module):
+                module.on_model_ready(self)
 
     def _validate_prompts(self) -> None:
         """Validate prompt configuration and log prompt information."""
@@ -266,8 +367,8 @@ class BaseModel(nn.Sequential, PeftAdapterMixin, ABC):
         if self.default_prompt_name:
             logger.warning_once(
                 f"Default prompt name is set to '{self.default_prompt_name}'. "
-                f"This prompt will be applied to all inference calls, except if "
-                f"a `prompt` or `prompt_name` parameter is provided."
+                "This prompt applies unless overridden by `prompt`, `prompt_name`, or a method-specific prompt, "
+                "including an empty prompt."
             )
 
     def _resolve_prompt(self, prompt: str | None, prompt_name: str | None) -> str | None:
@@ -406,7 +507,7 @@ class BaseModel(nn.Sequential, PeftAdapterMixin, ABC):
             return input_module.can_flatten_inputs
         if isinstance(input_module, Router):
             for route in input_module.sub_modules.values():
-                # Each route is nn.Sequential; the first child is the Transformer
+                # Each route is nn.Sequential. The first child is the Transformer
                 first_in_route = next(iter(route.children()), None)
                 if not isinstance(first_in_route, Transformer) or not first_in_route.can_flatten_inputs:
                     return False
@@ -444,7 +545,7 @@ class BaseModel(nn.Sequential, PeftAdapterMixin, ABC):
 
         # Text pair or non-text pair
         if isinstance(sample, (tuple, list)):
-            if sample and not (isinstance(sample[0], dict) and "role" in sample[0]):
+            if sample and not is_message_dict(sample[0]):
                 return sum(BaseModel._input_length(s) for s in sample)
 
         # Dict inputs: audio/video wrappers, messages, multimodal dicts
@@ -498,9 +599,24 @@ class BaseModel(nn.Sequential, PeftAdapterMixin, ABC):
             input = module(input, **module_kwargs)
         return input
 
+    def compile(self, *args, **kwargs) -> None:
+        """
+        Compile the model's forward pass with :func:`torch.compile` to speed up inference.
+
+        All arguments are forwarded to :func:`torch.compile`. Inference (e.g. ``encode()`` or ``predict()``) runs
+        the forward pass by calling the model, so compiling the model speeds up these calls.
+
+        .. tip::
+
+            Pass ``dynamic=True`` for inputs with variable sequence lengths, so one compiled kernel handles any
+            length. Explicit ``dynamic=False`` recompiles the model for every new sequence length, which adds
+            significant overhead.
+        """
+        return super().compile(*args, **kwargs)
+
     def preprocess(
         self,
-        inputs: list[SingleInput | PairInput],
+        inputs: Sequence[SingleInput | PairInput],
         prompt: str | None = None,
         **kwargs,
     ) -> dict[str, Tensor | Any]:
@@ -508,7 +624,7 @@ class BaseModel(nn.Sequential, PeftAdapterMixin, ABC):
         Preprocesses the inputs for the model.
 
         Args:
-            inputs (list[SingleInput | PairInput]): A list of inputs to be preprocessed. Each input can be a
+            inputs (Sequence[SingleInput | PairInput]): A list of inputs to be preprocessed. Each input can be a
                 string, dict, tuple, PIL Image, numpy array, torch Tensor, or other supported modality.
                 If a single input is provided, it must be wrapped in a list.
             prompt (str, optional): A prompt string to prepend to text inputs. Defaults to None.
@@ -569,11 +685,17 @@ class BaseModel(nn.Sequential, PeftAdapterMixin, ABC):
         """
         Check if the input represents a single example or a batch of examples.
 
+        A list is the batch axis, with one exception: a conversation (a list of role/content
+        message dicts) is a single example, matching how chat templates read a message list.
+        A batch of single messages can be passed as one-turn conversations, e.g. ``[[msg]]``.
+
         Args:
             inputs: The input to check.
         Returns:
             bool: True if the input is a single example, False if it is a batch.
         """
+        if isinstance(inputs, list) and inputs and is_message_dict(inputs[0]):
+            return True
         list_types = (list, tuple)
         if is_datasets_available():
             try:
@@ -866,6 +988,8 @@ class BaseModel(nn.Sequential, PeftAdapterMixin, ABC):
 
         Args:
             repo_id (str): Repository name for your model in the Hub, including the user or organization.
+            organization (str, optional): DEPRECATED, include the organization in ``repo_id`` instead
+                (e.g. ``"organization/repo_id"``).
             token (str, optional): An authentication token (See https://huggingface.co/settings/token)
             private (bool, optional): Set to true, for hosting a private model
             safe_serialization (bool, optional): If true, save the model using safetensors. If false, save the model the traditional PyTorch way
@@ -1075,7 +1199,7 @@ This pull request has been automatically generated to add {self.__class__.__name
             logger.info(f"Loading {self.model_type} model from {model_name_or_path}.")
             return self._load_config_modules(model_name_or_path, **load_kwargs)
 
-        logger.info(f"Converting {model_type_being_loaded} model {model_name_or_path} to {self.model_type}.")
+        logger.warning(f"Converting {model_type_being_loaded} model {model_name_or_path} to {self.model_type}.")
         return self._load_converted_modules(model_name_or_path, **load_kwargs, model_type=model_type_being_loaded)
 
     @abstractmethod
@@ -1150,6 +1274,9 @@ This pull request has been automatically generated to add {self.__class__.__name
             with open(config_sentence_transformers_json_path, encoding="utf8") as fIn:
                 model_config = json.load(fIn)
 
+            # Fail before any modules are loaded if the environment doesn't meet the author's requirements
+            check_version_requirements(model_config.get("requirements"), source=model_name_or_path)
+
             if (
                 "__version__" in model_config
                 and "sentence_transformers" in model_config["__version__"]
@@ -1162,7 +1289,7 @@ This pull request has been automatically generated to add {self.__class__.__name
 
             self._parse_model_config(model_config)
 
-        # Check if a readme exists. README is optional metadata; a transient Hub error
+        # Check if a readme exists. README is optional metadata. A transient Hub error
         # here shouldn't block model loading.
         try:
             model_card_path = load_file_path(
@@ -1198,11 +1325,14 @@ This pull request has been automatically generated to add {self.__class__.__name
         with open(modules_json_path, encoding="utf8") as fIn:
             modules_config = json.load(fIn)
 
+        for module_config in modules_config:
+            _validate_relative_path(module_config["path"])
+
         modules = OrderedDict()
         module_kwargs = OrderedDict()
         for module_config in modules_config:
             class_ref = module_config["type"]
-            module_class: Module = self._load_module_class_from_ref(
+            module_class: type[Module] = self._load_module_class_from_ref(
                 class_ref,
                 model_name_or_path,
                 trust_remote_code,
@@ -1221,8 +1351,8 @@ This pull request has been automatically generated to add {self.__class__.__name
             if len(load_signature.parameters) == 1:
                 signature = inspect.signature(module_class.__init__)
                 # Detect Transformer-based modules by checking for model/config kwargs in __init__.
-                # Old custom modules (e.g. jinaai/jina-embeddings-v3) use model_args/config_args;
-                # new-style modules use model_kwargs/config_kwargs.
+                # Old custom modules (e.g. jinaai/jina-embeddings-v3) use model_args/config_args.
+                # New-style modules use model_kwargs/config_kwargs.
                 init_params = set(signature.parameters)
                 uses_old_names = {"model_args", "config_args", "tokenizer_args"} & init_params
                 uses_new_names = {"model_kwargs", "config_kwargs"} <= init_params
@@ -1277,6 +1407,14 @@ This pull request has been automatically generated to add {self.__class__.__name
                     module = module_class.load(local_path)
 
             else:
+                # Only pass a non-empty init_defaults: third-party load() overrides without **kwargs would fail
+                extra_load_kwargs: dict[str, Any] = {}
+                if init_defaults := self._get_module_init_defaults(class_ref):
+                    extra_load_kwargs["init_defaults"] = init_defaults
+                # Modules that resolve class refs of their own (Router) opt in by declaring the parameter
+                if self._module_classes and "module_classes" in load_signature.parameters:
+                    extra_load_kwargs["module_classes"] = self._module_classes
+
                 # Newer modules that support the new loading method are loaded with the new style
                 # i.e. with many keyword arguments that can optionally be used by the modules
                 module = module_class.load(
@@ -1293,6 +1431,7 @@ This pull request has been automatically generated to add {self.__class__.__name
                     processor_kwargs=processor_kwargs,
                     config_kwargs=config_kwargs,
                     backend=self.backend,
+                    **extra_load_kwargs,
                 )
 
             modules[module_config["name"]] = module
@@ -1336,6 +1475,15 @@ This pull request has been automatically generated to add {self.__class__.__name
         config_kwargs: dict[str, Any] | None = None,
         model_type: str | None = None,
     ) -> tuple[list[nn.Module] | OrderedDict[str, nn.Module], dict[str, Any]]:
+        """Load a save of a different model type by building this class's default modules on top of it.
+
+        The source's ``config_sentence_transformers.json`` is deliberately not parsed: this path
+        replaces the source's modules with this family's defaults, so its inference-time settings
+        (``prompts``, ``default_prompt_name``, ``similarity_fn_name``) no longer describe the loaded
+        model and would silently misapply, e.g. a reranker's default prompt prepended to every
+        ``encode`` call. Subclass overrides that reuse the saved modules instead (the
+        SentenceTransformer branches of SparseEncoder and MultiVectorEncoder) do keep those settings.
+        """
         return self._load_default_modules(
             model_name_or_path,
             token=token,
@@ -1394,6 +1542,18 @@ This pull request has been automatically generated to add {self.__class__.__name
             # Older SentenceTransformer models won't have "model_type", so those default to "SentenceTransformer"
             return config.get("model_type", "SentenceTransformer")
 
+    def _get_module_init_defaults(self, class_ref: str) -> dict[str, Any]:
+        """Hook for subclasses to inject extra defaults into a module's ``__init__`` at load time.
+
+        Returned kwargs are forwarded to ``module_class.load(..., init_defaults=...)`` and applied
+        with ``setdefault`` priority: saved config wins, so this only fills keys the saved config
+        omitted. Used by :class:`~sentence_transformers.multi_vector_encoder.model.MultiVectorEncoder` to flip the
+        ``query_expansion`` / ``query_length`` / ``document_length`` knobs on for the backbone
+        Transformer when promoting a dense SentenceTransformer or PyLate v3 checkpoint, without
+        post-init ``setattr`` + re-validation. Base implementation returns ``{}``.
+        """
+        return {}
+
     def _load_module_class_from_ref(
         self,
         class_ref: str,
@@ -1404,9 +1564,9 @@ This pull request has been automatically generated to add {self.__class__.__name
         token: bool | str | None = None,
         cache_folder: str | None = None,
         local_files_only: bool = False,
-    ) -> nn.Module:
+    ) -> type:
         """
-        Load a module class from a class reference string.
+        Load a module class from a class reference string, preferring a class supplied via ``module_classes``.
 
         Args:
             class_ref: The class reference string (e.g., "sentence_transformers.sentence_transformer.modules.Pooling")
@@ -1421,6 +1581,9 @@ This pull request has been automatically generated to add {self.__class__.__name
         Returns:
             The module class
         """
+        if module_class := self._module_classes.get(class_ref):
+            return module_class
+
         code_revision = model_kwargs.pop("code_revision", None) if model_kwargs else None
         return import_module_class(
             class_ref,
@@ -1453,38 +1616,182 @@ This pull request has been automatically generated to add {self.__class__.__name
         # Propagate the gradient checkpointing to the transformer model
         for module in self.modules():
             if module is not self and hasattr(module, "gradient_checkpointing_enable"):
+                if getattr(module, "supports_gradient_checkpointing", True) is False:
+                    # e.g. a `*ForRetrieval` wrapper that doesn't declare support while its inner
+                    # model does: skip it so the supporting submodules still enable checkpointing.
+                    logger.warning_once(
+                        f"{type(module).__name__} does not support gradient checkpointing, skipping it."
+                    )
+                    continue
                 try:
                     module.gradient_checkpointing_enable(gradient_checkpointing_kwargs)
                 except TypeError:
                     module.gradient_checkpointing_enable()
 
+    def _place_modules(self) -> None:
+        """Align auxiliary modules without changing backbones or dispatched submodules."""
+        device = self.device
+        first_param = next(self[0].parameters(), None)
+        dtype = first_param.dtype if first_param is not None else None
+        modules = list(self.modules())
+        protected: set[nn.Module] = set()
+
+        def collect_hook(module: nn.Module, hook: ModelHook | None) -> None:
+            if getattr(hook, "execution_device", None) is not None:
+                if getattr(hook, "place_submodules", True):
+                    protected.update(module.modules())
+                else:
+                    protected.add(module)
+            for child in getattr(hook, "hooks", ()):
+                collect_hook(module, child)
+
+        for module in modules:
+            if self._device_map is not None and isinstance(module, Transformer):
+                protected.update(module.model.modules())
+            elif self._device_map is not None and isinstance(module, PreTrainedModel):
+                protected.update(module.modules())
+            collect_hook(module, module.__dict__.get("_hf_hook"))
+
+        def convert(tensor: Tensor) -> Tensor:
+            return tensor.to(device=device, dtype=dtype if tensor.is_floating_point() or tensor.is_complex() else None)
+
+        for module in reversed(modules):
+            if module not in protected:
+                if isinstance(module, BaseModel):
+                    super(BaseModel, module)._apply(convert, recurse=False)
+                else:
+                    module._apply(convert, recurse=False)
+
+    @torch.inference_mode(False)
+    def _resolve_inference_device(self, device: int | str | torch.device | None) -> torch.device:
+        """Resolve the input device and skip redundant or delegated model moves.
+
+        Delegated models align auxiliary modules during construction and again on first inference
+        to include modules added afterward. Finish assembling the model before that inference call,
+        or clear the placement cache to prepare it again.
+        """
+        if self._placement_is_delegated:
+            if device is not None:
+                override = (
+                    "To choose the device yourself, reload the model without a `device_map` or Accelerate hooks."
+                    if self._accelerate_placement_hook is not None
+                    else "Use `model.to(device)` to override it."
+                )
+                logger.warning_once(
+                    f"Ignoring `device={device}`, as a device map or Accelerate hooks control "
+                    f"this model's placement. {override}"
+                )
+            if not self._modules_placed:
+                self._place_modules()
+                self._modules_placed = True
+            return self.device
+
+        if device is None:
+            device = self.device
+            target_device = device
+        else:
+            # Tensor devices canonicalize aliases such as cpu:0 and an unindexed cuda device.
+            target_device = torch.empty(0, device=device).device
+        if any(tensor.device != target_device for tensor in chain(self.parameters(), self.buffers())):
+            self.to(device)
+        return target_device
+
+    def to(self, *args: Any, **kwargs: Any) -> Self:
+        """Move and/or cast the parameters and buffers, as :meth:`torch.nn.Module.to` does.
+
+        The warning mirrors the one accelerate patches onto the backbone's own ``to``, which the
+        ``nn.Module._apply`` recursion under this call never reaches.
+        """
+        target = args[0] if args else kwargs.get("device", kwargs.get("tensor"))
+        device_requested = target is not None and not isinstance(target, torch.dtype)
+        if device_requested and self._accelerate_placement_hook is not None:
+            logger.warning_once("You shouldn't move a model that is dispatched using accelerate hooks.")
+        result = super().to(*args, **kwargs)
+        if device_requested:
+            self._device_map = None
+        return result
+
+    def cpu(self) -> Self:
+        """Move the model to the CPU and override its saved device map."""
+        result = super().cpu()
+        self._device_map = None
+        return result
+
+    def cuda(self, device: int | torch.device | None = None) -> Self:
+        """Move the model to a CUDA device and override its saved device map."""
+        result = super().cuda(device=device)
+        self._device_map = None
+        return result
+
+    def _apply(self, *args: Any, **kwargs: Any) -> Self:
+        """Apply a function to every parameter and buffer, as :meth:`torch.nn.Module._apply` does.
+
+        accelerate patches ``to`` and ``cuda`` on the backbone to refuse moves that would strand the
+        weights it offloaded, but ``nn.Module._apply`` recurses past those patches, and ``cpu()`` and
+        ``half()`` never reach them at all. Every mover funnels through here, so the guard lives here.
+        """
+        if self._accelerate_placement_hook is not None and any(
+            tensor.device.type == "meta" for tensor in chain(self.parameters(), self.buffers())
+        ):
+            raise RuntimeError("You can't move a model that has some modules offloaded to cpu or disk.")
+        return super()._apply(*args, **kwargs)
+
+    def clear_placement_cache(self) -> None:
+        """Clear the cached Accelerate hook and repeat auxiliary alignment on the next inference.
+
+        Call this after attaching, replacing, or removing Accelerate hooks on an existing model.
+        It also prepares modules added after the first inference call.
+        """
+        self.__dict__.pop("_accelerate_placement_hook", None)
+        self._modules_placed = False
+
+    @cached_property
+    def _accelerate_placement_hook(self) -> ModelHook | None:
+        """The first placement hook, including hooks on ordinary modules and inside SequentialHook."""
+
+        def find_hook(hook: ModelHook | None) -> ModelHook | None:
+            if getattr(hook, "execution_device", None) is not None:
+                return hook
+            for child in getattr(hook, "hooks", ()):
+                if (found := find_hook(child)) is not None:
+                    return found
+            return None
+
+        for module in self.modules():
+            hook = module.__dict__.get("_hf_hook")
+            if hook is not None and (placement_hook := find_hook(hook)) is not None:
+                return placement_hook
+        return None
+
+    @property
+    def _placement_is_delegated(self) -> bool:
+        """Whether a requested device map or live placement hooks control inference placement."""
+        return self._device_map is not None or self._accelerate_placement_hook is not None
+
     @property
     def device(self) -> torch.device:
-        """
-        Get torch.device from module, assuming that the whole module has one device.
-        In case there are no PyTorch parameters, fall back to CPU.
-        """
-        if (transformers_model := self.transformers_model) is not None and hasattr(transformers_model, "device"):
-            return transformers_model.device
+        """Return the execution device, falling back to model tensors and then CPU."""
+        # An offloaded module keeps its parameters on ``meta`` until accelerate streams them in, so the
+        # first parameter is not where the model runs. accelerate resolved that when it dispatched.
+        if (execution_device := getattr(self._accelerate_placement_hook, "execution_device", None)) is not None:
+            return torch.device(execution_device)
 
-        if len(self._modules) and hasattr(self[0], "auto_model") and hasattr(self[0].auto_model, "device"):
-            return self[0].auto_model.device
+        transformers_model = self.transformers_model
+        if (device := getattr(transformers_model, "device", None)) is not None:
+            return device
 
-        try:
-            return next(self.parameters()).device
-        except StopIteration:
-            # Fallback for nn.DataParallel compatibility when parameters() is empty
+        if (parameter := next(self.parameters(), None)) is not None:
+            return parameter.device
+        if (buffer := next(self.buffers(), None)) is not None:
+            return buffer.device
 
-            def find_tensor_attributes(module: nn.Module) -> list[tuple[str, Tensor]]:
-                tuples = [(k, v) for k, v in module.__dict__.items() if torch.is_tensor(v)]
-                return tuples
+        # DataParallel replicas store their weights as ordinary tensor attributes.
+        for module in self.modules():
+            for value in vars(module).values():
+                if torch.is_tensor(value):
+                    return value.device
 
-            gen = self._named_members(get_members_fn=find_tensor_attributes)
-            try:
-                first_tuple = next(gen)
-                return first_tuple[1].device
-            except StopIteration:
-                return torch.device("cpu")
+        return torch.device("cpu")
 
     def start_multi_process_pool(
         self, target_devices: list[str] | None = None
@@ -1505,6 +1812,13 @@ This pull request has been automatically generated to add {self.__class__.__name
         Returns:
             Dict[str, Any]: A dictionary with the target processes, an input queue, and an output queue.
         """
+        if self._accelerate_placement_hook is not None:
+            raise ValueError(
+                "Multi-process encoding places the model on each target device itself, which a model "
+                "dispatched by accelerate does not allow. Load it without a `device_map` to encode "
+                "with a pool."
+            )
+
         if target_devices is None:
             if torch.cuda.is_available():
                 target_devices = [f"cuda:{i}" for i in range(torch.cuda.device_count())]
@@ -1554,27 +1868,116 @@ This pull request has been automatically generated to add {self.__class__.__name
             p.join()
             p.close()
 
+        pool["input"].cancel_join_thread()
         pool["input"].close()
         pool["output"].close()
 
-    def _multi_process(self, *args, **kwargs):
+    def _inference(self, inputs: list, **kwargs) -> Any:
+        """Run local inference on normalized inputs with resolved arguments."""
         raise NotImplementedError("This method should be implemented in subclasses.")
 
-    @staticmethod
+    def _multi_process(
+        self,
+        inputs: Sequence,
+        show_progress_bar: bool | None = True,
+        pool: dict[Literal["input", "output", "processes"], Any] | None = None,
+        device: str | torch.device | list[str | torch.device] | None = None,
+        chunk_size: int | None = None,
+        **kwargs,
+    ) -> list | Tensor:
+        """Run inference in a provided pool or a temporary pool created from a list of devices."""
+        if chunk_size is not None and chunk_size <= 0:
+            raise ValueError(f"chunk_size must be a positive integer, got {chunk_size}.")
+        if not inputs:
+            return []
+        kwargs["show_progress_bar"] = False
+
+        created_pool = False
+        if pool is None and isinstance(device, list):
+            pool = self.start_multi_process_pool(device)
+            created_pool = True
+
+        try:
+            if chunk_size is None:
+                chunk_size = max(1, min(math.ceil(len(inputs) / len(pool["processes"]) / 10), 5000))
+
+            input_queue: Queue = pool["input"]
+            chunk_starts = range(0, len(inputs), chunk_size)
+            num_chunks = len(chunk_starts)
+            for chunk_id, start in enumerate(chunk_starts):
+                input_queue.put([chunk_id, inputs[start : start + chunk_size], kwargs])
+
+            outputs = [None] * num_chunks
+            for _ in trange(num_chunks, desc="Chunks", disable=not show_progress_bar):
+                chunk_id, output = self._get_worker_result(pool)
+                outputs[chunk_id] = output
+
+            for output in outputs:
+                if isinstance(output, Exception):
+                    raise output
+
+            if isinstance(outputs[0], Tensor):
+                return torch.cat(outputs)
+            return [item for chunk in outputs for item in chunk]
+        finally:
+            if created_pool:
+                self.stop_multi_process_pool(pool)
+
+    @classmethod
     def _multi_process_worker(
+        cls,
         target_device: str,
         model: BaseModel,
         input_queue: Queue,
         results_queue: Queue,
     ) -> None:
-        """Worker function for multi-process inference. Must be overridden by subclasses.
+        """Run inference on queued chunks in a worker process.
 
-        This is called as the target function in each spawned process by
-        :meth:`start_multi_process_pool`. Subclasses should implement this to
-        read from ``input_queue``, run inference on ``target_device``, and write
-        results to ``results_queue``.
+        Workers are terminated externally via ``stop_multi_process_pool``.
         """
-        raise NotImplementedError("This method should be implemented in subclasses.")
+        while True:
+            chunk_id, inputs, kwargs = input_queue.get()
+            try:
+                outputs = model._inference(inputs, device=target_device, **kwargs)
+                outputs = _move_tensors_to_cpu(outputs)
+            except Exception as exc:
+                results_queue.put(cls._report_worker_failure(chunk_id, exc, target_device))
+            else:
+                results_queue.put([chunk_id, outputs])
+
+    @staticmethod
+    def _get_worker_result(
+        pool: dict[Literal["input", "output", "processes"], Any], poll_interval: float = 1.0
+    ) -> Any:
+        """Wait for a result, checking for dead workers whenever the queue is empty."""
+        while True:
+            try:
+                return pool["output"].get(timeout=poll_interval)
+            except queue.Empty:
+                pass
+            dead = [p for p in pool["processes"] if not p.is_alive()]
+            if dead:
+                details = ", ".join(f"pid {p.pid} (exit code {p.exitcode})" for p in dead)
+                raise RuntimeError(
+                    f"{len(dead)} multi-process pool worker(s) died unexpectedly: {details}. "
+                    "Stop the pool and start a new one before retrying."
+                )
+
+    @classmethod
+    def _report_worker_failure(cls, chunk_id: int, exc: Exception, target_device: str) -> list[int | Exception]:
+        """Log a chunk that a worker failed to process and build the result to enqueue for it.
+
+        :meth:`_multi_process` blocks for exactly one result per submitted chunk, so a worker that
+        dies without reporting leaves it waiting forever. The queue pickles in a feeder thread
+        after ``put`` returns, so an exception that cannot round-trip is replaced by its formatted
+        traceback rather than being dropped there.
+        """
+        logger.exception(f"Error in {cls.__name__} worker process on {target_device} for chunk {chunk_id}")
+        try:
+            pickle.loads(pickle.dumps(exc))
+        except Exception:
+            exc = RuntimeError("".join(traceback.format_exception(exc)))
+        return [chunk_id, exc]
 
     @property
     def tokenizer(self) -> Any:
@@ -1657,6 +2060,15 @@ This pull request has been automatically generated to add {self.__class__.__name
         """
         underlying = self.transformers_model
         return getattr(underlying, "config", None)
+
+    @config.setter
+    def config(self, value: PretrainedConfig) -> None:
+        """Sets the config on the underlying transformer model.
+        Has no effect if the model has no underlying transformer model.
+        """
+        underlying = self.transformers_model
+        if underlying is not None:
+            underlying.config = value
 
     @property
     def _target_device(self) -> torch.device:

@@ -18,7 +18,7 @@ def main():
     # Set the log level to INFO to get more information
     logging.basicConfig(format="%(asctime)s - %(message)s", datefmt="%Y-%m-%d %H:%M:%S", level=logging.INFO)
     logging.getLogger("httpx").setLevel(logging.WARNING)
-    # mini_batch_size subdivides each batch inside the loss for memory/speed control; the loss sees
+    # mini_batch_size subdivides each batch inside the loss for memory/speed control. The loss sees
     # `train_batch_size * num_docs` pairs, not `train_batch_size`.
     train_batch_size = 16
     eval_batch_size = 16
@@ -119,13 +119,13 @@ def main():
     model.save_pretrained(final_output_dir)
 
     # 9. (Optional) save the model to the Hugging Face Hub!
-    # It is recommended to run `huggingface-cli login` to log into your Hugging Face account first
+    # It is recommended to run `hf auth login` to log into your Hugging Face account first
     try:
         model.push_to_hub(run_name)
     except Exception:
         logging.error(
             f"Error uploading model to the Hugging Face Hub:\n{traceback.format_exc()}To upload it manually, you can run "
-            f"`huggingface-cli login`, followed by loading the model using `model = CrossEncoder({final_output_dir!r})` "
+            f"`hf auth login`, followed by loading the model using `model = CrossEncoder({final_output_dir!r})` "
             f"and saving it using `model.push_to_hub('{run_name}')`."
         )
 

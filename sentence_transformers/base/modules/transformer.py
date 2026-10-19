@@ -2,14 +2,15 @@ from __future__ import annotations
 
 import importlib
 import inspect
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextlib import contextmanager
 from dataclasses import fields
 from typing import TYPE_CHECKING, Any, Literal, TypedDict, get_args, get_type_hints
 
 import torch
 from packaging.version import parse as parse_version
-from tokenizers.normalizers import Lowercase, Sequence
+from tokenizers.normalizers import Lowercase
+from tokenizers.normalizers import Sequence as NormalizerSequence
 from transformers import (
     AutoConfig,
     AutoModel,
@@ -43,6 +44,7 @@ from transformers.utils import ModelOutput
 from transformers.utils import logging as transformers_logging
 from transformers.utils.import_utils import is_peft_available
 from transformers.utils.peft_utils import find_adapter_config_file
+from typing_extensions import NotRequired
 
 from sentence_transformers.backend import load_onnx_model, load_openvino_model
 from sentence_transformers.base.modality import InputFormatter, format_modality, raise_unsupported_modality_error
@@ -105,6 +107,14 @@ except ImportError:
         pass
 
 
+try:
+    from transformers import PaliGemmaProcessor
+except ImportError:
+
+    class PaliGemmaProcessor:
+        pass
+
+
 if TYPE_CHECKING and is_peft_available():
     from peft import PeftConfig
 
@@ -117,8 +127,12 @@ _TRANSFORMERS_APPLY_CHAT_TEMPLATE_RECOMMENDS_PROCESSOR_KWARGS = parse_version(tr
 _TRANSFORMERS_SUPPORTS_USE_BIDIRECTIONAL_ATTENTION = parse_version(transformers_version) >= parse_version("4.56.2")
 _TRANSFORMERS_SUPPORTS_IS_CAUSAL_FALSE = parse_version(transformers_version) >= parse_version("5.2.0")
 
+# The size/output kwargs of apply_chat_template, which a bare tokenizer wants as top-level kwargs.
+_APPLY_CHAT_TEMPLATE_TOP_LEVEL_KWARGS = frozenset({"padding", "truncation", "max_length", "return_tensors"})
+_CHAT_TEMPLATE_SUFFIX_CACHE_SIZE = 256
+
 TransformerTask = Literal[
-    "feature-extraction", "sequence-classification", "text-generation", "any-to-any", "fill-mask"
+    "feature-extraction", "sequence-classification", "text-generation", "any-to-any", "fill-mask", "retrieval"
 ]
 
 
@@ -140,11 +154,51 @@ class ModalityParams(_ModalityParamsRequired, total=False):
 
 ModalityConfig = dict[Modality, ModalityParams]
 
+
+def _resolve_retrieval_model_class(config: PretrainedConfig | PeftConfig) -> type[PreTrainedModel]:
+    """Resolve the concrete ``*ForRetrieval`` class (ColPali, ColQwen2, ...) for ``transformer_task="retrieval"``.
+
+    transformers (as of v5.13) has no ``AutoModelForRetrieval``, and ``MODEL_FOR_RETRIEVAL_MAPPING`` is
+    incomplete (missing ``colqwen2``), so fall back to the checkpoint's ``architectures`` entry.
+    """
+    try:
+        from transformers.models.auto.modeling_auto import MODEL_FOR_RETRIEVAL_MAPPING
+
+        return MODEL_FOR_RETRIEVAL_MAPPING[type(config)]
+    except (ImportError, KeyError):
+        pass
+
+    # PEFT adapter checkpoints carry a PeftConfig without `architectures`: resolve from the base
+    # model's config instead.
+    base_model_name_or_path = getattr(config, "base_model_name_or_path", None)
+    if base_model_name_or_path:
+        return _resolve_retrieval_model_class(AutoConfig.from_pretrained(base_model_name_or_path))
+
+    import transformers
+
+    for architecture in getattr(config, "architectures", None) or []:
+        model_class = getattr(transformers, architecture, None)
+        if model_class is not None:
+            return model_class
+
+    # Remote-code checkpoints (e.g. ColQwen3) define their class in-repo, so only ``auto_map`` can
+    # resolve it. AutoModel still refuses to execute that code without ``trust_remote_code``.
+    if "AutoModel" in (getattr(config, "auto_map", None) or {}):
+        return AutoModel
+
+    raise ValueError(
+        f"Could not resolve a retrieval model class for model_type {getattr(config, 'model_type', None)!r}. "
+        'The transformer_task="retrieval" expects a `*ForRetrieval` architecture, e.g. ColPali, '
+        "ColQwen2 or ColModernVBert."
+    )
+
+
 TRANSFORMER_TASK_TO_AUTO_MODEL: dict[TransformerTask, Any] = {
     "feature-extraction": AutoModel,  # Used by SentenceTransformer, also covers "image-feature-extraction"
     "sequence-classification": AutoModelForSequenceClassification,  # Used by CrossEncoder
     "text-generation": AutoModelForCausalLM,  # Used by CrossEncoder
     "fill-mask": AutoModelForMaskedLM,  # Used by SparseEncoder
+    "retrieval": None,  # Used by MultiVectorEncoder, via _resolve_retrieval_model_class
 }
 
 try:
@@ -180,6 +234,14 @@ TRANSFORMER_TASK_DEFAULTS: dict[TransformerTask, tuple[ModalityConfig, str]] = {
         {"text": {"method": "forward", "method_output_name": "logits"}},
         "token_embeddings",
     ),
+    # `*ForRetrieval` heads return already-projected, already-normalised token embeddings.
+    "retrieval": (
+        {
+            "text": {"method": "forward", "method_output_name": "embeddings"},
+            "image": {"method": "forward", "method_output_name": "embeddings"},
+        },
+        "token_embeddings",
+    ),
 }
 
 # Registry of encoder-decoder architectures whose encoder can be loaded standalone.
@@ -204,8 +266,8 @@ _ENCODER_ONLY_MODELS: list[tuple[type, str, str]] = [
     (MoonshineConfig, "transformers.models.moonshine.modeling_moonshine", "MoonshineEncoder"),
     (WhisperConfig, "transformers.models.whisper.modeling_whisper", "WhisperEncoder"),
     (MarianConfig, "transformers.models.marian.modeling_marian", "MarianEncoder"),
-    # T5Gemma2TextConfig is for loading from an already encoder-only checkpoint;
-    # loading the encoder from a full T5Gemma2Config is handled separately in _load_encoder_only_model.
+    # T5Gemma2TextConfig is for loading from an already encoder-only checkpoint.
+    # Loading the encoder from a full T5Gemma2Config is handled separately in _load_encoder_only_model.
     (T5Gemma2TextConfig, "transformers.models.t5gemma2.modeling_t5gemma2", "T5Gemma2Encoder"),
 ]
 
@@ -314,7 +376,7 @@ _FEATURE_EXTRACTION_EDGE_CASES: dict[str, tuple[ModalityConfig, str, bool]] = {
         "token_embeddings",
         False,
     ),
-    # Audio encoder models; we load only the encoder, so text decoding is not available
+    # Audio encoder models: we load only the encoder, so text decoding is not available
     "hubert": _AUDIO_MODALITY_CONFIG,
     "moonshine": _AUDIO_MODALITY_CONFIG,
     "sew": _AUDIO_MODALITY_CONFIG,
@@ -416,7 +478,7 @@ def _has_lowercase(normalizer) -> bool:
         return False
     if isinstance(normalizer, Lowercase):
         return True
-    if isinstance(normalizer, Sequence):
+    if isinstance(normalizer, NormalizerSequence):
         return any(isinstance(n, Lowercase) for n in normalizer)
     return False
 
@@ -438,7 +500,8 @@ class ProcessingKwargs(TypedDict, total=False):
 
     Valid keys: ``"common"``, ``"text"``, ``"audio"``, ``"image"``, ``"video"``, ``"chat_template"``.
     Modality and ``"common"`` kwargs override built-in defaults. ``"chat_template"`` kwargs are
-    forwarded to ``apply_chat_template``.
+    forwarded to ``apply_chat_template``, except the Sentence Transformers ``restore_suffix`` flag.
+    ``text.logits_to_keep`` is passed to the causal model instead (default 1, 0 for all token logits).
     """
 
     common: dict[str, Any]
@@ -449,13 +512,94 @@ class ProcessingKwargs(TypedDict, total=False):
     chat_template: dict[str, Any]
 
 
+class QueryExpansionConfig(TypedDict):
+    """ColBERT-style query expansion config. When set, :meth:`Transformer.preprocess` expands every
+    ``task="query"`` batch, regardless of the downstream modules: only meaningful with a
+    :class:`MultiVectorMask` downstream (which scores the expansion positions), so leave it ``None``
+    for dense / sparse / cross-encoder pipelines. Keys:
+
+    * ``strategy``:
+
+      - ``"fixed"`` (classic ColBERT): every query leaves preprocessing at exactly ``length``
+        tokens. Shorter queries are padded up to ``length`` and the pads swapped for ``token``
+        (defaults to the tokenizer's ``mask_token``), longer queries are truncated down to it.
+        ``length`` is both the floor and the ceiling: for query batches it overrides
+        ``Transformer.query_length``.
+      - ``"min"``: ``length`` is only the floor. Shorter queries are expanded exactly like
+        ``"fixed"``, longer queries pass through untruncated instead of silently losing content.
+        ``Transformer.query_length`` (or a trainer ``max_length`` override) still applies as the
+        ceiling. On corpora where queries stay under ``length``, ``"min"`` and ``"fixed"`` produce
+        identical batches.
+
+    * ``attend``: whether the encoder attends to the expansion positions. ``False`` (default,
+      classic ColBERT) leaves them at ``attention_mask=0``: the encoder skips them in the forward
+      pass, MaxSim still scores them, and they soak up query context via the asymmetric attention
+      mask. ``True`` forces ``attention_mask=1`` so the encoder also attends to them, matching
+      PyLate's ``attend_to_expansion_tokens``. Used by some ColBERT variants.
+
+    * ``token``: defaults to the tokenizer's ``mask_token``.
+
+    * ``length``: pad target (total tokens after expansion, the width floor). **Required**
+      (classic ColBERT uses 32).
+
+    Query expansion exists for classic mask-token checkpoints (PyLate / Stanford-NLP ColBERT):
+    their attention-mask surgery and fixed-length pad target cannot be expressed in a chat
+    template. Modern chat-template backbones (the colpali-engine ColQwen / ColGemma / ColIdefics
+    families) should instead own their query augmentation in the checkpoint's chat template,
+    which receives the ``task`` kwarg and can e.g. append the family's suffix tokens for
+    ``task == "query"`` renders.
+    """
+
+    strategy: Literal["fixed", "min"]
+    attend: NotRequired[bool]
+    token: NotRequired[str | None]
+    length: NotRequired[int]
+
+
+_VALID_QUERY_EXPANSION_KEYS: set[str] = {"strategy", "attend", "token", "length"}
+_VALID_QUERY_EXPANSION_STRATEGIES: tuple[str, ...] = ("fixed", "min")
+
+
+def _normalize_query_expansion(
+    query_expansion: QueryExpansionConfig | None,
+) -> QueryExpansionConfig | None:
+    """Validate the dict, fill defaults, and return a fully-populated config (or ``None`` for the
+    no-expansion case).
+    """
+    if query_expansion is None:
+        return None
+    unknown = set(query_expansion) - _VALID_QUERY_EXPANSION_KEYS
+    if unknown:
+        raise ValueError(
+            f"query_expansion has unknown keys {sorted(unknown)!r}. "
+            f"Valid keys: {sorted(_VALID_QUERY_EXPANSION_KEYS)!r}."
+        )
+    strategy = query_expansion.get("strategy")
+    if strategy not in _VALID_QUERY_EXPANSION_STRATEGIES:
+        raise ValueError(
+            f"query_expansion['strategy'] must be one of {_VALID_QUERY_EXPANSION_STRATEGIES!r}, got {strategy!r}."
+        )
+    attend = query_expansion.get("attend", False)
+    if not isinstance(attend, bool):
+        raise ValueError(f"query_expansion['attend'] must be a bool, got {attend!r}.")
+    token = query_expansion.get("token")
+    normalized: QueryExpansionConfig = {"strategy": strategy, "attend": attend, "token": token}
+    length = query_expansion.get("length")
+    if not isinstance(length, int) or isinstance(length, bool) or length < 1:
+        raise ValueError(
+            f"query_expansion strategy={strategy!r} requires 'length': a positive int specifying "
+            "the pad target (total tokens after expansion). Classic ColBERT uses 32."
+        )
+    normalized["length"] = length
+    return normalized
+
+
 def _count_media_per_sample(messages: list[list[dict[str, Any]]]) -> tuple[list[int], list[int]]:
     """Count images and videos per sample from the message structure.
 
     Some VLM processors flatten per-sample visual tokens into single tensors (e.g.
     ``pixel_values`` shape ``(total_visual_tokens, hidden_dim)``), losing the per-sample
-    association. By counting before the processor call, we get reliable per-sample counts
-    that downstream minibatching can use directly.
+    association. Counting the original messages preserves this association for minibatching.
     """
     num_images: list[int] = []
     num_videos: list[int] = []
@@ -476,6 +620,25 @@ def _count_media_per_sample(messages: list[list[dict[str, Any]]]) -> tuple[list[
         num_images.append(img_count)
         num_videos.append(vid_count)
     return num_images, num_videos
+
+
+# Forward-kwarg filter constants: ST/tokenizer bookkeeping to never forward, plus common kwargs to always allow.
+_NON_MODEL_FEATURE_KEYS = frozenset(
+    {
+        # Sentence Transformers' own bookkeeping.
+        "modality",
+        "num_images_per_sample",
+        "num_videos_per_sample",
+        "prompt_length",
+        "query_expansion_positions",
+        "task",
+        # Tokenizer extras from return_* flags (return_offsets_mapping, etc.), not forward inputs.
+        "offset_mapping",
+        "overflow_to_sample_mapping",
+        "special_tokens_mask",
+    }
+)
+_FORWARD_SAFETY_NET_KEYS = frozenset({"input_ids", "attention_mask", "token_type_ids", "inputs_embeds", "return_dict"})
 
 
 class Transformer(InputModule):
@@ -515,7 +678,8 @@ class Transformer(InputModule):
               ``"sdpa"``, or ``"flash_attention_2"``. If you ``pip install kernels``, then
               ``"flash_attention_2"`` should work without having to install ``flash_attn``. It is
               frequently the fastest option. Defaults to ``"sdpa"`` when available (torch>=2.1.1).
-            - ``device_map``: Device map for model parallelism, e.g. ``"auto"``.
+            - ``device_map``: Controls how the model is placed across devices, e.g. ``"auto"`` for
+              model parallelism, or a single device like ``"cuda:1"`` to load the backbone directly onto one GPU.
             - ``provider``: For ``backend="onnx"``, the ONNX execution provider
               (e.g. ``"CUDAExecutionProvider"``).
             - ``file_name``: For ``backend="onnx"`` or ``"openvino"``, the filename to load
@@ -534,13 +698,18 @@ class Transformer(InputModule):
         config_kwargs (dict[str, Any], optional): Keyword arguments forwarded to
             ``AutoConfig.from_pretrained`` when loading the config. See the `AutoConfig.from_pretrained
             <https://huggingface.co/docs/transformers/en/model_doc/auto#transformers.AutoConfig.from_pretrained>`_
-            documentation for more details. Defaults to None.
+            documentation for more details. Defaults to None. KV caching is disabled on the loaded
+            config and its sub-configs unless explicitly overridden in these kwargs via ``use_cache``.
         processing_kwargs (dict[str, dict[str, Any]], optional): Keyword arguments applied when *calling*
             the processor during preprocessing. This is a nested dict whose keys are modality names
             (``"text"``, ``"audio"``, ``"image"``, ``"video"``), ``"common"`` for kwargs shared across all
             modalities, or ``"chat_template"`` for kwargs forwarded to ``apply_chat_template`` (e.g.
             ``{"add_generation_prompt": True}``). Modality and common kwargs override the built-in defaults.
-            Saved to and loaded from the model configuration file. Defaults to None.
+            ``text.logits_to_keep`` is passed to the causal model instead (default 1, 0 for all token logits).
+            The ``"chat_template"`` dict also accepts ``"restore_suffix"`` (default ``True``), a Sentence
+            Transformers flag: fixed tokens a chat template appends after the content (e.g. an assistant
+            prefill) are restored when truncation drops them, so models that read the final token position
+            keep working. Saved to and loaded from the model configuration file. Defaults to None.
         backend (str, optional): Backend used for model inference. Can be ``"torch"`` (default), ``"onnx"``,
             or ``"openvino"``. Defaults to ``"torch"``.
         modality_config (dict, optional): Custom modality configuration mapping modality names to method and
@@ -554,10 +723,25 @@ class Transformer(InputModule):
             padding for faster inference using flash attention's variable-length functions. Non-text
             inputs (images, audio, video) are always padded normally. If ``None`` (default), unpadding
             is enabled automatically when all prerequisites are met (flash attention with variable-length
-            support, ``"torch"`` backend, ``"feature-extraction"`` task). Set to ``False`` to force
+            support, ``"torch"`` backend, and the ``"feature-extraction"`` or ``"fill-mask"`` task).
+            Set to ``False`` to force
             padding, which is needed for architectures that don't support unpadded inputs (e.g.
-            ``qwen2_vl``). Set to ``True`` to request unpadding explicitly; a warning is logged if the
+            ``qwen2_vl``). Set to ``True`` to request unpadding explicitly. A warning is logged if the
             prerequisites are not met. Defaults to None.
+        query_length (int, optional): Per-task text max-length applied when ``task="query"`` reaches
+            :meth:`preprocess` (e.g. via :meth:`encode_query`). Content-cap only (truncation). ``None``
+            (default) falls back to the tokenizer's ``model_max_length``. Used by ColBERT-style
+            retrieval to cap queries shorter than documents. Not the pad target: query expansion
+            specifies its pad target via ``query_expansion["length"]``, which overrides this (a
+            smaller ``query_length`` raises when the expansion is assigned).
+        document_length (int, optional): Per-task text max-length applied when ``task="document"``
+            reaches :meth:`preprocess`. ``None`` (default) falls back to the tokenizer's
+            ``model_max_length``.
+        query_expansion (QueryExpansionConfig, optional): ColBERT-style query expansion config. See
+            :class:`QueryExpansionConfig`. ``None`` (default) means no expansion. When set, every
+            ``task="query"`` batch is expanded during preprocessing, so only set this with a
+            :class:`MultiVectorMask` downstream (leave it ``None`` for dense / sparse /
+            cross-encoder pipelines).
         max_seq_length (int, optional): Truncate any inputs longer than this value. Prefer setting
             ``model_max_length`` via ``processor_kwargs`` instead. Defaults to None.
         do_lower_case (bool, optional): If true, lowercases the input (independent of whether the model
@@ -573,7 +757,18 @@ class Transformer(InputModule):
         "module_output_name",
         "processing_kwargs",
         "unpad_inputs",
+        "query_length",
+        "document_length",
+        "query_expansion",
     ]
+    # Config keys held at their default for dense / sparse / cross-encoder use are omitted from the
+    # saved ``sentence_bert_config.json`` (see :meth:`get_config_dict`). The multi-vector machinery is
+    # paid-for only when a model actually opts into it.
+    _DEFAULT_CONFIG_VALUES: dict[str, Any] = {
+        "query_length": None,
+        "document_length": None,
+        "query_expansion": None,
+    }
     save_in_root: bool = True
     _VALID_PROCESSING_KWARGS_KEYS: set[str] = {"common", "text", "audio", "image", "video", "chat_template"}
 
@@ -591,6 +786,9 @@ class Transformer(InputModule):
         modality_config: ModalityConfig | None = None,
         module_output_name: str | None = None,
         unpad_inputs: bool | None = None,
+        query_length: int | None = None,
+        document_length: int | None = None,
+        query_expansion: QueryExpansionConfig | None = None,
         max_seq_length: int | None = None,
         do_lower_case: bool = False,
         tokenizer_name_or_path: str | None = None,
@@ -612,6 +810,12 @@ class Transformer(InputModule):
             processor_kwargs = {}
         if config_kwargs is None:
             config_kwargs = {}
+
+        # A revision resolved for the model repository must not pin a separate processor repository
+        processor_revision = processor_kwargs.get("revision")
+        if tokenizer_name_or_path not in (None, model_name_or_path) and hasattr(processor_revision, "initial"):
+            processor_kwargs = {**processor_kwargs, "revision": processor_revision.initial}
+
         self.processing_kwargs: ProcessingKwargs = processing_kwargs or {}
         unknown_keys = set(self.processing_kwargs) - self._VALID_PROCESSING_KWARGS_KEYS
         if unknown_keys:
@@ -623,11 +827,17 @@ class Transformer(InputModule):
             )
         self.backend = backend
         self.do_lower_case = do_lower_case
-        self.track_media_counts = False
         self._prompt_length_mapping = {}
         self._method_signature_cache: dict[str, set[str]] = {}
+        self._chat_template_suffix_cache: dict[Any, list[int]] = {}
+        # Per-task max-length overrides applied to the text modality. When ``task`` reaches
+        # :meth:`preprocess` as ``"query"`` / ``"document"`` we pick the matching attribute. ``None``
+        # leaves the tokenizer's default behaviour intact.
+        self.query_length = query_length
+        self.document_length = document_length
 
         config, is_peft_model = self._load_config(model_name_or_path, backend, config_kwargs)
+        self._configure_use_cache(config, config_kwargs)
         self._warn_on_unsupported_attention_config(config)
 
         if (
@@ -646,15 +856,13 @@ class Transformer(InputModule):
             model_name_or_path, transformer_task, config, backend, is_peft_model, **model_kwargs
         )
 
-        # Start from the forward signature and add common parameter names as a safety net
-        # for models that use **kwargs or a wrapper that hides them from the signature.
-        self.model_forward_params = set(inspect.signature(self.model.forward).parameters) | {
-            "input_ids",
-            "attention_mask",
-            "token_type_ids",
-            "inputs_embeds",
-            "return_dict",
-        }
+        # ``None`` = forward accepts ``**kwargs`` (pass all but undeclared ST bookkeeping).
+        # Set = declared params plus safety net.
+        forward_signature = inspect.signature(self.model.forward)
+        self._declared_forward_params = set(forward_signature.parameters)
+        self.model_forward_params: set[str] | None = None
+        if not any(p.kind is inspect.Parameter.VAR_KEYWORD for p in forward_signature.parameters.values()):
+            self.model_forward_params = self._declared_forward_params | _FORWARD_SAFETY_NET_KEYS
 
         if max_seq_length is not None and "model_max_length" not in processor_kwargs:
             processor_kwargs["model_max_length"] = max_seq_length
@@ -682,11 +890,11 @@ class Transformer(InputModule):
                     normalizer = self.tokenizer.backend_tokenizer.normalizer
                     if not _has_lowercase(normalizer):
                         new_normalizers = [Lowercase()]
-                        if isinstance(normalizer, Sequence):
+                        if isinstance(normalizer, NormalizerSequence):
                             new_normalizers += list(normalizer)
                         elif normalizer is not None:
                             new_normalizers.append(normalizer)
-                        self.tokenizer.backend_tokenizer.normalizer = Sequence(new_normalizers)
+                        self.tokenizer.backend_tokenizer.normalizer = NormalizerSequence(new_normalizers)
                 else:
                     # Some v4 Tokenizers have do_lower_case as property without a setter, and those often
                     # have a basic_tokenizer on which do_lower_case can be set.
@@ -698,7 +906,10 @@ class Transformer(InputModule):
         # Causal models require left padding so the last position is always a real token,
         # which is needed for logits_to_keep=1 and LogitScore.
         if self.transformer_task in ("text-generation", "any-to-any"):
-            self.processor.padding_side = "left"
+            # A multimodal processor pads via its tokenizer and has no padding_side of its own that
+            # transformers reads. Setting one anyway plants an attribute that looks authoritative but isn't.
+            if hasattr(self.processor, "padding_side"):
+                self.processor.padding_side = "left"
             if hasattr(self.processor, "tokenizer"):
                 self.processor.tokenizer.padding_side = "left"
 
@@ -741,6 +952,10 @@ class Transformer(InputModule):
         # Evaluate whether we can skip padding
         self.unpad_inputs = unpad_inputs
 
+        # ColBERT-style query expansion. The setter normalizes the dict, fills defaults, and
+        # runs the FA2 compatibility check for non-attend expansion.
+        self.query_expansion = query_expansion
+
     @property
     def unpad_inputs(self) -> bool | None:
         """Whether text-only inputs are concatenated without padding for faster inference.
@@ -767,6 +982,74 @@ class Transformer(InputModule):
                     "Falling back to padded inputs."
                 )
 
+    @property
+    def query_expansion(self) -> QueryExpansionConfig | None:
+        """ColBERT-style query expansion config. See :class:`QueryExpansionConfig`. Validated and
+        normalized on assignment, so re-setting after construction is safe::
+
+            model[0].query_expansion = {"strategy": "fixed", "attend": True, "length": 32}
+            model[0].query_expansion = None  # turn off
+        """
+        return self._query_expansion
+
+    @query_expansion.setter
+    def query_expansion(self, value: QueryExpansionConfig | None) -> None:
+        expansion = _normalize_query_expansion(value)
+        # ``model`` may not exist yet during very early init. Skip tokenizer + FA2 checks until it does.
+        if expansion is not None and getattr(self, "model", None) is not None:
+            self._validate_query_expansion_token(expansion)
+            if not expansion["attend"] and self._is_flash_attention_requested():
+                raise ValueError(
+                    "FlashAttention-2 is incompatible with query_expansion attend=False. "
+                    "FA2 strips attention_mask=0 positions, so the [MASK] expansion tokens used by MaxSim "
+                    "never receive an attention update. Pass attn_implementation='sdpa' (preserves semantics) "
+                    "or set attend=True (changes semantics)."
+                )
+        # Expansion tokenizes with max_length=length, so a smaller query_length content cap is
+        # inexpressible: raise instead of silently ignoring it.
+        query_length = getattr(self, "query_length", None)
+        if expansion is not None and query_length is not None and query_length < expansion["length"]:
+            raise ValueError(
+                f"query_length={query_length} is smaller than query_expansion['length']={expansion['length']}. "
+                "The expansion length is the query width floor, so a smaller query_length cap is "
+                "contradictory. Drop query_length, raise it to at least the expansion length, or lower "
+                "the expansion length."
+            )
+        self._query_expansion = expansion
+
+    def _validate_query_expansion_token(self, expansion: QueryExpansionConfig) -> None:
+        """Tokenizer-aware checks. The structural ``_normalize_query_expansion`` runs without the
+        tokenizer, so this method catches the two silent-wrong-behavior cases that require it:
+
+        * ``token=None`` falls back to ``mask_token_id``, then ``eos_token_id``. If the tokenizer
+          has neither, the preprocess swap silently no-ops and the encoder sees raw pad tokens.
+        * An explicit ``token`` that isn't in the tokenizer's vocabulary resolves to
+          ``unk_token_id`` (or ``None``), silently inserting unk tokens at expansion positions.
+        """
+        if self.tokenizer is None:
+            return
+        strategy = expansion["strategy"]
+        token = expansion["token"]
+        if token is None:
+            # token=None falls back to mask_token, then eos_token (PyLate's chain:
+            # [MASK] for encoder models, EOS for decoder models without one).
+            if self.tokenizer.mask_token_id is None and self.tokenizer.eos_token_id is None:
+                raise ValueError(
+                    f"query_expansion strategy={strategy!r} with token=None falls back to the "
+                    "tokenizer's mask_token, then its eos_token, but this tokenizer has neither. "
+                    "Set ``query_expansion={..., 'token': '<your_token>'}`` explicitly."
+                )
+            return
+        token_id = self.tokenizer.convert_tokens_to_ids(token)
+        unk_id = self.tokenizer.unk_token_id
+        if token_id is None or (token_id == unk_id and token != self.tokenizer.unk_token):
+            raise ValueError(
+                f"query_expansion token={token!r} isn't in this tokenizer's vocabulary (resolves "
+                f"to {'None' if token_id is None else 'unk_token_id'}). Check your model family's "
+                "expected token: PaliGemma uses '<pad>', Qwen2/2.5/3/Omni use '<|endoftext|>', "
+                "Gemma3 uses '<eos>', Idefics3 / ModernVBERT use '<end_of_utterance>'."
+            )
+
     def _can_flatten_inputs(self) -> bool:
         """Determine whether text-only inputs can be flattened (concatenated without padding) for more efficient inference.
 
@@ -776,10 +1059,12 @@ class Transformer(InputModule):
         returns True.
 
         This requires:
-        1. The ``"feature-extraction"`` task, as model heads (e.g. ``AutoModelForSequenceClassification``)
-           are incompatible with flattened inputs.
+        1. The ``"feature-extraction"`` or ``"fill-mask"`` task. Position-reading model heads
+           (e.g. ``AutoModelForSequenceClassification``, which pools specific positions) are
+           incompatible with flattened inputs, but the masked language modelling head is strictly
+           position-wise, so its logits stay correct on a flattened sequence.
         2. The ``"text"`` modality must be supported by the model.
-        3. All modality call methods must be ``"forward"``; ``get_..._features`` methods apply heads
+        3. All modality call methods must be ``"forward"``. ``get_..._features`` methods apply heads
            that are incompatible with flattened inputs.
         4. The ``"torch"`` backend with an attention-interface-compatible model.
         5. Flash attention with variable-length function support.
@@ -791,7 +1076,7 @@ class Transformer(InputModule):
             bool: True if text-only inputs can be flattened for efficient inference.
         """
         if (
-            self.transformer_task != "feature-extraction"
+            self.transformer_task not in ("feature-extraction", "fill-mask")
             or "text" not in self.modality_config
             or self.backend != "torch"
             or not getattr(self.model, "is_backend_compatible", lambda: False)()
@@ -802,7 +1087,6 @@ class Transformer(InputModule):
         try:
             from transformers import DataCollatorWithFlattening
             from transformers.modeling_flash_attention_utils import lazy_import_flash_attention
-            from transformers.utils.generic import is_flash_attention_requested
         except ImportError:
             logger.debug(
                 "Consider upgrading to transformers >= 5.0.0 to skip padding for text-only inputs, "
@@ -810,11 +1094,10 @@ class Transformer(InputModule):
             )
             return False
 
-        attn_implementation = self.config._attn_implementation
-        if not is_flash_attention_requested(requested_attention_implementation=attn_implementation):
+        if not self._is_flash_attention_requested():
             return False
 
-        (_, flash_varlen_fn, *_), _ = lazy_import_flash_attention(attn_implementation)
+        (_, flash_varlen_fn, *_), _ = lazy_import_flash_attention(self.config._attn_implementation)
         if flash_varlen_fn is None:
             return False
 
@@ -826,17 +1109,31 @@ class Transformer(InputModule):
             return_flash_attn_kwargs=True,
             return_position_ids=True,  # Crucial for performance
         )
-        # Ensure the flash attention keys reach the model through **kwargs. They
-        # are not named parameters in the model's forward signature, but the model
-        # passes them through to its attention layers via **kwargs.
-        self.model_forward_params |= {
-            "cu_seq_lens_q",
-            "cu_seq_lens_k",
-            "max_length_q",
-            "max_length_k",
-            "seq_idx",
-        }
+        # Ensure the flash attention keys survive forward-kwargs filtering: they are not named
+        # parameters in the model's forward signature, but the model passes them through to its
+        # attention layers via **kwargs. A None model_forward_params already passes everything.
+        if self.model_forward_params is not None:
+            self.model_forward_params |= {
+                "cu_seq_lens_q",
+                "cu_seq_lens_k",
+                "max_length_q",
+                "max_length_k",
+                "seq_idx",
+            }
+        self._flatten_position_offset = self._infer_flatten_position_offset()
         return True
+
+    def _infer_flatten_position_offset(self) -> int:
+        # DataCollatorWithFlattening emits 0-based position_ids, but RoBERTa-family embeddings
+        # (XLM-R, MPNet, ...) expect positions from padding_idx + 1. No 0-based or rotary module
+        # pairs an int padding_idx with a learned position_embeddings table.
+        for module in self.model.modules():
+            padding_idx = getattr(module, "padding_idx", None)
+            if isinstance(padding_idx, int) and isinstance(
+                getattr(module, "position_embeddings", None), torch.nn.Embedding
+            ):
+                return padding_idx + 1
+        return 0
 
     @property
     def max_seq_length(self) -> int | None:
@@ -883,9 +1180,56 @@ class Transformer(InputModule):
             return self.processor
         return getattr(self.processor, "tokenizer", None)
 
+    def _chat_template_declares_task(self) -> bool:
+        """Whether the active chat template (the processor's, else the tokenizer's) uses a ``task``
+        variable, e.g. to append query augmentation tokens for ``task == "query"`` renders.
+        Reuses the template introspection transformers' own kwarg routing is based on."""
+        try:
+            from transformers.utils.chat_template_utils import _get_template_variables
+        except ImportError:
+            # Without the introspection-based kwarg routing, an extra template kwarg is harmless.
+            return True
+        template = getattr(self.processor, "chat_template", None)
+        if template is None and self.tokenizer is not None:
+            template = getattr(self.tokenizer, "chat_template", None)
+        templates = template.values() if isinstance(template, dict) else [template]
+        return any(isinstance(value, str) and "task" in _get_template_variables(value) for value in templates)
+
+    def _should_flatten_inputs(
+        self,
+        modality: Modality,
+        processor_inputs: dict[str, Any],
+        **kwargs: Any,
+    ) -> bool:
+        """Whether to pack variable-length text inputs into a single flat sequence (FA2 unpadding).
+
+        Only safe for text-only inputs, since :class:`DataCollatorWithFlattening` only handles
+        ``input_ids`` / ``labels``. Subclasses can override to opt out for specific tasks.
+        """
+        # FA2 unpadding would drop the pad positions before `preprocess` can swap them for the expansion
+        # token, so fall back to padded for expansion queries.
+        if kwargs.get("task") == "query" and self.query_expansion is not None:
+            return False
+        return self.can_flatten_inputs and (
+            modality == "text"
+            or (modality == "message" and self.input_formatter.is_text_only_messages(processor_inputs["message"]))
+        )
+
+    def _is_flash_attention_requested(self) -> bool:
+        """Whether the loaded model was configured for FlashAttention-2 (via ``attn_implementation``)."""
+        try:
+            from transformers.utils.generic import is_flash_attention_requested
+        except ImportError:
+            return False
+        attn_impl = getattr(self.config, "_attn_implementation", None)
+        if attn_impl is None:
+            # E.g. ONNX/OpenVINO-loaded configs never materialize _attn_implementation.
+            return False
+        return is_flash_attention_requested(requested_attention_implementation=attn_impl)
+
     def preprocess(
         self,
-        inputs: list[SingleInput | PairInput],
+        inputs: Sequence[SingleInput | PairInput],
         prompt: str | None = None,
         processing_kwargs: ProcessingKwargs | None = None,
         **kwargs,
@@ -898,7 +1242,7 @@ class Transformer(InputModule):
             prompt: Optional prompt to prepend to text inputs or inject as a system message.
             processing_kwargs: Per-call overrides for the processor kwargs configured on the module
                 via the ``processing_kwargs`` constructor argument. Same nested structure (modality
-                keys plus ``"common"`` and ``"chat_template"``); per-call values are merged on top of
+                keys plus ``"common"`` and ``"chat_template"``). Per-call values are merged on top of
                 the instance-level kwargs with shallow per-modality merge, so individual settings
                 (e.g. only ``max_length``) can be overridden without replacing the entire modality
                 dict. Defaults to None.
@@ -925,25 +1269,92 @@ class Transformer(InputModule):
             # padding=True ("longest") which would override that default. Restore "max_length".
             modality_kwargs["audio"]["padding"] = "max_length"
 
+        # Apply the per-task max-length override for text inputs (e.g. ColBERT-style
+        # query_length/document_length). A caller-supplied max_length (e.g. the trainer's
+        # args.max_length via the data collator) wins over the module lengths, and caller-supplied
+        # processing_kwargs still wins below.
+        task = kwargs.get("task")
+        max_length_override = kwargs.get("max_length")
+        if max_length_override is not None:
+            task_max_length = max_length_override
+        elif task == "query":
+            task_max_length = self.query_length
+        elif task == "document":
+            task_max_length = self.document_length
+        else:
+            task_max_length = None
+        # Expansion queries manage their own max_length below (they pad to the config length).
+        # Skip the generic path for them.
+        expansion = self.query_expansion if task == "query" else None
+        if (
+            expansion is not None
+            and expansion["strategy"] == "fixed"
+            and max_length_override is not None
+            and max_length_override != expansion["length"]
+        ):
+            logger.warning_once(
+                f"query_expansion fixes queries to {expansion['length']} tokens, so the "
+                f"max_length={max_length_override} override is ignored for query batches."
+            )
+        if task_max_length is not None and expansion is None:
+            modality_kwargs["text"]["max_length"] = task_max_length
+
         effective_processing_kwargs = self._merge_processing_kwargs(processing_kwargs)
         if "common" in effective_processing_kwargs:
             common_kwargs.update(effective_processing_kwargs["common"])
         for modality_key in modality_kwargs:
             if overrides := effective_processing_kwargs.get(modality_key):  # type: ignore[arg-type]
                 modality_kwargs[modality_key].update(overrides)
+        logits_to_keep = modality_kwargs["text"].pop("logits_to_keep", 1)
+
+        # strategy='fixed': pad to the expansion length so the post-tokenization swap below has
+        # pad positions to replace. Applied after the merge so processing_kwargs can't break the
+        # fixed width. strategy='min' only applies the ceiling here, the width floor is enforced
+        # post-tokenization.
+        if expansion is not None:
+            text_overrides = effective_processing_kwargs.get("text") or {}
+            if expansion["strategy"] == "fixed":
+                if "padding" in text_overrides or "max_length" in text_overrides:
+                    logger.warning_once(
+                        "processing_kwargs overrides the text padding or max_length, but query "
+                        "expansion requires a fixed width: re-applying padding='max_length' with the "
+                        "expansion length for query batches."
+                    )
+                modality_kwargs["text"]["max_length"] = expansion["length"]
+                modality_kwargs["text"]["padding"] = "max_length"
+            elif task_max_length is not None and "max_length" not in text_overrides:
+                if task_max_length < expansion["length"]:
+                    logger.warning_once(
+                        f"query_expansion guarantees at least {expansion['length']} query tokens, so the "
+                        f"max_length={task_max_length} override is raised to it for query batches."
+                    )
+                modality_kwargs["text"]["max_length"] = max(task_max_length, expansion["length"])
+
         chat_template_kwargs = effective_processing_kwargs.get("chat_template", {})
+        # Task-aware templates can branch on the task, e.g. to append query augmentation tokens.
+        # Only forwarded when declared: transformers treats unknown kwargs as processor kwargs.
+        if task is not None and self._chat_template_declares_task():
+            chat_template_kwargs = {"task": task, **chat_template_kwargs}
 
         modality, processor_inputs, extra_modality_kwargs = self.input_formatter.parse_inputs(inputs)
+
+        # `*ForRetrieval` processors have no document treatment for text (always query-rendered):
+        # warn instead of silently scoring query-formatted "documents".
+        if self.transformer_task == "retrieval" and modality == "text" and task is not None and task != "query":
+            logger.warning_once(
+                f"This retrieval model's processor always renders text as a query, but task={task!r} was "
+                "requested: these inputs get the query prefix and augmentation tokens. *ForRetrieval "
+                "models expect image documents."
+            )
 
         for modality_key, extra_kwargs in extra_modality_kwargs.items():
             modality_kwargs[modality_key].update(extra_kwargs)
 
         # Flatten inputs to avoid padding overhead when using flash attention variable-length functions.
-        # Only safe for text-only inputs, since DataCollatorWithFlattening only handles input_ids/labels.
-        should_flatten = self.can_flatten_inputs and (
-            modality == "text"
-            or (modality == "message" and self.input_formatter.is_text_only_messages(processor_inputs["message"]))
-        )
+        # Subclasses can override `_should_flatten_inputs` to opt out of flattening for specific tasks
+        # (e.g. ColBERT-style query expansion, which repurposes padding positions as [MASK] tokens and
+        # therefore can't have them dropped by FA2 unpadding).
+        should_flatten = self._should_flatten_inputs(modality, processor_inputs, **kwargs)
         if should_flatten:
             del common_kwargs["return_tensors"]
             modality_kwargs["text"].pop("padding", None)
@@ -951,9 +1362,25 @@ class Transformer(InputModule):
 
         # Always convert to the message format if it's supported, since it's most flexible with e.g. defaults
         if "message" in self.modality_config and modality != "message":
+            if expansion is not None and modality == "text":
+                # The expansion length would be applied as max_length to the chat-rendered
+                # sequence, right-truncating it: at small lengths every query collapses to the
+                # identical template preamble.
+                raise ValueError(
+                    f"query_expansion strategy={expansion['strategy']!r} cannot be combined with a "
+                    "chat-template (message) backbone: queries are rendered through the chat template "
+                    "and then padded / truncated to the expansion length, which destroys the query "
+                    "content. Chat-template backbones should own their query augmentation in the "
+                    "template itself (it receives task='query'), or pin modality_config to the plain "
+                    "text modality."
+                )
             modality, processor_inputs = self.input_formatter.batch_to_message(modality, processor_inputs)
         elif modality not in self.modality_config:
             raise_unsupported_modality_error(inputs, modality, list(self.modality_config.keys()), "Transformer module")
+
+        # Checked after the conversion so it covers pairs that parse_inputs already turned into messages
+        if modality == "message":
+            self._verify_pair_roles_supported(processor_inputs["message"], chat_template_kwargs)
 
         # Incorporate prompt into inputs if applicable
         prompt_length = None
@@ -967,14 +1394,6 @@ class Transformer(InputModule):
             processor_inputs["text"] = self.input_formatter.prepend_prompt_to_texts(processor_inputs["text"], prompt)
             prompt_length = self._get_prompt_length(prompt, **kwargs)
 
-        # Track per-sample image/video counts before the processor flattens them into single tensors.
-        # Losses that minibatch VLM inputs (e.g. CachedMNRL) use these counts to slice visual tensors.
-        # Only used if the Trainer updated track_media_counts to True.
-        num_images_per_sample = None
-        num_videos_per_sample = None
-        if self.training and self.track_media_counts and modality == "message":
-            num_images_per_sample, num_videos_per_sample = _count_media_per_sample(processor_inputs["message"])
-
         with suggest_extra_on_exception():
             processor_output = self._call_processor(
                 modality,
@@ -984,32 +1403,164 @@ class Transformer(InputModule):
                 chat_template_kwargs=chat_template_kwargs,
             )
 
-        if num_images_per_sample is not None and "image_grid_thw" in processor_output:
-            processor_output["num_images_per_sample"] = torch.tensor(num_images_per_sample, dtype=torch.long)
-        if num_videos_per_sample is not None and "video_grid_thw" in processor_output:
-            processor_output["num_videos_per_sample"] = torch.tensor(num_videos_per_sample, dtype=torch.long)
+        if modality == "message" and ("pixel_values" in processor_output or "video_grid_thw" in processor_output):
+            num_images, num_videos = _count_media_per_sample(processor_inputs["message"])
+            if "pixel_values" in processor_output:
+                processor_output["num_images_per_sample"] = torch.tensor(num_images, dtype=torch.long)
+            if "video_grid_thw" in processor_output:
+                processor_output["num_videos_per_sample"] = torch.tensor(num_videos, dtype=torch.long)
 
         if should_flatten:
             # DataCollatorWithFlattening expects list[dict], but the processor returns dict[str, list].
             per_sample = [dict(zip(processor_output, values)) for values in zip(*processor_output.values())]
             processor_output = self.data_collator(per_sample)
             processor_output.pop("labels", None)
+            if self._flatten_position_offset:
+                processor_output["position_ids"] = processor_output["position_ids"] + self._flatten_position_offset
 
         processor_output["modality"] = modality
         if prompt_length is not None:
             processor_output["prompt_length"] = prompt_length
 
         if self.transformer_task in ("text-generation", "any-to-any"):
-            if self.processor.padding_side != "left":
-                raise ValueError(
-                    f"The processor padding side is {self.processor.padding_side!r}, but causal models require "
-                    "left padding so that the last token position is always a real token. "
-                    "This is needed for efficient logit computation (logits_to_keep=1) and for LogitScore. "
-                    'Please set ``processing_kwargs={"padding_side": "left"}``.'
+            if isinstance(logits_to_keep, bool) or not isinstance(logits_to_keep, int) or logits_to_keep < 0:
+                raise ValueError("logits_to_keep must be a non-negative integer")
+            self._verify_left_padding(processor_output, modality_kwargs, common_kwargs)
+            processor_output["logits_to_keep"] = logits_to_keep
+
+        # ColBERT-style query expansion: swap pad positions within the width floor for the expansion
+        # token id, and mark them via ``query_expansion_positions`` so downstream modules score them.
+        expansion = self.query_expansion if task == "query" else None
+        if expansion is not None and "attention_mask" in processor_output and "input_ids" in processor_output:
+            floor = expansion["length"]
+            input_ids = processor_output["input_ids"]
+            attention_mask = processor_output["attention_mask"]
+            # 'min' tokenizes with batch-longest padding, which can sit below the floor: widen up to
+            # it. The 0-filler is overwritten by the expansion swap below.
+            if input_ids.shape[1] < floor:
+                missing = floor - input_ids.shape[1]
+                input_ids = torch.nn.functional.pad(input_ids, (0, missing), value=0)
+                attention_mask = torch.nn.functional.pad(attention_mask, (0, missing), value=0)
+                processor_output["input_ids"] = input_ids
+                processor_output["attention_mask"] = attention_mask
+                if "token_type_ids" in processor_output:
+                    processor_output["token_type_ids"] = torch.nn.functional.pad(
+                        processor_output["token_type_ids"], (0, missing), value=0
+                    )
+            # Per position rather than per batch: 'min' rows can carry real pads beyond the floor
+            # that must stay excluded from scoring. For 'fixed', width == floor: every pad counts.
+            expansion_positions = (attention_mask == 0) & (
+                torch.arange(input_ids.shape[1], device=attention_mask.device) < floor
+            )
+            # A 'fixed' row with no expansion positions was truncated to the width (silent content
+            # loss). Under 'min' such rows are simply long queries.
+            if expansion["strategy"] == "fixed" and not expansion_positions.any(dim=-1).all():
+                logger.warning_once(
+                    f"One or more queries filled the entire query_expansion length of {floor} tokens: any "
+                    "content beyond it was truncated, as this model always processes queries at exactly "
+                    "this width."
                 )
-            processor_output["logits_to_keep"] = 1
+            if self.tokenizer is not None:
+                if expansion["token"] is not None:
+                    expansion_id = self.tokenizer.convert_tokens_to_ids(expansion["token"])
+                else:
+                    # PyLate's fallback chain: [MASK] for encoder models, EOS for decoder models.
+                    expansion_id = self.tokenizer.mask_token_id
+                    if expansion_id is None:
+                        expansion_id = self.tokenizer.eos_token_id
+                if expansion_id is not None:
+                    processor_output["input_ids"] = input_ids.masked_fill(expansion_positions, expansion_id)
+            processor_output["query_expansion_positions"] = expansion_positions
+            # Scoped to the expansion positions, not ones_like: 'min' rows can carry real trailing
+            # pads. attend=False keeps the classic ColBERT "skip during forward" trick.
+            if expansion["attend"]:
+                processor_output["attention_mask"] = attention_mask.masked_fill(expansion_positions, 1)
 
         return processor_output
+
+    def _verify_pair_roles_supported(
+        self, messages_batch: list[list[dict[str, Any]]], chat_template_kwargs: dict[str, Any]
+    ) -> None:
+        """Raise if the chat template cannot carry the ``query``/``document`` roles a pair is mapped to.
+
+        A template that only branches on ``system``/``user``/``assistant`` renders a pair to an empty
+        prompt, so the model would score an input holding neither the query nor the document. Published
+        rerankers ship a template that handles both roles, so this is reached when a backbone is used,
+        or fine-tuned, without one.
+        """
+        # Checked before the probe, which costs a render, so batches without a pair never pay for it
+        if not self.input_formatter.has_pair_roles(messages_batch):
+            return
+        # Drop what never reaches the Jinja render: size kwargs (tokenization only) and the ST-only restore_suffix
+        probe_kwargs = {
+            key: value
+            for key, value in chat_template_kwargs.items()
+            if key not in _APPLY_CHAT_TEMPLATE_TOP_LEVEL_KWARGS and key != "restore_suffix"
+        }
+        failure = self.input_formatter.pair_roles_failure(probe_kwargs)
+        if failure is None:
+            return
+        model_name = getattr(self.config, "name_or_path", None) or "this model"
+        if self.input_formatter.message_format == "structured":
+            example = (
+                '    <Query>: {{ (messages | selectattr("role", "eq", "query") | first).content[0].text }}\n'
+                '    <Document>: {{ (messages | selectattr("role", "eq", "document") | first).content[0].text }}\n'
+            )
+        else:
+            example = (
+                '    <Query>: {{ messages | selectattr("role", "eq", "query") | map(attribute="content") | first }}\n'
+                '    <Document>: {{ messages | selectattr("role", "eq", "document") | map(attribute="content") | first }}\n'
+            )
+        raise ValueError(
+            f"The chat template of {model_name} cannot carry a 'query'/'document' pair ({failure}). Pair inputs "
+            "are mapped to one message per role, so set a chat template that renders both roles, e.g.:\n"
+            f"{example}"
+            'via `processor_kwargs={"chat_template": ...}` when loading, `model.processor.chat_template = ...` '
+            "afterwards, or a `chat_template.jinja` file alongside the model."
+        )
+
+    def _verify_left_padding(
+        self,
+        processor_output: dict[str, Any],
+        modality_kwargs: dict[str, dict[str, Any]],
+        common_kwargs: dict[str, Any],
+    ) -> None:
+        """Verify that causal inputs are left-padded, i.e. that every sample ends in a real token.
+
+        Checks the produced ``attention_mask`` rather than ``padding_side``, because the side that
+        actually applies can come from the tokenizer attribute or from either the ``"text"`` or
+        ``"common"`` processing_kwargs bucket, and which of those wins differs per processor type and
+        per call path. The output is the only signal that covers every route.
+        """
+        attention_mask = processor_output.get("attention_mask")
+        if not isinstance(attention_mask, torch.Tensor) or attention_mask.ndim != 2:
+            return
+        if attention_mask[:, -1].all():
+            return
+
+        # Only reached when padding is wrong, so it's worth working out which route caused it. Either
+        # bucket can be the one that wins, depending on the processor type, so blame whichever is at fault.
+        kwargs_side = next(
+            (
+                side
+                for side in (modality_kwargs["text"].get("padding_side"), common_kwargs.get("padding_side"))
+                if side is not None and side != "left"
+            ),
+            None,
+        )
+        if kwargs_side is not None:
+            fix = f'Your ``processing_kwargs`` set the padding side to {kwargs_side!r}. Remove it or set it to "left".'
+        else:
+            padder_path = "processor.tokenizer" if hasattr(self.processor, "tokenizer") else "processor"
+            fix = (
+                f'The module sets ``{padder_path}.padding_side`` to "left" on load, so it was changed afterwards. '
+                f'Restore it with ``{padder_path}.padding_side = "left"``.'
+            )
+        raise ValueError(
+            "At least one sample ends in a padding token, but causal models require left padding so that "
+            "the last token position is always a real token. "
+            "This is needed for efficient logit computation (logits_to_keep=1) and for LogitScore. " + fix
+        )
 
     def _merge_processing_kwargs(self, per_call: ProcessingKwargs | None) -> ProcessingKwargs:
         """Merge per-call ``processing_kwargs`` on top of the instance-level ``self.processing_kwargs``.
@@ -1046,7 +1597,7 @@ class Transformer(InputModule):
         Args:
             features: Input features dictionary produced by :meth:`preprocess`. Must contain the
                 keys expected by the underlying model (e.g. ``input_ids``, ``pixel_values``, etc.).
-                A ``modality`` key selects the modality config to use; defaults to ``"text"``
+                A ``modality`` key selects the modality config to use. Defaults to ``"text"``
                 when absent.
             **kwargs: Additional keyword arguments forwarded to the model method (override features).
 
@@ -1072,7 +1623,16 @@ class Transformer(InputModule):
             raise ValueError(f"Model does not have the requested '{method_name}' method")
 
         if method_name == "forward":
-            filtered_kwargs = {key: value for key, value in all_kwargs.items() if key in self.model_forward_params}
+            if self.model_forward_params is None:
+                # forward accepts **kwargs: drop ST's own bookkeeping, unless the forward names it and
+                # so wants to condition on it (e.g. a custom model with task adapters keyed on ``task``).
+                filtered_kwargs = {
+                    key: value
+                    for key, value in all_kwargs.items()
+                    if key not in _NON_MODEL_FEATURE_KEYS or key in self._declared_forward_params
+                }
+            else:
+                filtered_kwargs = {key: value for key, value in all_kwargs.items() if key in self.model_forward_params}
         else:
             method_params = self._method_signature_cache.get(method_name)
             if method_params is None:
@@ -1110,19 +1670,6 @@ class Transformer(InputModule):
 
         features[self.module_output_name] = embedding
 
-        # If the AutoModel is wrapped with a PeftModel(ForFeatureExtraction), then it may have added virtual tokens
-        # We need to extend the attention mask to include these virtual tokens, or the pooling will fail
-        if "input_ids" in features and "attention_mask" in features and is_peft_available():
-            from peft import PeftModel
-
-            if isinstance(self.model, PeftModel) and self.model.active_peft_config.is_prompt_learning:
-                batch_size = features["input_ids"].shape[0]
-                attention_mask = features["attention_mask"]
-                prefix_attention_mask = torch.ones(
-                    batch_size, self.model.active_peft_config.num_virtual_tokens, device=attention_mask.device
-                )
-                features["attention_mask"] = torch.cat((prefix_attention_mask, attention_mask), dim=1)
-
         if (
             hasattr(self.model.config, "output_hidden_states")
             and self.model.config.output_hidden_states
@@ -1144,6 +1691,10 @@ class Transformer(InputModule):
         # Edge case for timm models
         if isinstance(self.model.config, TimmWrapperConfig):
             return self.model.config.num_features
+
+        # `*ForRetrieval` heads project down to `config.embedding_dim`, not the backbone hidden size.
+        if self.transformer_task == "retrieval" and getattr(self.model.config, "embedding_dim", None) is not None:
+            return self.model.config.embedding_dim
 
         def get_hidden_size_from_config(config):
             # If we're directly outputting sentence embeddings from the transformer (e.g., using the pooler output),
@@ -1239,6 +1790,18 @@ class Transformer(InputModule):
         common_kwargs: dict[str, Any],
     ) -> dict[str, Any]:
         """Call a :class:`ProcessorMixin` processor, handling both legacy and v5 calling conventions."""
+        # `*ForRetrieval` processors reject raw image strings, and the retrieval path skips the chat
+        # template that resolves them elsewhere: load URLs / paths / base64 here (also converts to RGB).
+        if self.transformer_task == "retrieval" and "image" in processor_inputs:
+            from transformers.image_utils import load_image
+
+            processor_inputs = {
+                **processor_inputs,
+                "image": [
+                    load_image(image) if isinstance(image, str) else image for image in processor_inputs["image"]
+                ],
+            }
+
         # Convert modality keys to processor argument names (e.g., "image" -> "images")
         processor_inputs = {MODALITY_TO_PROCESSOR_ARG.get(key, key): value for key, value in processor_inputs.items()}
 
@@ -1307,7 +1870,8 @@ class Transformer(InputModule):
     ) -> dict[str, Any]:
         """Process chat messages using the processor's chat template.
 
-        ``chat_template_kwargs`` is forwarded to ``apply_chat_template``.
+        ``chat_template_kwargs`` is forwarded to ``apply_chat_template``, except the Sentence Transformers
+        ``restore_suffix`` flag, which only toggles the truncation suffix restore.
         """
         if "message" not in self.modality_config:
             raise ValueError(
@@ -1315,10 +1879,79 @@ class Transformer(InputModule):
                 f"Supported modalities: {list(self.modality_config.keys())}"
             )
 
-        # Ideally we'd use the same code path for both ProcessorMixin and Tokenizers, but the latter expects
-        # the text kwargs to be passed at the top level instead of in a nested "text_kwargs" dict.
-        chat_template_kwargs = chat_template_kwargs or {}
+        chat_template_kwargs = dict(chat_template_kwargs or {})
+
+        # `restore_suffix` is a Sentence Transformers flag, not an apply_chat_template arg, so pop it (default on).
+        restore_suffix = chat_template_kwargs.pop("restore_suffix", True)
+
+        # Truncation/max_length may ride in any kwarg bucket (chat-template wins). Tokenizers also truncate
+        # when max_length is set while truncation was left unset, so only an explicit opt-out disables the
+        # restore.
+        text_kwargs = modality_kwargs["text"]
+        truncation = chat_template_kwargs.get(
+            "truncation", text_kwargs.get("truncation", common_kwargs.get("truncation"))
+        )
+        max_length = chat_template_kwargs.get(
+            "max_length", text_kwargs.get("max_length", common_kwargs.get("max_length"))
+        )
+        truncation_active = bool(truncation) or (truncation is None and max_length is not None)
+        restore_chat_template_suffix = restore_suffix and truncation_active and truncation != "do_not_truncate"
+
+        features = self._apply_chat_template(messages, modality_kwargs, common_kwargs, chat_template_kwargs)
+
+        if restore_chat_template_suffix:
+            if max_length is None:
+                max_length = self.max_seq_length
+            self._restore_chat_template_suffix(
+                features, messages, chat_template_kwargs, text_kwargs, common_kwargs, max_length
+            )
+        return features
+
+    def _apply_chat_template(
+        self,
+        messages: list[list[MessageInput]],
+        modality_kwargs: dict[str, dict[str, Any]],
+        common_kwargs: dict[str, Any],
+        chat_template_kwargs: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Call ``apply_chat_template`` with the kwarg routing the processor type expects: nested kwargs for
+        a ProcessorMixin, flat with the size kwargs hoisted to the top level for a bare tokenizer. Both the
+        real batch and the suffix skeleton renders go through this (the given dicts are never mutated).
+        """
+        # Fold size kwargs from the chat-template bucket into the text kwargs (chat wins), else
+        # apply_chat_template gets them twice (bare tokenizer) or misroutes them (ProcessorMixin).
+        if size_keys := _APPLY_CHAT_TEMPLATE_TOP_LEVEL_KWARGS & chat_template_kwargs.keys():
+            chat_template_kwargs = dict(chat_template_kwargs)
+            folded = {key: chat_template_kwargs.pop(key) for key in size_keys}
+            modality_kwargs = {**modality_kwargs, "text": {**modality_kwargs["text"], **folded}}
+
+        # PaliGemmaProcessor refuses text-only inputs. Fall back to the tokenizer's apply_chat_template
+        # (same token ids). Extend the isinstance check if other processors share the constraint.
+        if (
+            isinstance(self.processor, PaliGemmaProcessor)
+            and self.tokenizer is not None
+            and self.input_formatter.is_text_only_messages(messages)
+        ):
+            top_level_kwarg_names = {"padding", "truncation", "max_length", "return_tensors"}
+            top_level_kwargs = {key: common_kwargs.pop(key) for key in top_level_kwarg_names & common_kwargs.keys()}
+            top_level_kwargs |= {
+                key: modality_kwargs["text"].pop(key) for key in top_level_kwarg_names & modality_kwargs["text"].keys()
+            }
+            return self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=True,
+                return_dict=True,
+                **top_level_kwargs,
+                **modality_kwargs["text"],
+                **chat_template_kwargs,
+            )
+
         if isinstance(self.processor, ProcessorMixin):
+            video_kwargs = dict(modality_kwargs["video"])
+            chat_template_kwargs = {
+                "load_audio_from_video": video_kwargs.pop("load_audio_from_video", False),
+                **chat_template_kwargs,
+            }
             # Transformers v5.4.0 prefers us to pass processor_kwargs as a single dict, but there's still some top level
             # kwargs that need to be hoisted out for backwards compatibility.
             if _TRANSFORMERS_APPLY_CHAT_TEMPLATE_RECOMMENDS_PROCESSOR_KWARGS:
@@ -1327,52 +1960,242 @@ class Transformer(InputModule):
                     tokenize=True,
                     return_dict=True,
                     return_tensors=common_kwargs.get("return_tensors"),
-                    load_audio_from_video=modality_kwargs["video"].get("load_audio_from_video", False),
                     processor_kwargs={
                         "text_kwargs": modality_kwargs["text"],
                         "images_kwargs": modality_kwargs["image"],
                         "audio_kwargs": modality_kwargs["audio"],
-                        "videos_kwargs": modality_kwargs["video"],
+                        "videos_kwargs": video_kwargs,
                         "common_kwargs": common_kwargs,
                     },
                     **chat_template_kwargs,
                 )
-            else:
-                return self.processor.apply_chat_template(
-                    messages,
-                    tokenize=True,
-                    return_dict=True,
-                    text_kwargs=modality_kwargs["text"],
-                    images_kwargs=modality_kwargs["image"],
-                    audio_kwargs=modality_kwargs["audio"],
-                    videos_kwargs=modality_kwargs["video"],
-                    common_kwargs=common_kwargs,
-                    **chat_template_kwargs,
-                )
+            return self.processor.apply_chat_template(
+                messages,
+                tokenize=True,
+                return_dict=True,
+                text_kwargs=modality_kwargs["text"],
+                images_kwargs=modality_kwargs["image"],
+                audio_kwargs=modality_kwargs["audio"],
+                videos_kwargs=video_kwargs,
+                common_kwargs=common_kwargs,
+                **chat_template_kwargs,
+            )
 
-        # apply_chat_template expects padding/truncation/max_length/return_tensors as top-level kwargs,
-        # not nested inside tokenizer_kwargs or common_kwargs, so we hoist them out.
-        top_level_kwarg_names = {"padding", "truncation", "max_length", "return_tensors"}
-        top_level_kwargs = {key: common_kwargs.pop(key) for key in top_level_kwarg_names & common_kwargs.keys()}
-        top_level_kwargs |= {
-            key: modality_kwargs["text"].pop(key) for key in top_level_kwarg_names & modality_kwargs["text"].keys()
+        # A bare tokenizer's apply_chat_template wants padding/truncation/max_length/return_tensors as
+        # top-level kwargs, not nested in tokenizer_kwargs or common_kwargs, so we hoist them out of copies.
+        text_kwargs = dict(modality_kwargs["text"])
+        common_kwargs = dict(common_kwargs)
+        top_level_kwargs = {
+            key: common_kwargs.pop(key) for key in _APPLY_CHAT_TEMPLATE_TOP_LEVEL_KWARGS & common_kwargs.keys()
         }
-
+        top_level_kwargs |= {
+            key: text_kwargs.pop(key) for key in _APPLY_CHAT_TEMPLATE_TOP_LEVEL_KWARGS & text_kwargs.keys()
+        }
         return self.processor.apply_chat_template(
             messages,
             tokenize=True,
             return_dict=True,
-            tokenizer_kwargs=modality_kwargs["text"],
+            tokenizer_kwargs=text_kwargs,
             common_kwargs=common_kwargs,
             **top_level_kwargs,
             **chat_template_kwargs,
         )
+
+    def _restore_chat_template_suffix(
+        self,
+        features: dict[str, Any],
+        messages: list[list[MessageInput]],
+        chat_template_kwargs: dict[str, Any],
+        tokenizer_kwargs: dict[str, Any],
+        common_kwargs: dict[str, Any] | None = None,
+        max_length: int | None = None,
+    ) -> None:
+        """Restore the trailing chat-template suffix that truncation may have removed (in place).
+
+        Chat templates append fixed tokens after the content (e.g. an assistant prefill or EOS) that
+        right-truncation cuts off first. That is harmless for mean/CLS pooling but breaks models that read
+        the final position (causal-LM rerankers, last-token pooling), so the suffix is written back over the
+        final real tokens of every truncated row. This must happen post-hoc: the tokenizer truncates the
+        rendered string blind to template structure, with no upstream option to trim only the content.
+
+        Only rows whose real length reached ``max_length`` can have been truncated, so shorter rows are
+        skipped. The suffix is derived (and cached) per row, handling batches that mix role layouts.
+        """
+        input_ids = features.get("input_ids")
+        # Anything but torch tensors and the flattening path's token lists (e.g. numpy) is left untouched.
+        if not isinstance(input_ids, (torch.Tensor, list)):
+            return
+
+        # An unknown max_length (None) becomes 0, so the gates below never skip a row.
+        max_length = max_length or 0
+
+        is_tensor = isinstance(input_ids, torch.Tensor)
+        if is_tensor:
+            # unsqueeze returns a view, so the in-place writes below propagate to features["input_ids"]
+            ids = input_ids if input_ids.dim() == 2 else input_ids.unsqueeze(0)
+            width = ids.shape[-1]
+            # No row can have reached max_length when even the padded width is below it.
+            if width < max_length:
+                return
+            # The mask gives each row's real length and padding side, so the suffix lands on real tokens.
+            # Without one, real tokens can't be told apart from padding and nothing can be restored safely.
+            attention_mask = features.get("attention_mask")
+            if not isinstance(attention_mask, torch.Tensor) or attention_mask.numel() == 0:
+                return
+            am = attention_mask if attention_mask.dim() == 2 else attention_mask.unsqueeze(0)
+            real_lengths = am.long().sum(dim=1).tolist()
+            left_padded = (am[:, 0] == 0).tolist()
+            n_rows = ids.shape[0]
+        else:
+            # The flattening path (see preprocess) drops return_tensors, giving ragged unpadded token lists.
+            rows = input_ids
+            real_lengths = [len(row) for row in rows]
+            n_rows = len(rows)
+
+        for index in range(min(n_rows, len(messages))):
+            # Truncation cuts to exactly max_length, so shorter rows kept their tail. Real lengths stay
+            # correct when pad_to_multiple_of pads a truncated row past max_length.
+            if real_lengths[index] < max_length:
+                continue
+            suffix = self._chat_template_suffix_ids(
+                messages[index], chat_template_kwargs, tokenizer_kwargs, common_kwargs
+            )
+            keep = min(len(suffix), real_lengths[index])
+            if keep == 0:
+                continue
+            if is_tensor:
+                end = width if left_padded[index] else real_lengths[index]
+                ids[index, end - keep : end] = torch.as_tensor(suffix[-keep:], dtype=ids.dtype, device=ids.device)
+            else:
+                rows[index][-keep:] = suffix[-keep:]
+
+    def _chat_template_suffix_ids(
+        self,
+        conversation: list[MessageInput],
+        chat_template_kwargs: dict[str, Any],
+        tokenizer_kwargs: dict[str, Any],
+        common_kwargs: dict[str, Any] | None = None,
+    ) -> list[int]:
+        """Derive one conversation's trailing chat-template suffix (cached).
+
+        The conversation is rendered twice with different fillers: the longest common token suffix of the
+        renders is the template tail, so no per-model token count is hard-coded. ``system`` messages are
+        kept verbatim so a prompt the template renders in the tail is captured too.
+        """
+        # Media rows are skipped: cutting placeholder tokens would desync them from their media features.
+        # Message shapes the check can't inspect are skipped too rather than failing tokenization.
+        try:
+            if not conversation or not self.input_formatter.is_text_only_messages([conversation]):
+                return []
+        except Exception as exc:
+            logger.debug(f"Could not derive the chat-template suffix: {exc}")
+            return []
+        # Size/output kwargs in any bucket must not reach the untruncated skeleton renders or the cache key.
+        chat_template_kwargs, tokenizer_kwargs, common_kwargs = (
+            {key: value for key, value in kwargs.items() if key not in _APPLY_CHAT_TEMPLATE_TOP_LEVEL_KWARGS}
+            for kwargs in (chat_template_kwargs, tokenizer_kwargs, common_kwargs or {})
+        )
+        # The skeleton key covers everything the renders see except the fillered content (roles, system
+        # prompts, fields like ``name``), so conversations that render differently can't share an entry.
+        # repr() keeps the key hashable even when a value is a list (e.g. a ``tools`` arg).
+        cache = self._chat_template_suffix_cache
+        cache_key = (
+            repr(sorted(chat_template_kwargs.items())),
+            repr(sorted(tokenizer_kwargs.items())),
+            repr(sorted(common_kwargs.items())),
+            repr(self._message_skeleton(conversation, "")),
+        )
+        if cache_key in cache:
+            return cache[cache_key]
+
+        suffix: list[int] = []
+        try:
+            # The fillers tokenize differently, so the common token suffix is template tail, never content.
+            first = self._render_message_skeleton(
+                conversation, "0", chat_template_kwargs, tokenizer_kwargs, common_kwargs
+            )
+            second = self._render_message_skeleton(
+                conversation, "1 2 3 4", chat_template_kwargs, tokenizer_kwargs, common_kwargs
+            )
+            count = 0
+            for left, right in zip(reversed(first), reversed(second)):
+                if left != right:
+                    break
+                count += 1
+            # count == min(len) means the renders never diverged (no variable content): don't trust the run.
+            if 0 < count < min(len(first), len(second)):
+                suffix = first[len(first) - count :]
+        except Exception as exc:  # never let suffix derivation break tokenization
+            logger.debug(f"Could not derive the chat-template suffix: {exc}")
+
+        # Cache the result (even an empty one) and evict the oldest entry past the cap. Concurrent encode()
+        # calls can race on the shared dict, so the eviction is best effort.
+        cache[cache_key] = suffix
+        if len(cache) > _CHAT_TEMPLATE_SUFFIX_CACHE_SIZE:
+            try:
+                cache.pop(next(iter(cache)))
+            except (KeyError, RuntimeError):
+                pass
+        return suffix
+
+    def _message_skeleton(self, conversation: list[MessageInput], filler: str) -> list[MessageInput]:
+        """Replace each non-system message content with ``filler``, keeping everything else verbatim.
+
+        Keeping system messages whole lets the derivation capture a prompt rendered in the tail. Fillering
+        the rest keeps the renders tiny regardless of input length.
+        """
+        skeleton = []
+        for message in conversation:
+            if not isinstance(message, dict) or message.get("role") == "system":
+                skeleton.append(message)
+                continue
+            new_content = [{"type": "text", "text": filler}] if isinstance(message.get("content"), list) else filler
+            skeleton.append({**message, "content": new_content})
+        return skeleton
+
+    def _render_message_skeleton(
+        self,
+        conversation: list[MessageInput],
+        filler: str,
+        chat_template_kwargs: dict[str, Any],
+        tokenizer_kwargs: dict[str, Any],
+        common_kwargs: dict[str, Any],
+    ) -> list[int]:
+        """Tokenize one conversation's skeleton (non-system content replaced by ``filler``), untruncated.
+
+        The render shares ``_apply_chat_template`` with the real batch, so the suffix tokenizes exactly like
+        the rows it is restored onto, just without padding, truncation, or tensors.
+        """
+        skeleton = self._message_skeleton(conversation, filler)
+        output = self._apply_chat_template(
+            [skeleton],
+            modality_kwargs={
+                "text": {**tokenizer_kwargs, "padding": False, "truncation": False},
+                "audio": {},
+                "image": {},
+                "video": {},
+            },
+            common_kwargs=common_kwargs,
+            chat_template_kwargs=chat_template_kwargs,
+        )
+        # Coerce to a plain list and unwrap the single-conversation batch (some processors return tensors).
+        ids = output["input_ids"]
+        if isinstance(ids, torch.Tensor):
+            ids = ids.tolist()
+        if ids and isinstance(ids[0], list):
+            ids = ids[0]
+        return ids
 
     def _get_prompt_length(self, prompt: str, **kwargs) -> int | None:
         """Return the length of the prompt in tokens, excluding any trailing special token.
 
         Returns None if the processor does not produce ``input_ids``.
         """
+        # TODO: Perhaps mirror the _chat_template_suffix_ids implementation with 2 forwards and then checking the common prefix
+        # The prompt is measured under plain tokenization: with the task kept, query expansion would pad
+        # the lone prompt to the expansion length and report that width instead of the prompt's own size.
+        # Task is also excluded from the cache key so the same prompt is measured once across tasks.
+        kwargs = {key: value for key, value in kwargs.items() if key != "task"}
         cache_key = (prompt, *sorted(kwargs.items()))
         if cache_key in self._prompt_length_mapping:
             return self._prompt_length_mapping[cache_key]
@@ -1392,8 +2215,8 @@ class Transformer(InputModule):
 
     def _load_config(
         self, model_name_or_path: str, backend: str, config_kwargs: dict[str, Any]
-    ) -> tuple[PeftConfig | PretrainedConfig, bool]:
-        """Loads the transformers or PEFT configuration
+    ) -> tuple[PretrainedConfig, bool]:
+        """Loads the transformers configuration, resolving the base model's config for PEFT checkpoints
 
         Args:
             model_name_or_path (str): The model name on Hugging Face (e.g. 'sentence-transformers/all-MiniLM-L6-v2')
@@ -1402,7 +2225,7 @@ class Transformer(InputModule):
             config_kwargs (dict[str, Any]): Keyword arguments passed to the Hugging Face Transformers config.
 
         Returns:
-            tuple[PeftConfig | PretrainedConfig, bool]: The model configuration and a boolean indicating whether the model is a PEFT model.
+            tuple[PretrainedConfig, bool]: The model configuration and a boolean indicating whether the model is a PEFT model.
         """
         adapter_config_file = find_adapter_config_file(
             model_name_or_path,
@@ -1426,16 +2249,36 @@ class Transformer(InputModule):
                 )
             from peft import PeftConfig
 
-            return PeftConfig.from_pretrained(model_name_or_path, **config_kwargs), True
+            peft_config = PeftConfig.from_pretrained(model_name_or_path, **config_kwargs)
+            # `revision` and `subfolder` locate the adapter, not the base model.
+            base_config_kwargs = {
+                key: value for key, value in config_kwargs.items() if key not in ("revision", "subfolder")
+            }
+            return AutoConfig.from_pretrained(peft_config.base_model_name_or_path, **base_config_kwargs), True
 
         return AutoConfig.from_pretrained(model_name_or_path, **config_kwargs), False
 
     @staticmethod
-    def _warn_on_unsupported_attention_config(config: PeftConfig | PretrainedConfig) -> None:
-        """Warn if the config requests bidirectional attention settings not supported by the installed transformers version."""
-        if not isinstance(config, PretrainedConfig):
-            return
+    def _configure_use_cache(
+        config: PretrainedConfig, config_kwargs: dict[str, Any] | PretrainedConfig, use_cache: bool = False
+    ) -> None:
+        """Override Transformers cache settings with False unless explicitly set in ST's config_kwargs.
 
+        Applies recursively to sub-configs, with more specific config_kwargs overrides taking precedence.
+        """
+        if isinstance(config_kwargs, PretrainedConfig):
+            config_kwargs = config_kwargs.to_dict()
+        use_cache = config_kwargs.get("use_cache", use_cache)
+        if hasattr(config, "use_cache"):
+            config.use_cache = use_cache
+        for name in config.sub_configs:
+            sub_config = getattr(config, name, None)
+            if sub_config is not None:
+                Transformer._configure_use_cache(sub_config, config_kwargs.get(name) or {}, use_cache)
+
+    @staticmethod
+    def _warn_on_unsupported_attention_config(config: PretrainedConfig) -> None:
+        """Warn if the config requests bidirectional attention settings not supported by the installed transformers version."""
         configs_to_check: list[PretrainedConfig] = [config]
         if hasattr(config, "sub_configs"):
             for sub_config_name in config.sub_configs.keys():
@@ -1462,10 +2305,8 @@ class Transformer(InputModule):
     def _load_model(
         self,
         model_name_or_path: str,
-        transformer_task: Literal[
-            "feature-extraction", "sequence-classification", "text-generation", "any-to-any", "fill-mask"
-        ],
-        config: PeftConfig | PretrainedConfig,
+        transformer_task: TransformerTask,
+        config: PretrainedConfig,
         backend: str,
         is_peft_model: bool,
         **model_kwargs,
@@ -1475,7 +2316,9 @@ class Transformer(InputModule):
         Args:
             model_name_or_path (str): The model name on Hugging Face (e.g. 'sentence-transformers/all-MiniLM-L6-v2')
                 or the path to a local model directory.
-            config ("PeftConfig" | PretrainedConfig): The model configuration.
+            transformer_task (TransformerTask): The task the Transformer is used for, which determines the
+                auto model class used to load the model, e.g. ``"feature-extraction"``.
+            config (PretrainedConfig): The model configuration.
             backend (str): The backend used for model inference. Can be `torch`, `onnx`, or `openvino`.
             is_peft_model (bool): Whether the model is a PEFT model.
             model_kwargs (dict[str, Any]): Keyword arguments passed to the Hugging Face Transformers model.
@@ -1492,7 +2335,11 @@ class Transformer(InputModule):
                 if model is not None:
                     return model
 
-            model_cls = TRANSFORMER_TASK_TO_AUTO_MODEL[transformer_task]
+            if transformer_task == "retrieval":
+                # No AutoModelForRetrieval exists: resolve the concrete `*ForRetrieval` class per checkpoint.
+                model_cls = _resolve_retrieval_model_class(config)
+            else:
+                model_cls = TRANSFORMER_TASK_TO_AUTO_MODEL[transformer_task]
             return model_cls.from_pretrained(model_name_or_path, config=config, **model_kwargs)
         elif backend == "onnx":
             return load_onnx_model(
@@ -1771,6 +2618,7 @@ class Transformer(InputModule):
         processor_kwargs: dict[str, Any] | None = None,
         config_kwargs: dict[str, Any] | None = None,
         backend: str = "torch",
+        init_defaults: dict[str, Any] | None = None,
         **kwargs,
     ) -> Self:
         """Load a Transformer module from a pretrained model directory or Hugging Face model name."""
@@ -1787,6 +2635,9 @@ class Transformer(InputModule):
             config_kwargs=config_kwargs,
             backend=backend,
         )
+        # init_kwargs has priority over init_defaults
+        for key, value in (init_defaults or {}).items():
+            init_kwargs.setdefault(key, value)
         return cls(model_name_or_path=model_name_or_path, **init_kwargs)
 
     @classmethod
@@ -1964,6 +2815,11 @@ class Transformer(InputModule):
             config_dict.pop("processing_kwargs", None)
         if self.unpad_inputs is None:
             config_dict.pop("unpad_inputs", None)
+        # Drop multi-vector knobs held at their dense/sparse/cross-encoder defaults so
+        # ``sentence_bert_config.json`` for non-multi-vector models stays uncluttered.
+        for key, default in self._DEFAULT_CONFIG_VALUES.items():
+            if config_dict.get(key) == default:
+                config_dict.pop(key, None)
         return config_dict
 
     def __repr__(self) -> str:

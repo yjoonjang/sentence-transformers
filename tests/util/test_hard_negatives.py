@@ -1,16 +1,23 @@
 from __future__ import annotations
 
 import importlib.util
+import logging
+import math
 import os
+import random
+from collections import defaultdict
 from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
+import torch
 from torch import Tensor
 
 from sentence_transformers import CrossEncoder
 from sentence_transformers.sentence_transformer.model import SentenceTransformer
-from sentence_transformers.util import is_datasets_available, mine_hard_negatives
+from sentence_transformers.util import cos_sim, is_datasets_available, mine_hard_negatives, pairwise_cos_sim
 
 if is_datasets_available():
     from datasets import Dataset
@@ -189,7 +196,6 @@ def test_separate_corpus(
     result = mine_hard_negatives(
         dataset=dataset,
         model=model,
-        range_max=3,  # Limit range to avoid k out of range error
         corpus=passages[5:],  # Use different passages as corpus
         verbose=False,
     )
@@ -214,7 +220,6 @@ def test_cross_encoder(
         dataset=dataset,
         model=model,
         cross_encoder=cross_encoder,
-        range_max=3,  # Limit the range to avoid k out of range error
         max_score=0.8,  # Need a filtering criterion for cross-encoder to be used
         verbose=False,
     )
@@ -237,7 +242,6 @@ def test_cross_encoder_detailed(
         model=model,
         cross_encoder=cross_encoder,
         range_min=1,
-        range_max=3,  # Keep range_max small to avoid k out of range error
         max_score=0.7,
         min_score=0.2,
         num_negatives=2,
@@ -264,7 +268,6 @@ def test_cross_encoder_with_multiple_positives_non_faiss(
         dataset=multiple_positive_dataset,
         model=model,
         cross_encoder=cross_encoder,
-        range_max=3,  # keep small to avoid k out of range
         max_score=0.9,  # ensure CrossEncoder path is exercised
         num_negatives=2,
         verbose=False,
@@ -274,6 +277,48 @@ def test_cross_encoder_with_multiple_positives_non_faiss(
     assert "passage" in result.column_names
     assert "negative" in result.column_names
     assert len(result) > 0
+
+
+def test_cross_encoder_rescores_with_only_min_score(
+    dataset: Dataset, static_retrieval_mrl_en_v1_model: SentenceTransformer, reranker_bert_tiny_model: CrossEncoder
+) -> None:
+    """min_score is a score filter too, so it must filter on the CrossEncoder scores rather than the bi-encoder ones."""
+    cross_encoder = reranker_bert_tiny_model
+    result = mine_hard_negatives(
+        dataset=dataset,
+        model=static_retrieval_mrl_en_v1_model,
+        cross_encoder=cross_encoder,
+        min_score=-1e9,  # Keeps every candidate, so only the source of the scores is under test
+        output_format="triplet",
+        output_scores=True,
+        verbose=False,
+    )
+    assert result
+
+    reported = [row["scores"] for row in result]
+    expected_positive = cross_encoder.predict(list(zip(result["query"], result["passage"])))
+    expected_negative = cross_encoder.predict(list(zip(result["query"], result["negative"])))
+    assert [pos for pos, _ in reported] == pytest.approx(expected_positive.tolist(), rel=1e-4, abs=1e-4)
+    assert [neg for _, neg in reported] == pytest.approx(expected_negative.tolist(), rel=1e-4, abs=1e-4)
+
+
+def test_min_score_preserves_random_candidate_pool(
+    dataset: Dataset, static_retrieval_mrl_en_v1_model: SentenceTransformer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    results = []
+    for min_score in (None, -1.0):
+        monkeypatch.setattr(random, "sample", random.Random(0).sample)
+        results.append(
+            mine_hard_negatives(
+                dataset=dataset,
+                model=static_retrieval_mrl_en_v1_model,
+                min_score=min_score,
+                sampling_strategy="random",
+                verbose=False,
+            )
+        )
+
+    assert results[0].to_dict() == results[1].to_dict()
 
 
 def test_range_parameters(dataset: Dataset, static_retrieval_mrl_en_v1_model: SentenceTransformer) -> None:
@@ -299,7 +344,6 @@ def test_score_filters(dataset: Dataset, static_retrieval_mrl_en_v1_model: Sente
     result = mine_hard_negatives(
         dataset=dataset,
         model=model,
-        range_max=3,  # Limit range to avoid k out of range error
         max_score=0.8,  # Only consider candidates with score <= 0.8
         min_score=0.1,  # Only consider candidates with score >= 0.1
         verbose=False,
@@ -318,7 +362,6 @@ def test_margin_parameters(dataset: Dataset, static_retrieval_mrl_en_v1_model: S
     result_abs = mine_hard_negatives(
         dataset=dataset,
         model=model,
-        range_max=3,  # Limit range to avoid k out of range error
         absolute_margin=0.1,  # Negative must be at least 0.1 less similar than positive
         verbose=False,
     )
@@ -327,7 +370,6 @@ def test_margin_parameters(dataset: Dataset, static_retrieval_mrl_en_v1_model: S
     result_rel = mine_hard_negatives(
         dataset=dataset,
         model=model,
-        range_max=3,  # Limit range to avoid k out of range error
         relative_margin=0.05,  # Negative must be at most 95% as similar as positive
         verbose=False,
     )
@@ -398,6 +440,41 @@ def test_include_positives(dataset: Dataset, static_retrieval_mrl_en_v1_model: S
     assert "negative_1" in result.column_names
 
 
+@pytest.mark.parametrize("include_positives", [False, True])
+@pytest.mark.parametrize(
+    "mining_kwargs",
+    [
+        {},
+        {"range_min": 1},
+        {"range_max": 5},
+        {"max_score": 0.8},
+        {"min_score": 0.5},
+        {"absolute_margin": 0.1},
+        {"relative_margin": 0.05},
+        {"margin": 0.1},
+        {"sampling_strategy": "random"},
+    ],
+)
+def test_include_positives_warning(
+    dataset: Dataset,
+    static_retrieval_mrl_en_v1_model: SentenceTransformer,
+    caplog: pytest.LogCaptureFixture,
+    include_positives: bool,
+    mining_kwargs: dict[str, float | int | str],
+) -> None:
+    with caplog.at_level(logging.WARNING, logger="sentence_transformers.util.hard_negatives"):
+        mine_hard_negatives(
+            dataset=dataset,
+            model=static_retrieval_mrl_en_v1_model,
+            include_positives=include_positives,
+            output_format="n-tuple",
+            verbose=False,
+            **mining_kwargs,
+        )
+
+    assert ("may still discard the positive values" in caplog.text) == (include_positives and bool(mining_kwargs))
+
+
 def test_include_positives_with_labeled_formats(
     dataset: Dataset, static_retrieval_mrl_en_v1_model: SentenceTransformer
 ) -> None:
@@ -409,7 +486,6 @@ def test_include_positives_with_labeled_formats(
         model=model,
         include_positives=True,
         output_format="labeled-pair",
-        range_max=3,  # Limit range to avoid k out of range error
         verbose=False,
     )
 
@@ -429,7 +505,6 @@ def test_include_positives_with_labeled_formats(
         model=model,
         include_positives=True,
         output_format="labeled-list",
-        range_max=3,  # Limit range to avoid k out of range error
         verbose=False,
     )
 
@@ -861,7 +936,8 @@ def test_non_faiss_batched_search_matches_single_batch(
 ) -> None:
     """Test that batching the non-FAISS similarity search splits the queries and does not change the mined negatives."""
     model = static_retrieval_mrl_en_v1_model
-    original_similarity = model.similarity
+    model.similarity_fn_name  # noqa: B018 (trigger lazy init of _similarity)
+    original_similarity = model._similarity
     chunk_sizes = []
 
     def similarity_spy(embeddings1, embeddings2):
@@ -893,7 +969,7 @@ def test_non_faiss_batched_search_matches_single_batch(
     for column in batched.column_names:
         if column == "scores":
             for batched_scores, single_scores in zip(batched[column], single[column]):
-                assert batched_scores == pytest.approx(single_scores)
+                assert batched_scores == pytest.approx(single_scores, rel=1e-6, abs=1e-7)
         else:
             assert batched[column] == single[column]
 
@@ -919,8 +995,42 @@ def test_cache(dataset: Dataset, static_retrieval_mrl_en_v1_model: SentenceTrans
     assert len(result1) == len(result2)
 
 
+def test_cache_respects_prompt(
+    dataset: Dataset, static_retrieval_mrl_en_v1_model: SentenceTransformer, tmp_path: Path
+) -> None:
+    """The cache key must incorporate the prompt arguments, so a different `query_prompt`
+    produces its own cache file rather than silently reusing embeddings computed with a different prompt."""
+    model = static_retrieval_mrl_en_v1_model
+    cache_dir = os.path.join(tmp_path, "embeddings_cache")
+
+    mine_hard_negatives(
+        dataset=dataset,
+        model=model,
+        cache_folder=cache_dir,
+        query_prompt="Represent this question for retrieval: ",
+        verbose=False,
+    )
+    query_files_a = {f for f in os.listdir(cache_dir) if f.startswith("query_embeddings")}
+
+    mine_hard_negatives(
+        dataset=dataset,
+        model=model,
+        cache_folder=cache_dir,
+        query_prompt="Represent this statement for retrieval: ",
+        verbose=False,
+    )
+    query_files_b = {f for f in os.listdir(cache_dir) if f.startswith("query_embeddings")}
+
+    # A second, distinct query_prompt must add a new cache file, not reuse the first prompt's.
+    assert query_files_a != query_files_b
+    assert query_files_a.issubset(query_files_b)
+
+
 def test_multiple_positives_per_query(
-    queries: list[str], passages: list[str], static_retrieval_mrl_en_v1_model: SentenceTransformer
+    queries: list[str],
+    passages: list[str],
+    static_retrieval_mrl_en_v1_model: SentenceTransformer,
+    capsys: pytest.CaptureFixture,
 ):
     """Test dataset with multiple positives per query."""
     model = static_retrieval_mrl_en_v1_model
@@ -931,6 +1041,7 @@ def test_multiple_positives_per_query(
     dataset_dup = Dataset.from_dict({"query": queries_dup, "passage": passages_dup})
 
     result = mine_hard_negatives(dataset=dataset_dup, model=model, range_max=3, verbose=False)
+    assert capsys.readouterr().out == ""
 
     # Should still have expected structure
     assert "query" in result.column_names
@@ -939,6 +1050,115 @@ def test_multiple_positives_per_query(
 
     # Should handle the duplicates correctly
     assert len(result) >= len(dataset_dup)
+
+
+@pytest.mark.skipif(importlib.util.find_spec("faiss") is None, reason="faiss not installed")
+def test_faiss_multiple_positives_matches_non_faiss(
+    queries: list[str], passages: list[str], static_retrieval_mrl_en_v1_model: SentenceTransformer
+) -> None:
+    """FAISS and non-FAISS paths must mine the same number of negatives when queries have multiple positives.
+
+    Regression test for the FAISS branch requesting only ``range_max + 1`` candidates from
+    ``index.search`` instead of ``range_max + max_positives`` (as the non-FAISS ``torch.topk`` sibling
+    does). With 2+ positives per query the FAISS path retrieved too few candidates and could mine fewer
+    negatives than the non-FAISS path for the same input. This crosses ``use_faiss=True`` with the
+    multi-positive case, which neither ``test_faiss`` nor ``test_multiple_positives_per_query`` covered.
+    """
+    model = static_retrieval_mrl_en_v1_model
+    # Duplicate queries with different positives -> repeated queries have multiple positives (max_positives == 2).
+    queries_dup = queries[:3] + queries[:2]
+    passages_dup = passages[:3] + passages[5:7]
+    dataset_dup = Dataset.from_dict({"query": queries_dup, "passage": passages_dup})
+
+    # num_negatives must reach into the tail of the candidate pool (num_negatives == range_max), otherwise the
+    # missing candidates are never selected and the assertion below passes even without the fix.
+    kwargs = dict(dataset=dataset_dup, model=model, num_negatives=3, range_max=3, faiss_batch_size=2, verbose=False)
+    faiss_result = mine_hard_negatives(use_faiss=True, **kwargs)
+    non_faiss_result = mine_hard_negatives(use_faiss=False, **kwargs)
+
+    # The invariant the fix restores: both paths mine the same number of negatives for the same input
+    # (default "triplet" output_format yields one negative per row, so len == number of mined negatives).
+    assert len(faiss_result) == len(non_faiss_result)
+
+
+@pytest.mark.skipif(importlib.util.find_spec("faiss") is None, reason="faiss not installed")
+@pytest.mark.parametrize("range_max", [3, 10])
+def test_faiss_corpus_smaller_than_k(
+    queries: list[str], passages: list[str], static_retrieval_mrl_en_v1_model: SentenceTransformer, range_max: int
+) -> None:
+    """Candidates must never include a query's own positives when ``k`` exceeds the corpus size.
+
+    FAISS pads short result sets with index -1 and score -3.4e38. The score survives the -inf filters and
+    the index resolves to the last corpus entry, so the final document could be mined as a negative for
+    every query, including for the query it is a positive of.
+    """
+    model = static_retrieval_mrl_en_v1_model
+    corpus = passages[:4]
+    # The first query has two positives (max_positives == 2), so k = range_max + 2 overruns the 4 document corpus.
+    queries_dup = queries[:3] + queries[:1]
+    passages_dup = [passages[0], passages[1], passages[2], passages[3]]
+    dataset_dup = Dataset.from_dict({"query": queries_dup, "passage": passages_dup})
+
+    result = mine_hard_negatives(
+        dataset=dataset_dup,
+        model=model,
+        corpus=corpus,
+        num_negatives=3,
+        range_max=range_max,
+        use_faiss=True,
+        faiss_batch_size=2,
+        verbose=False,
+    )
+
+    positives_per_query = defaultdict(set)
+    for query, positive in zip(dataset_dup["query"], dataset_dup["passage"]):
+        positives_per_query[query].add(positive)
+
+    for row in result:
+        assert row["negative"] != row["passage"]
+        assert row["negative"] not in positives_per_query[row["query"]]
+
+
+@pytest.mark.skipif(importlib.util.find_spec("faiss") is None, reason="faiss not installed")
+def test_faiss_corpus_smaller_than_k_with_cross_encoder(
+    queries: list[str],
+    passages: list[str],
+    static_retrieval_mrl_en_v1_model: SentenceTransformer,
+    reranker_bert_tiny_model: CrossEncoder,
+) -> None:
+    """The FAISS -1 padding must stay disqualified after the CrossEncoder rescoring.
+
+    The rescoring assigns a fresh score to every candidate, so disqualifying the padding at search time
+    is not enough: the padded slots get a genuine score back and can be mined as negatives. A negative
+    ``absolute_margin`` keeps the margin filter from incidentally removing them.
+    """
+    model = static_retrieval_mrl_en_v1_model
+    corpus = passages[:4]
+    # The first query has two positives (max_positives == 2), so k = 3 + 2 overruns the 4 document corpus.
+    queries_dup = queries[:3] + queries[:1]
+    passages_dup = [passages[0], passages[1], passages[2], passages[3]]
+    dataset_dup = Dataset.from_dict({"query": queries_dup, "passage": passages_dup})
+
+    result = mine_hard_negatives(
+        dataset=dataset_dup,
+        model=model,
+        corpus=corpus,
+        cross_encoder=reranker_bert_tiny_model,
+        num_negatives=3,
+        range_max=3,
+        absolute_margin=-10.0,
+        use_faiss=True,
+        faiss_batch_size=2,
+        verbose=False,
+    )
+
+    positives_per_query = defaultdict(set)
+    for query, positive in zip(dataset_dup["query"], dataset_dup["passage"]):
+        positives_per_query[query].add(positive)
+
+    for row in result:
+        assert row["negative"] != row["passage"]
+        assert row["negative"] not in positives_per_query[row["query"]]
 
 
 def test_deprecated_parameters(dataset: Dataset, static_retrieval_mrl_en_v1_model: SentenceTransformer) -> None:
@@ -963,14 +1183,16 @@ def test_deprecated_parameters(dataset: Dataset, static_retrieval_mrl_en_v1_mode
     assert "negative" in result_margin.column_names
 
 
-def test_margin_with_safe_range(dataset: Dataset, static_retrieval_mrl_en_v1_model: SentenceTransformer) -> None:
-    """Test margin parameter with safe range values to avoid k out of range error."""
+def test_margin_with_default_range_max(
+    dataset: Dataset, static_retrieval_mrl_en_v1_model: SentenceTransformer
+) -> None:
+    """Test the deprecated margin parameter with the auto-derived range_max, which exceeds the
+    corpus size and relies on the candidate set being capped at the corpus size."""
     model = static_retrieval_mrl_en_v1_model
     result = mine_hard_negatives(
         dataset=dataset,
         model=model,
         margin=0.2,  # Use deprecated margin parameter
-        range_max=3,  # Small range_max to avoid k out of range error
         verbose=False,
     )
 
@@ -997,7 +1219,6 @@ def test_multi_process(
         dataset=dataset,
         model=model,
         cross_encoder=cross_encoder,
-        range_max=3,  # Reduced to avoid k out of range error
         num_negatives=2,
         relative_margin=0.1,
         use_multi_process=True,
@@ -1010,6 +1231,55 @@ def test_multi_process(
     assert "negative" in result.column_names
 
 
+@pytest.mark.parametrize("failure", ["encode_document", "encode_query", "candidates", "positives", None])
+def test_multi_process_pool_cleanup(failure: str | None) -> None:
+    dataset = Dataset.from_dict({"query": ["q"], "passage": ["p"]})
+    model = Mock(spec=SentenceTransformer, device=torch.device("cpu"))
+    model.encode_document.return_value = torch.eye(2).numpy()
+    model.encode_query.return_value = torch.tensor([[1.0, 0.0]]).numpy()
+    model.similarity.side_effect = cos_sim
+    model.similarity_pairwise.side_effect = pairwise_cos_sim
+    cross_encoder = Mock(spec=CrossEncoder)
+    cross_encoder.predict.side_effect = [torch.tensor([0.9, 0.1]), torch.tensor([0.9])]
+    error = RuntimeError("simulated inference failure")
+    if failure in ("encode_document", "encode_query"):
+        getattr(model, failure).side_effect = error
+    elif failure == "candidates":
+        cross_encoder.predict.side_effect = error
+    elif failure == "positives":
+        cross_encoder.predict.side_effect = [torch.tensor([0.9, 0.1]), error]
+
+    kwargs = dict(
+        dataset=dataset,
+        model=model,
+        corpus=["p", "n"],
+        cross_encoder=cross_encoder,
+        max_score=0.8,
+        range_max=1,
+        num_negatives=1,
+        use_multi_process=["cpu"],
+        verbose=False,
+    )
+    if failure is None:
+        result = mine_hard_negatives(**kwargs)
+        assert result.to_dict() == {"query": ["q"], "passage": ["p"], "negative": ["n"]}
+    else:
+        with pytest.raises(RuntimeError) as exc_info:
+            mine_hard_negatives(**kwargs)
+        assert exc_info.value is error
+
+    model.start_multi_process_pool.assert_called_once_with(target_devices=["cpu"])
+    model.stop_multi_process_pool.assert_called_once_with(model.start_multi_process_pool.return_value)
+    if failure in ("encode_document", "encode_query"):
+        cross_encoder.start_multi_process_pool.assert_not_called()
+        cross_encoder.stop_multi_process_pool.assert_not_called()
+    else:
+        cross_encoder.start_multi_process_pool.assert_called_once_with(target_devices=["cpu"])
+        cross_encoder.stop_multi_process_pool.assert_called_once_with(
+            cross_encoder.start_multi_process_pool.return_value
+        )
+
+
 def test_empty_dataset(static_retrieval_mrl_en_v1_model: SentenceTransformer) -> None:
     """Test behavior with an empty dataset."""
     model = static_retrieval_mrl_en_v1_model
@@ -1017,6 +1287,150 @@ def test_empty_dataset(static_retrieval_mrl_en_v1_model: SentenceTransformer) ->
 
     with pytest.raises(ValueError):
         mine_hard_negatives(dataset=empty_dataset, model=model, verbose=False)
+
+
+@pytest.mark.parametrize("sampling_strategy", ["top", "random"])
+def test_num_negatives_exceeds_range_window(
+    dataset: Dataset, static_retrieval_mrl_en_v1_model: SentenceTransformer, sampling_strategy: str
+) -> None:
+    """Requesting more negatives than the range window holds must explain itself, not fail on a tensor shape.
+
+    Both strategies reach the same invalid window by a different route: "top" slices the candidate matrix to
+    range_max - range_min columns while the anchor index matrix keeps num_negatives columns, and "random" clamps
+    its number of options to num_negatives and then samples past the width of that same matrix.
+    """
+    with pytest.raises(ValueError, match="Cannot mine 10 negatives per query: only 3 candidates remain"):
+        mine_hard_negatives(
+            dataset=dataset,
+            model=static_retrieval_mrl_en_v1_model,
+            num_negatives=10,
+            range_min=0,
+            range_max=3,
+            sampling_strategy=sampling_strategy,
+            verbose=False,
+        )
+
+
+@pytest.mark.parametrize("num_negatives", [0, -1, -5])
+def test_num_negatives_must_be_positive(
+    dataset: Dataset, static_retrieval_mrl_en_v1_model: SentenceTransformer, num_negatives: int
+) -> None:
+    """range_max is derived from num_negatives, so a non-positive value must be named rather than mined around.
+
+    Without the check, 0 quietly returns the dataset with no negative columns at all, and a negative value
+    derives a range_max at or below range_min, reporting a range problem the caller never configured.
+    """
+    with pytest.raises(ValueError, match=f"num_negatives must be at least 1, got num_negatives={num_negatives}"):
+        mine_hard_negatives(
+            dataset=dataset,
+            model=static_retrieval_mrl_en_v1_model,
+            num_negatives=num_negatives,
+            verbose=False,
+        )
+
+
+def test_num_negatives_exceeds_range_window_capped_by_faiss(
+    dataset: Dataset, static_retrieval_mrl_en_v1_model: SentenceTransformer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The FAISS GPU cap can shrink an auto-derived range_max below num_negatives, so the error mentions the cap."""
+    faiss = pytest.importorskip("faiss")
+    monkeypatch.setattr(faiss, "get_num_gpus", lambda: 1)
+
+    with pytest.raises(ValueError, match="range_max was capped to 2047 because FAISS on GPU"):
+        mine_hard_negatives(
+            dataset=dataset,
+            model=static_retrieval_mrl_en_v1_model,
+            num_negatives=10,
+            range_min=2040,
+            use_faiss=True,
+            verbose=False,
+        )
+
+
+def test_use_faiss_on_cpu_is_not_capped(
+    dataset: Dataset, static_retrieval_mrl_en_v1_model: SentenceTransformer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FAISS on CPU has no 2048-document limit, so the same arguments must mine instead of raising."""
+    faiss = pytest.importorskip("faiss")
+    monkeypatch.setattr(faiss, "get_num_gpus", lambda: 0)
+    monkeypatch.delattr(faiss, "GpuMultipleClonerOptions", raising=False)
+
+    result = mine_hard_negatives(
+        dataset=dataset,
+        model=static_retrieval_mrl_en_v1_model,
+        num_negatives=10,
+        range_min=2040,
+        use_faiss=True,
+        verbose=False,
+    )
+
+    assert len(result) == 0
+
+
+@pytest.mark.parametrize("sampling_strategy", ["top", "random"])
+def test_num_negatives_matching_range_window_is_allowed(
+    dataset: Dataset, static_retrieval_mrl_en_v1_model: SentenceTransformer, sampling_strategy: str
+) -> None:
+    """A window exactly the size of num_negatives is still satisfiable, under either strategy, and must not raise."""
+    result = mine_hard_negatives(
+        dataset=dataset,
+        model=static_retrieval_mrl_en_v1_model,
+        num_negatives=3,
+        range_min=0,
+        range_max=3,
+        sampling_strategy=sampling_strategy,
+        output_format="n-tuple",
+        verbose=False,
+    )
+
+    assert len(result.column_names) == 2 + 3
+    assert len(result) == len(dataset)
+
+
+def test_range_min_must_be_non_negative(
+    dataset: Dataset, static_retrieval_mrl_en_v1_model: SentenceTransformer
+) -> None:
+    """A negative range_min would silently slice the candidate window from the wrong end."""
+    with pytest.raises(ValueError, match="range_min must be non-negative"):
+        mine_hard_negatives(
+            dataset=dataset,
+            model=static_retrieval_mrl_en_v1_model,
+            range_min=-5,
+            range_max=8,
+            verbose=False,
+        )
+
+
+@pytest.mark.parametrize(("range_min", "range_max"), [(3, 3), (5, 3)])
+def test_range_min_must_be_below_range_max(
+    dataset: Dataset, static_retrieval_mrl_en_v1_model: SentenceTransformer, range_min: int, range_max: int
+) -> None:
+    """A range_min at or above range_max leaves no candidate window at all."""
+    with pytest.raises(ValueError, match="range_min must be smaller than range_max"):
+        mine_hard_negatives(
+            dataset=dataset,
+            model=static_retrieval_mrl_en_v1_model,
+            range_min=range_min,
+            range_max=range_max,
+            verbose=False,
+        )
+
+
+def test_range_min_above_faiss_capped_range_max(
+    dataset: Dataset, static_retrieval_mrl_en_v1_model: SentenceTransformer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The FAISS GPU cap can push an auto-derived range_max below range_min, so the error mentions the cap."""
+    faiss = pytest.importorskip("faiss")
+    monkeypatch.setattr(faiss, "get_num_gpus", lambda: 1)
+
+    with pytest.raises(ValueError, match="range_min must be smaller than range_max.*range_max was capped to 2047"):
+        mine_hard_negatives(
+            dataset=dataset,
+            model=static_retrieval_mrl_en_v1_model,
+            range_min=2050,
+            use_faiss=True,
+            verbose=False,
+        )
 
 
 def test_larger_dataset_with_combinations(
@@ -1034,12 +1448,12 @@ def test_larger_dataset_with_combinations(
 
     larger_dataset = Dataset.from_dict({"query": queries_large, "passage": passages_large})
 
-    # Test combination of parameters - using smaller range_max to avoid k out of range error
+    # Test a combination of parameters
     result = mine_hard_negatives(
         dataset=larger_dataset,
         model=model,
         range_min=1,
-        range_max=3,  # Reduced from 15 to avoid k out of range error
+        range_max=15,
         max_score=0.9,
         min_score=0.1,
         absolute_margin=0.05,
@@ -1161,17 +1575,21 @@ def test_tiny_corpus(
     assert len(result) >= 1
 
 
-def test_verbose_mode(dataset: Dataset, static_retrieval_mrl_en_v1_model: SentenceTransformer) -> None:
-    """Test that verbose=True doesn't cause any crashes."""
+def test_verbose_mode(
+    dataset: Dataset,
+    static_retrieval_mrl_en_v1_model: SentenceTransformer,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """Test that verbose=True prints statistics."""
     model = static_retrieval_mrl_en_v1_model
 
-    # Simply check that running with verbose=True doesn't crash
     result = mine_hard_negatives(
         dataset=dataset,
         model=model,
         range_max=3,  # Small range to keep test fast
         verbose=True,  # Enable verbose output
     )
+    assert capsys.readouterr().out != ""
 
     # Verify we still get valid results
     assert "query" in result.column_names
@@ -1181,11 +1599,11 @@ def test_verbose_mode(dataset: Dataset, static_retrieval_mrl_en_v1_model: Senten
 
 
 @pytest.mark.skipif(not is_datasets_available(), reason="datasets library is not available")
-def test_mine_hard_negatives_with_prompt(paraphrase_distilroberta_base_v1_model: SentenceTransformer) -> None:
+def test_mine_hard_negatives_with_prompt(stsb_bert_tiny_model: SentenceTransformer) -> None:
     """
     Tests that mine_hard_negatives runs with and without a prompt.
     """
-    model = paraphrase_distilroberta_base_v1_model
+    model = stsb_bert_tiny_model
     # 1. Create a test dataset
     data = {
         "anchor": [
@@ -1376,3 +1794,120 @@ def test_missing_negatives(
     assert len(result) < expected_max_count
     captured = capsys.readouterr()
     assert "Could not find enough negatives" in captured.out
+
+
+class ControlledNegativeScoreModel:
+    """Deterministic model whose anchor-positive score is negative, with a candidate negative
+    that is *more* similar to the anchor than the positive (see #3819)."""
+
+    device = torch.device("cpu")
+    model_card_data = SimpleNamespace(base_model="controlled-negative-score-model")
+
+    def __init__(self) -> None:
+        self.embeddings = {
+            "q": torch.tensor([1.0, 0.0]),
+            "p": torch.tensor([-0.50, math.sqrt(1 - 0.50**2)]),
+            "n_more_similar": torch.tensor([-0.49, math.sqrt(1 - 0.49**2)]),
+            "n_far": torch.tensor([-0.80, math.sqrt(1 - 0.80**2)]),
+        }
+
+    def encode_query(self, texts, **kwargs):
+        return torch.stack([self.embeddings[text] for text in texts]).numpy()
+
+    def encode_document(self, texts, **kwargs):
+        return torch.stack([self.embeddings[text] for text in texts]).numpy()
+
+    def similarity(self, queries, corpus):
+        return torch.as_tensor(queries, dtype=torch.float32) @ torch.as_tensor(corpus, dtype=torch.float32).T
+
+    def similarity_pairwise(self, queries, positives):
+        return (torch.as_tensor(queries, dtype=torch.float32) * torch.as_tensor(positives, dtype=torch.float32)).sum(
+            dim=1
+        )
+
+
+def test_relative_margin_with_negative_positive_score() -> None:
+    """`relative_margin` must not keep a negative that is more similar to the anchor than the
+    positive pair when the positive-pair score is negative (#3819)."""
+    dataset = Dataset.from_dict({"query": ["q"], "positive": ["p"]})
+    result = mine_hard_negatives(
+        dataset=dataset,
+        model=ControlledNegativeScoreModel(),
+        anchor_column_name="query",
+        positive_column_name="positive",
+        corpus=["p", "n_more_similar", "n_far"],
+        range_max=2,
+        relative_margin=0.05,
+        num_negatives=1,
+        output_scores=True,
+        verbose=False,
+    )
+    row = result[0]
+    positive_score, negative_score = row["scores"]
+    assert row["negative"] == "n_far"
+    assert negative_score < positive_score
+
+
+def test_range_max_larger_than_corpus_does_not_crash() -> None:
+    """Requesting more candidates than the corpus holds must not crash the default (non-FAISS)
+    path. `torch.topk` cannot return more columns than the corpus size, so the candidate set is
+    capped at the corpus size and padded up, mirroring the FAISS branch."""
+    dataset = Dataset.from_dict({"query": ["q"], "positive": ["p"]})
+    # The corpus has only 3 unique entries, yet range_max + max_positives (11) asks for far more.
+    result = mine_hard_negatives(
+        dataset=dataset,
+        model=ControlledNegativeScoreModel(),
+        anchor_column_name="query",
+        positive_column_name="positive",
+        corpus=["p", "n_more_similar", "n_far"],
+        range_max=10,
+        num_negatives=1,
+        use_faiss=False,
+        output_scores=True,
+        verbose=False,
+    )
+    assert len(result) == 1
+    row = result[0]
+    # The top real negative must be returned, with the positive excluded and no padding leaking through.
+    assert row["negative"] == "n_more_similar"
+    positive_score, negative_score = row["scores"]
+    assert positive_score == pytest.approx(-0.50)
+    assert negative_score == pytest.approx(-0.49)
+
+
+def test_missing_negatives_message_names_range_max(capsys: pytest.CaptureFixture) -> None:
+    """With only range_max to suggest, the "Could not find enough negatives" message must still
+    name it instead of printing an empty parameter list."""
+    dataset = Dataset.from_dict({"query": ["q"], "positive": ["p"]})
+    mine_hard_negatives(
+        dataset=dataset,
+        model=ControlledNegativeScoreModel(),
+        anchor_column_name="query",
+        positive_column_name="positive",
+        corpus=["p", "n_more_similar", "n_far"],
+        num_negatives=5,
+        verbose=True,
+    )
+    captured = capsys.readouterr()
+    assert "Consider adjusting the range_max parameter if" in captured.out
+
+
+def test_one_column_dataset_raises_value_error(queries) -> None:
+    dataset = Dataset.from_dict({"anchor": queries[:3]})
+
+    with pytest.raises(ValueError, match="Dataset must contain at least two columns"):
+        mine_hard_negatives(dataset=dataset, model=SimpleNamespace(), verbose=False)
+
+
+def test_default_column_selection_allows_extra_columns() -> None:
+    dataset = Dataset.from_dict({"query": ["q"], "positive": ["p"], "metadata": [1]})
+
+    result = mine_hard_negatives(
+        dataset=dataset,
+        model=ControlledNegativeScoreModel(),
+        corpus=["p", "n_more_similar", "n_far"],
+        num_negatives=1,
+        verbose=False,
+    )
+
+    assert result.to_dict() == {"query": ["q"], "positive": ["p"], "negative": ["n_more_similar"]}

@@ -2,11 +2,42 @@ from __future__ import annotations
 
 import logging
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 from huggingface_hub import hf_hub_download, snapshot_download
-from huggingface_hub.utils import EntryNotFoundError, HFValidationError, LocalEntryNotFoundError
+from huggingface_hub.utils import (
+    EntryNotFoundError,
+    HFValidationError,
+    LocalEntryNotFoundError,
+    RepositoryNotFoundError,
+    RevisionNotFoundError,
+)
 from tqdm.autonotebook import tqdm
+
+# hf_hub v1.31.0+ exports its HTTP library as httpx, allowing a switch to httpx2.
+# Older versions depend on httpx directly, so we can import it safely as a fallback.
+try:
+    from huggingface_hub.utils import httpx
+except ImportError:
+    import httpx
+
+try:
+    from huggingface_hub import resolve_revision as _hub_resolve_revision
+    from huggingface_hub.errors import RevisionResolutionError
+except ImportError:
+    _hub_resolve_revision = None
+
+    class RevisionResolutionError(Exception):
+        """Placeholder for Hub versions that cannot resolve revisions, and so never raise this."""
+
+
+try:
+    from huggingface_hub.errors import IncompleteSnapshotError
+except ImportError:
+
+    class IncompleteSnapshotError(Exception):
+        """Placeholder for Hub versions without cached tree listings, which never raise this."""
+
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +60,54 @@ class disabled_tqdm(tqdm):
         except AttributeError:
             if attr != "_lock":
                 raise
+
+
+def _resolve_model_revision(
+    model_name_or_path: str,
+    revision: str | None,
+    *,
+    token: bool | str | None = None,
+    cache_folder: str | None = None,
+    local_files_only: bool = False,
+) -> str | None:
+    """Resolve a Hub revision once when supported.
+
+    Falls back to the requested revision on older Hub versions, and when resolution fails for any reason other
+    than a missing repository or revision (rate limits, an unreachable Hub, ...), so that loading degrades to
+    per-file resolution instead of failing outright. An inaccessible repository (missing, or private or gated
+    without a valid token) is resolved from the local cache when possible.
+    """
+    if _hub_resolve_revision is None:
+        return revision
+
+    try:
+        return _hub_resolve_revision(
+            model_name_or_path,
+            revision=revision,
+            token=token,
+            cache_dir=cache_folder,
+            local_files_only=local_files_only,
+        )
+    except RevisionNotFoundError:
+        raise
+    except RepositoryNotFoundError as not_found:
+        # Like hf_hub_download, fall back to the cache for private or gated repositories
+        # when the token is missing or invalid
+        try:
+            return _hub_resolve_revision(
+                model_name_or_path, revision=revision, cache_dir=cache_folder, local_files_only=True
+            )
+        except Exception:
+            raise not_found from None
+    except RevisionResolutionError:
+        # The Hub is unreachable or excluded and nothing is cached, so the regular loading path reports the error
+        return revision
+    except Exception as exc:
+        logger.warning(
+            f"Could not resolve the revision of {model_name_or_path!r} ({exc}). "
+            "Loading without pinning to a single commit."
+        )
+        return revision
 
 
 def is_sentence_transformer_model(
@@ -70,6 +149,15 @@ def is_sentence_transformer_model(
     )
 
 
+def _validate_relative_path(path: str | Path) -> None:
+    """Reject rooted paths and parent traversal in both POSIX and Windows syntax."""
+    if not isinstance(path, (str, Path)):
+        raise ValueError(f"Invalid model path {path!r}: expected a relative path.")
+    windows_path = PureWindowsPath(path)
+    if windows_path.anchor or ".." in windows_path.parts or "\0" in str(path):
+        raise ValueError(f"Invalid model path {str(path)!r}: expected a relative path without '..' components.")
+
+
 def load_file_path(
     model_name_or_path: str,
     filename: str | Path,
@@ -92,6 +180,7 @@ def load_file_path(
         local_files_only (bool, optional): Whether to only consider local files. Defaults to False.
 
     Raises:
+        ValueError: If ``subfolder`` or ``filename`` is rooted or contains parent traversal.
         Exception: Errors that are not unambiguously "this file is not on the Hub"
             propagate to the caller (e.g. authentication, rate-limit, network). Only
             ``EntryNotFoundError``, ``HFValidationError``, and ``LocalEntryNotFoundError``
@@ -101,6 +190,9 @@ def load_file_path(
         Optional[str]: The path to the loaded file, or ``None`` if the file is not present
         locally and the Hub confirms it is not in the repo (or no valid repo id was given).
     """
+    _validate_relative_path(subfolder)
+    _validate_relative_path(filename)
+
     # If file is local
     file_path = Path(model_name_or_path, subfolder, filename)
     if file_path.exists():
@@ -150,16 +242,18 @@ def load_dir_path(
         local_files_only (bool, optional): Whether to only use local files. Defaults to False.
 
     Raises:
+        ValueError: If ``subfolder`` is rooted or contains parent traversal.
         Exception: Errors that are not unambiguously "this is not on the Hub" propagate
             to the caller. ``HFValidationError`` and ``LocalEntryNotFoundError`` are
             converted to a ``None`` return. Other failures (auth, rate-limit, network)
-            trigger a single cache-only retry; if the cache also lacks the file, the
+            trigger a single cache-only retry. If the cache also lacks the file, the
             original exception is re-raised (a cache miss would mask the real cause).
 
     Returns:
         Optional[str]: The subfolder path, or ``None`` if the parent is a local directory
         without the subfolder, or no valid repo id was given.
     """
+    _validate_relative_path(subfolder)
     if isinstance(subfolder, Path):
         subfolder = subfolder.as_posix()
 
@@ -172,10 +266,11 @@ def load_dir_path(
     if Path(model_name_or_path).is_dir():
         return None
 
+    wants_subfolder = subfolder not in ["", "."]
     download_kwargs = {
         "repo_id": model_name_or_path,
         "revision": revision,
-        "allow_patterns": f"{subfolder}/**" if subfolder not in ["", "."] else None,
+        "allow_patterns": f"{subfolder}/**" if wants_subfolder else None,
         "library_name": "sentence-transformers",
         "token": token,
         "cache_dir": cache_folder,
@@ -185,6 +280,10 @@ def load_dir_path(
     # Try to download from the remote
     try:
         repo_path = snapshot_download(**download_kwargs)
+    except IncompleteSnapshotError:
+        # The Hub call failed, for example on a rate limit, and the cached snapshot lacks requested files.
+        # Unlike its LocalEntryNotFoundError parent this is transient, so it must not become a None return.
+        raise
     except (HFValidationError, LocalEntryNotFoundError) as exc:
         # Unambiguous "not found" / "not cached" cases.
         logger.debug(f"Could not load subfolder {subfolder!r} from {model_name_or_path!r}: {exc}")
@@ -199,6 +298,18 @@ def load_dir_path(
             # (with `from None` to suppress the cache miss from the traceback) so the
             # user sees the real cause, e.g. rate limit, not the misleading cache miss.
             raise first_error from None
+        if wants_subfolder and not Path(repo_path, subfolder).is_dir():
+            # A cached snapshot that never received this subfolder is a cache miss as well
+            raise first_error from None
+        return str(Path(repo_path, subfolder))
+
+    if wants_subfolder and not Path(repo_path, subfolder).is_dir():
+        # When its Hub call fails, for example on a rate limit, snapshot_download can hand back an existing
+        # cached snapshot without raising, even if that snapshot never received this subfolder
+        raise OSError(
+            f"Could not download {subfolder!r} of {model_name_or_path!r} from the Hub, "
+            "and the local cache does not contain it."
+        )
     return str(Path(repo_path, subfolder))
 
 
@@ -215,18 +326,12 @@ def http_get(url: str, path: str) -> None:
         path (str): Destination file path on the local filesystem.
 
     Raises:
-        ImportError: If the optional ``httpx`` dependency is not installed.
         httpx.HTTPStatusError: If the HTTP request returns a non-success status code.
         OSError: If the file cannot be written to ``path``.
 
     Returns:
         None
     """
-    try:
-        import httpx
-    except ImportError:
-        raise ImportError("httpx is required to use this function. Please install it via `pip install httpx`.")
-
     if os.path.dirname(path) != "":
         os.makedirs(os.path.dirname(path), exist_ok=True)
 

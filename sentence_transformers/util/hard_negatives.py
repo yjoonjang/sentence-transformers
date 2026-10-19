@@ -80,8 +80,8 @@ def mine_hard_negatives(
       to the anchor is within a certain margin of the positive pair. A value of 0 can be used to enforce that the negative
       is always further away from the anchor than the positive.
     - **relative_margin**: Relative margin for hard negative mining: useful to skip candidate negatives whose similarity
-      to the anchor is within a certain margin of the positive pair. A value of 0.05 means that the negative is at most 95%
-      as similar to the anchor as the positive.
+      to the anchor is within a certain margin of the positive pair. A value of 0.05 keeps a negative only if its
+      similarity to the anchor is at least 5% of the positive score magnitude below the positive.
     - **sampling_strategy**: Sampling strategy for negatives: "top" or "random". "top" will always sample the top n
       candidates as negatives, while "random" will sample n negatives randomly from the candidates that satisfy the
       margin or max_score conditions.
@@ -95,7 +95,7 @@ def mine_hard_negatives(
             dataset = mine_hard_negatives(
                 dataset=dataset,
                 model=model,
-                relative_margin=0.05,         # 0.05 means that the negative is at most 95% as similar to the anchor as the positive
+                relative_margin=0.05,         # keep negatives at least 5% of the positive score magnitude below the positive
                 num_negatives=num_negatives,  # 10 or less is recommended
                 sampling_strategy="top",      # "top" means that we sample the top candidates as negatives
                 batch_size=batch_size,        # Adjust as needed
@@ -182,16 +182,20 @@ def mine_hard_negatives(
             in addition to the second column in `dataset`. Defaults to None, in which case the second column in
             `dataset` will exclusively be used as the negative candidate corpus.
         cross_encoder (CrossEncoder, optional): A CrossEncoder model to use for rescoring the candidates. Defaults to None.
-        range_min (int): Minimum rank of the closest matches to consider as negatives. Defaults to 0.
-        range_max (int, optional): Maximum rank of the closest matches to consider as negatives. Defaults to None.
+        range_min (int): Minimum rank of the closest matches to consider as negatives. Must be non-negative.
+            Defaults to 0.
+        range_max (int, optional): Maximum rank of the closest matches to consider as negatives. Must leave at least
+            `num_negatives` candidates after `range_min`. Defaults to None.
         max_score (float, optional): Maximum score to consider as a negative. Defaults to None.
         min_score (float, optional): Minimum score to consider as a negative. Defaults to None.
         absolute_margin (float, optional): Absolute margin for hard negative mining, i.e. the minimum distance between
             the positive similarity and the negative similarity. Defaults to None.
-        relative_margin (float, optional): Relative margin for hard negative mining, i.e. the maximum ratio between
-            the positive similarity and the negative similarity. A value of 0.05 means that the negative is at most
-            95% as similar to the anchor as the positive. Defaults to None.
-        num_negatives (int): Number of negatives to sample. Defaults to 3.
+        relative_margin (float, optional): Relative margin for hard negative mining, i.e. the minimum distance between
+            the positive similarity and the negative similarity as a fraction of the positive score magnitude. A value
+            of 0.05 discards negatives whose similarity is greater than ``positive_score - abs(positive_score) * 0.05``.
+            Defaults to None.
+        num_negatives (int): Number of negatives to sample. Must be at least 1, and must fit in the candidate
+            window left by `range_min` and `range_max`. Defaults to 3.
         sampling_strategy (Literal["random", "top"]): Sampling strategy for negatives: "top" or "random". Defaults to "top".
         query_prompt_name (Optional[str], optional): The name of a predefined prompt to use when encoding the first/anchor dataset column.
             It must match a key in the ``model.prompts`` dictionary, which can be set during model initialization
@@ -235,7 +239,9 @@ def mine_hard_negatives(
         faiss_batch_size (int): Batch size of queries for the top-k similarity search, both with FAISS and without
             (``use_faiss=False``), where it bounds the size of the intermediate similarity matrix to
             ``faiss_batch_size * len(corpus)``. Defaults to 16384.
-        use_faiss (bool): Whether to use FAISS for similarity search. May be recommended for large datasets. Defaults to False.
+        use_faiss (bool): Whether to use FAISS for similarity search. May be recommended for large datasets. Requires
+            the ``faiss-cpu`` or ``faiss-gpu`` package. On GPU, FAISS can retrieve at most 2048 documents per query,
+            so an automatically derived ``range_max`` is capped to fit. Defaults to False.
         use_multi_process (bool | List[str], optional): Whether to use multi-GPU/CPU processing. If True, uses all GPUs if CUDA
             is available, and 4 CPU processes if it's not available. You can also pass a list of PyTorch devices like
             ["cuda:0", "cuda:1", ...] or ["cpu", "cpu", "cpu", "cpu"].
@@ -243,7 +249,9 @@ def mine_hard_negatives(
         cache_folder (str, optional): Directory path for caching embeddings. If provided, the function will save
             ``query_embeddings_{hash}.npy`` and ``corpus_embeddings_{hash}.npy`` under this folder after the first run,
             and on subsequent calls will load from these files if they exist to avoid recomputation. The hashes are
-            computed based on the model name and the queries/corpus. Defaults to None.
+            computed based on the model name, the query/corpus prompts, and the queries/corpus, so changing the prompt
+            arguments invalidates the cache rather than silently returning embeddings from a different prompt.
+            Defaults to None.
         as_triplets (bool, optional): Deprecated. Use `output_format` instead. Defaults to None.
         margin (float, optional): Deprecated. Use `absolute_margin` or `relative_margin` instead. Defaults to None.
 
@@ -271,6 +279,15 @@ def mine_hard_negatives(
     if faiss_batch_size <= 0:
         raise ValueError(f"faiss_batch_size must be a positive integer, got {faiss_batch_size}.")
 
+    if use_faiss:
+        try:
+            import faiss
+        except ImportError as exc:
+            raise ImportError(
+                "Please install `faiss` to use this function with `use_faiss=True`: "
+                "`pip install faiss-cpu` (or `faiss-gpu`)."
+            ) from exc
+
     from datasets import Dataset
 
     # If a dataset has duplicate queries, assume that all duplicates are positive pairs.
@@ -280,10 +297,9 @@ def mine_hard_negatives(
         anchor_column_name = columns[0]
 
     if not positive_column_name or positive_column_name not in columns:
+        if len(columns) < 2:
+            raise ValueError("Dataset must contain at least two columns to select the positive column automatically.")
         positive_column_name = columns[1]
-
-    if not anchor_column_name and not positive_column_name and len(columns) != 2:
-        raise ValueError("Dataset must contain exactly two columns.")
 
     if as_triplets is not None:
         output_format = "triplet" if as_triplets else "n-tuple"
@@ -297,12 +313,16 @@ def mine_hard_negatives(
             range_min != 0
             or range_max is not None
             or max_score is not None
+            or min_score is not None
+            or absolute_margin is not None
+            or relative_margin is not None
             or margin is not None
             or sampling_strategy != "top"
         ):
             logger.warning(
-                "When using `include_positives=True`, updating `range_min`, `range_max`, `max_score`, `margin`, or "
-                "`sampling_strategy` from the default values may still discard the positive values."
+                "When using `include_positives=True`, updating `range_min`, `range_max`, `max_score`, `min_score`, "
+                "`absolute_margin`, `relative_margin`, or `sampling_strategy` from the default values may still "
+                "discard the positive values."
             )
         if output_format != "n-tuple":
             logger.warning(
@@ -336,20 +356,57 @@ def mine_hard_negatives(
     )
     max_positives = max(positives_per_query)
 
+    # range_max is derived from num_negatives below, so a non-positive value has to be rejected first: it would
+    # otherwise surface as a confusing range_min/range_max error, or mine nothing at all without saying so.
+    if num_negatives < 1:
+        raise ValueError(f"num_negatives must be at least 1, got num_negatives={num_negatives}.")
+
+    faiss_cap_note = ""
     if range_max is None:
-        if absolute_margin is not None or relative_margin is not None or max_score is not None:
+        if (
+            absolute_margin is not None
+            or relative_margin is not None
+            or max_score is not None
+            or (cross_encoder is not None and min_score is not None)
+        ):
             # max_positives + 10 * num_negatives negatives because some might be skipped, and range_min skipped
             range_max = range_min + (num_negatives * 10) + max_positives
         else:
             # max_positives, num_negatives negatives, and range_min skipped
             range_max = range_min + num_negatives + max_positives
-        if range_max > 2048 and use_faiss:
-            # FAISS on GPU can only retrieve up to 2048 documents per query
-            range_max = 2048
-            if verbose:
-                print("Using FAISS, we can only retrieve up to 2048 documents per query. Setting range_max to 2048.")
+        if use_faiss and range_max + max_positives > 2048:
+            # FAISS on GPU raises if asked to retrieve more than 2048 documents per query, and the search
+            # retrieves range_max + max_positives of them. FAISS on CPU has no such limit.
+            if getattr(faiss, "get_num_gpus", lambda: 0)() > 0:
+                range_max = 2048 - max_positives
+                faiss_cap_note = (
+                    f" Note that range_max was capped to {range_max} because FAISS on GPU can only retrieve up to"
+                    " 2048 documents per query, some of which are reserved for the positives. Passing use_faiss=False"
+                    " lifts that cap, although it can cost a lot more memory."
+                )
+                if verbose:
+                    print(
+                        "Using FAISS on GPU, we can only retrieve up to 2048 documents per query, some of which "
+                        f"are reserved for the positives. Setting range_max to {range_max}."
+                    )
         if verbose:
             print(f"Setting range_max to {range_max} based on the provided parameters.")
+
+    if range_min < 0:
+        raise ValueError(f"range_min must be non-negative, got range_min={range_min}.")
+
+    if range_min >= range_max:
+        raise ValueError(
+            f"range_min must be smaller than range_max, "
+            f"got range_min={range_min} and range_max={range_max}.{faiss_cap_note}"
+        )
+
+    if num_negatives > range_max - range_min:
+        raise ValueError(
+            f"Cannot mine {num_negatives} negatives per query: only {range_max - range_min} candidates remain after "
+            f"skipping the first range_min={range_min} of range_max={range_max}. Consider decreasing num_negatives "
+            f"or range_min, or increasing range_max.{faiss_cap_note}"
+        )
 
     log_counters = {}
     queries = list(dataset[anchor_column_name])
@@ -378,7 +435,7 @@ def mine_hard_negatives(
     if n_queries != len(all_queries) and verbose:
         print(f"Found {n_queries} unique queries out of {len(all_queries)} total queries.")
 
-    if max_positives > 1:
+    if max_positives > 1 and verbose:
         avg_positives_per_query = np.mean(positives_per_query)
         print(f"Found an average of {avg_positives_per_query:.3f} positives per query.")
 
@@ -389,8 +446,14 @@ def mine_hard_negatives(
         os.makedirs(cache_folder, exist_ok=True)
 
         model_name = model.model_card_data.base_model or ""
-        query_hash = hashlib.sha256((model_name + "".join(queries)).encode(), usedforsecurity=False).hexdigest()
-        corpus_hash = hashlib.sha256((model_name + "".join(corpus)).encode(), usedforsecurity=False).hexdigest()
+        query_hash = hashlib.sha256(
+            repr((model_name, query_prompt, query_prompt_name, queries)).encode(),
+            usedforsecurity=False,
+        ).hexdigest()
+        corpus_hash = hashlib.sha256(
+            repr((model_name, corpus_prompt, corpus_prompt_name, corpus)).encode(),
+            usedforsecurity=False,
+        ).hexdigest()
 
         query_cache_file = os.path.join(cache_folder, f"query_embeddings_{query_hash}.npy")
         corpus_cache_file = os.path.join(cache_folder, f"corpus_embeddings_{corpus_hash}.npy")
@@ -413,30 +476,32 @@ def mine_hard_negatives(
             )
         else:
             pool = None
-        if corpus_embeddings is None:
-            corpus_embeddings = model.encode_document(
-                corpus,
-                pool=pool,
-                batch_size=batch_size,
-                normalize_embeddings=True,
-                convert_to_numpy=True,
-                show_progress_bar=True,
-                prompt_name=corpus_prompt_name,
-                prompt=corpus_prompt,
-            )
-        if query_embeddings is None:
-            query_embeddings = model.encode_query(
-                queries,
-                pool=pool,
-                batch_size=batch_size,
-                normalize_embeddings=True,
-                convert_to_numpy=True,
-                show_progress_bar=True,
-                prompt_name=query_prompt_name,
-                prompt=query_prompt,
-            )
-        if use_multi_process:
-            model.stop_multi_process_pool(pool)
+        try:
+            if corpus_embeddings is None:
+                corpus_embeddings = model.encode_document(
+                    corpus,
+                    pool=pool,
+                    batch_size=batch_size,
+                    normalize_embeddings=True,
+                    convert_to_numpy=True,
+                    show_progress_bar=True,
+                    prompt_name=corpus_prompt_name,
+                    prompt=corpus_prompt,
+                )
+            if query_embeddings is None:
+                query_embeddings = model.encode_query(
+                    queries,
+                    pool=pool,
+                    batch_size=batch_size,
+                    normalize_embeddings=True,
+                    convert_to_numpy=True,
+                    show_progress_bar=True,
+                    prompt_name=query_prompt_name,
+                    prompt=query_prompt,
+                )
+        finally:
+            if use_multi_process:
+                model.stop_multi_process_pool(pool)
 
     if cache_folder:
         if not os.path.exists(query_cache_file):
@@ -450,8 +515,6 @@ def mine_hard_negatives(
                 print(f"[Cache] Saved corpus embeddings to {corpus_cache_file}")
 
     if use_faiss:
-        import faiss
-
         index = faiss.IndexFlatIP(model.get_embedding_dimension())
         # Move the index to the GPU if available
         try:
@@ -469,7 +532,8 @@ def mine_hard_negatives(
         # Iterate over query embeddings in batches so we can track the progress
         for i in trange(0, len(query_embeddings), faiss_batch_size, desc="Querying FAISS index"):
             query_chunk = query_embeddings[i : i + faiss_batch_size]
-            scores, indices = index.search(query_chunk, k=range_max + 1)
+            # Keep the range_max + max_positives highest scores. We offset by max_positives to leave room for the positive pair(s).
+            scores, indices = index.search(query_chunk, k=range_max + max_positives)
             scores_list.append(scores)
             indices_list.append(indices)
         scores = torch.from_numpy(np.concatenate(scores_list, axis=0)).to(device)
@@ -479,17 +543,25 @@ def mine_hard_negatives(
         scores_list = []
         indices_list = []
         corpus_embeddings = torch.as_tensor(corpus_embeddings)
+        # torch.topk raises if k exceeds the corpus size, so cap it here and pad back up below.
+        k = min(range_max + max_positives, len(corpus))
         # Compute the similarity scores between the queries and the corpus in batches, to avoid
         # materializing the full (n_queries, n_corpus) similarity matrix
         for i in trange(0, len(query_embeddings), faiss_batch_size, desc="Computing similarity scores"):
             chunk_scores = model.similarity(query_embeddings[i : i + faiss_batch_size], corpus_embeddings).to(device)
 
             # Keep only the range_max + max_positives highest scores. We offset by max_positives to leave room for the positive pair(s).
-            chunk_scores, chunk_indices = torch.topk(chunk_scores, k=range_max + max_positives, dim=1)
+            chunk_scores, chunk_indices = torch.topk(chunk_scores, k=k, dim=1)
             scores_list.append(chunk_scores)
             indices_list.append(chunk_indices)
         scores = torch.cat(scores_list, dim=0)
         indices = torch.cat(indices_list, dim=0)
+
+        # Pad back up to range_max + max_positives columns with index -1, mirroring the FAISS branch.
+        missing = (range_max + max_positives) - scores.size(1)
+        if missing > 0:
+            scores = torch.cat([scores, scores.new_full((scores.size(0), missing), -float("inf"))], dim=1)
+            indices = torch.cat([indices, indices.new_full((indices.size(0), missing), -1)], dim=1)
 
     # As we may have duplicated queries (i.e., a single query with multiple positives),
     # We keep track, for each unique query, of where their positives are in the list of positives (positive_indices).
@@ -523,7 +595,7 @@ def mine_hard_negatives(
 
     # Rescore with cross_encoder
     if cross_encoder is not None and (
-        absolute_margin is not None or relative_margin is not None or max_score is not None
+        absolute_margin is not None or relative_margin is not None or max_score is not None or min_score is not None
     ):
         if use_multi_process:
             pool = cross_encoder.start_multi_process_pool(
@@ -531,25 +603,32 @@ def mine_hard_negatives(
             )
         else:
             pool = None
-        for idx, candidate_idx in tqdm(enumerate(indices), desc="Rescoring with CrossEncoder", total=len(indices)):
-            query = queries[idx]
-            candidate_passages = [corpus[_idx] for _idx in candidate_idx]
-            num_candidates = len(candidate_passages)
-            pred_scores = cross_encoder.predict(
-                list(zip([query] * num_candidates, candidate_passages)),
+        try:
+            for idx, candidate_idx in tqdm(enumerate(indices), desc="Rescoring with CrossEncoder", total=len(indices)):
+                query = queries[idx]
+                candidate_passages = [corpus[_idx] for _idx in candidate_idx]
+                num_candidates = len(candidate_passages)
+                pred_scores = cross_encoder.predict(
+                    list(zip([query] * num_candidates, candidate_passages)),
+                    batch_size=batch_size,
+                    convert_to_tensor=True,
+                    pool=pool,
+                ).to(device)
+                scores[idx] = pred_scores
+            positive_scores = cross_encoder.predict(
+                list(zip(all_queries, positives)),
                 batch_size=batch_size,
                 convert_to_tensor=True,
                 pool=pool,
             ).to(device)
-            scores[idx] = pred_scores
-        positive_scores = cross_encoder.predict(
-            list(zip(all_queries, positives)),
-            batch_size=batch_size,
-            convert_to_tensor=True,
-            pool=pool,
-        ).to(device)
-        if use_multi_process:
-            cross_encoder.stop_multi_process_pool(pool)
+        finally:
+            if use_multi_process:
+                cross_encoder.stop_multi_process_pool(pool)
+
+    # Both branches pad short result sets with index -1, which would otherwise resolve to the last
+    # corpus entry. Applied after the CrossEncoder rescoring, as that overwrites the score of every
+    # candidate.
+    scores[indices == -1] = -float("inf")
 
     if not include_positives:
         # for each query, create a mask that is True for the positives and False for the negatives in the indices
@@ -586,7 +665,10 @@ def mine_hard_negatives(
                 num_candidates -= num_skipped
 
         if relative_margin is not None:
-            removed_indices = scores > max_positive_scores.repeat(scores.size(1), 1).T * (1 - relative_margin)
+            # Subtract |positive| * margin rather than multiplying by (1 - margin): the latter is
+            # sign-dependent and raises the threshold for negative positive scores (#3819).
+            relative_threshold = max_positive_scores - max_positive_scores.abs() * relative_margin
+            removed_indices = scores > relative_threshold.repeat(scores.size(1), 1).T
             scores[removed_indices] = -float("inf")
 
             num_skipped = removed_indices.sum().item()
@@ -853,9 +935,10 @@ def mine_hard_negatives(
                 solutions.append("relative_margin")
             if max_score is not None:
                 solutions.append("max_score")
-            considerations = ", ".join(solutions[:-1])
             if len(solutions) > 1:
-                considerations += " and " + solutions[-1]
+                considerations = ", ".join(solutions[:-1]) + " and " + solutions[-1]
+            else:
+                considerations = solutions[0]
             missing_samples_ratio = missing_samples / maximum_possible_samples
             print(
                 f"Could not find enough negatives for {missing_samples} samples ({missing_samples_ratio:.2%})."

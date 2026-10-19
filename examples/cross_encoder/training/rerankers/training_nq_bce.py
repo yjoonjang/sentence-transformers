@@ -128,7 +128,8 @@ def main():
         warmup_steps=0.1,
         fp16=False,  # Set to False if you get an error that your GPU can't run on FP16
         bf16=True,  # Set to True if you have a GPU that supports BF16
-        dataloader_num_workers=4,
+        dataloader_num_workers=2,
+        dataloader_persistent_workers=True,  # Recommended on Windows/macOS, can be False on Linux
         load_best_model_at_end=True,
         metric_for_best_model="eval_nq-dev_ndcg@10",
         # Optional tracking/debugging parameters:
@@ -161,13 +162,13 @@ def main():
     model.save_pretrained(final_output_dir)
 
     # 9. (Optional) save the model to the Hugging Face Hub!
-    # It is recommended to run `huggingface-cli login` to log into your Hugging Face account first
+    # It is recommended to run `hf auth login` to log into your Hugging Face account first
     try:
         model.push_to_hub(run_name)
     except Exception:
         logging.error(
             f"Error uploading model to the Hugging Face Hub:\n{traceback.format_exc()}To upload it manually, you can run "
-            f"`huggingface-cli login`, followed by loading the model using `model = CrossEncoder({final_output_dir!r})` "
+            f"`hf auth login`, followed by loading the model using `model = CrossEncoder({final_output_dir!r})` "
             f"and saving it using `model.push_to_hub('{run_name}')`."
         )
 

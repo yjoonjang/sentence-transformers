@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-import heapq
 import json
 import logging
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -16,6 +15,7 @@ from sentence_transformers.base.evaluation.evaluator import BaseEvaluator
 from sentence_transformers.util.similarity import SimilarityFunction
 
 if TYPE_CHECKING:
+    from sentence_transformers.base.modality_types import SingleInput
     from sentence_transformers.sentence_transformer.model import SentenceTransformer
 
 logger = logging.getLogger(__name__)
@@ -43,7 +43,7 @@ class InformationRetrievalEvaluator(BaseEvaluator):
         name (str): A name for the evaluation. Defaults to "".
         write_csv (bool): Whether to write the evaluation results to a CSV file. Defaults to True.
         truncate_dim (int, optional): The dimension to truncate the embeddings to. Defaults to None.
-        score_functions (Dict[str, Callable[[Tensor, Tensor], Tensor]]): A dictionary mapping score function names to score functions. Defaults to the ``similarity`` function from the ``model``.
+        score_functions (Dict[str, Callable[[Tensor, Tensor], Tensor]]): A dictionary mapping score function names to score functions. Defaults to the ``similarity`` function of the model passed to each call, so a reused evaluator follows every model's own similarity.
         main_score_function (Union[str, SimilarityFunction], optional): The main score function to use for evaluation. Defaults to None.
         query_prompt (str, optional): The prompt to be used when encoding the corpus. Defaults to None.
         query_prompt_name (str, optional): The name of the prompt to be used when encoding the corpus. Defaults to None.
@@ -130,8 +130,8 @@ class InformationRetrievalEvaluator(BaseEvaluator):
 
     def __init__(
         self,
-        queries: dict[str, str],  # qid => query
-        corpus: dict[str, str],  # cid => doc
+        queries: dict[str, SingleInput],  # qid => query
+        corpus: dict[str, SingleInput],  # cid => doc
         relevant_docs: dict[str, set[str]],  # qid => Set[cid]
         corpus_chunk_size: int = 50000,
         mrr_at_k: list[int] = [10],
@@ -162,6 +162,7 @@ class InformationRetrievalEvaluator(BaseEvaluator):
 
         self.corpus_ids = list(corpus.keys())
         self.corpus = [corpus[cid] for cid in self.corpus_ids]
+        self._corpus_id_ranks = None
 
         self.query_prompt = query_prompt
         self.query_prompt_name = query_prompt_name
@@ -182,6 +183,7 @@ class InformationRetrievalEvaluator(BaseEvaluator):
         self.write_csv = write_csv
         self.score_functions = score_functions
         self.score_function_names = sorted(list(self.score_functions.keys())) if score_functions else []
+        self._score_functions_from_model = score_functions is None
         self.main_score_function = SimilarityFunction(main_score_function) if main_score_function else None
         self.truncate_dim = truncate_dim
 
@@ -214,6 +216,9 @@ class InformationRetrievalEvaluator(BaseEvaluator):
             for k in self.map_at_k:
                 self.csv_headers.append(f"{score_name}-MAP@{k}")
 
+    def _model_score_functions(self, model: SentenceTransformer) -> dict[str, Callable[[Tensor, Tensor], Tensor]]:
+        return {model.similarity_fn_name: model.similarity}
+
     def __call__(
         self,
         model: SentenceTransformer,
@@ -235,10 +240,17 @@ class InformationRetrievalEvaluator(BaseEvaluator):
 
         logger.info(f"Information Retrieval Evaluation of the model on the {self.name} dataset{out_txt}:")
 
-        if self.score_functions is None:
-            self.score_functions = {model.similarity_fn_name: model.similarity}
-            self.score_function_names = [model.similarity_fn_name]
-            self._append_csv_headers(self.score_function_names)
+        headers_changed = False
+        if self._score_functions_from_model:
+            # Resolved per call, so an evaluator reused across models scores and labels each of them
+            # with its own similarity rather than with the first model's.
+            self.score_functions = self._model_score_functions(model)
+            if self.score_function_names != sorted(self.score_functions):
+                headers_changed = bool(self.score_function_names)
+                self.score_function_names = sorted(self.score_functions)
+                self.csv_headers = ["epoch", "steps"]
+                self._append_csv_headers(self.score_function_names)
+                self.primary_metric = None
 
         scores = self.compute_all_metrics(model, output_path=output_path, *args, **kwargs)
 
@@ -252,6 +264,12 @@ class InformationRetrievalEvaluator(BaseEvaluator):
                 fOut.write("\n")
 
             else:
+                if headers_changed:
+                    logger.warning(
+                        f"{self.csv_file} was written with different score function columns, so the "
+                        f"rows appended for {self.score_function_names} are labeled with the previous "
+                        "score function."
+                    )
                 fOut = open(csv_path, mode="a", encoding="utf-8")
 
             output_data = [epoch, steps]
@@ -295,6 +313,14 @@ class InformationRetrievalEvaluator(BaseEvaluator):
         metrics = self.prefix_name_to_metrics(metrics, self.name)
         self.store_metrics_in_model_card_data(model, metrics, epoch, steps)
         return metrics
+
+    def get_corpus_id_ranks(self) -> Tensor:
+        """Position of each corpus entry in the ascending ``corpus_ids`` order, cached across calls."""
+        if self._corpus_id_ranks is None:
+            order = sorted(range(len(self.corpus_ids)), key=self.corpus_ids.__getitem__)
+            self._corpus_id_ranks = torch.empty(len(self.corpus_ids), dtype=torch.long)
+            self._corpus_id_ranks[torch.tensor(order, dtype=torch.long)] = torch.arange(len(self.corpus_ids))
+        return self._corpus_id_ranks
 
     def compute_all_metrics(
         self,
@@ -342,6 +368,9 @@ class InformationRetrievalEvaluator(BaseEvaluator):
                     prompt_name=self.corpus_prompt_name,
                     prompt=self.corpus_prompt,
                 )
+            elif isinstance(corpus_embeddings, Tensor) and corpus_embeddings.is_sparse:
+                indices = torch.arange(corpus_start_idx, corpus_end_idx, device=corpus_embeddings.device)
+                sub_corpus_embeddings = corpus_embeddings.index_select(0, indices)
             else:
                 sub_corpus_embeddings = corpus_embeddings[corpus_start_idx:corpus_end_idx]
 
@@ -350,27 +379,48 @@ class InformationRetrievalEvaluator(BaseEvaluator):
                 pair_scores = score_function(query_embeddings, sub_corpus_embeddings)
 
                 # Get top-k values
+                top_k = min(max_k, len(pair_scores[0]))
                 pair_scores_top_k_values, pair_scores_top_k_idx = torch.topk(
-                    pair_scores, min(max_k, len(pair_scores[0])), dim=1, largest=True, sorted=False
+                    pair_scores, top_k, dim=1, largest=True, sorted=False
                 )
+                # torch.topk breaks score ties arbitrarily. Rows with ties at the top_k-th score are
+                # reselected under the (-score, corpus_id) total order used for the final ranking, so
+                # the reported metrics do not depend on corpus_chunk_size.
+                thresholds = pair_scores_top_k_values.min(dim=1, keepdim=True).values
+                has_boundary_ties = ((pair_scores >= thresholds).sum(dim=1) > top_k).cpu().tolist()
+                if any(has_boundary_ties):
+                    # Order the candidates by (-score, corpus_id) with an integer key, so that only
+                    # top_k of them per query reach Python even when the whole chunk is tied: every
+                    # score above the cutoff sorts first, then the ties with the lowest corpus_ids.
+                    n_corpus = len(self.corpus_ids)
+                    chunk_ranks = self.get_corpus_id_ranks()[corpus_start_idx:corpus_end_idx].to(pair_scores.device)
+                    tie_keys = torch.where(pair_scores > thresholds, chunk_ranks, 2 * n_corpus)
+                    tie_keys = torch.where(pair_scores == thresholds, chunk_ranks + n_corpus, tie_keys)
+                    tie_idx = tie_keys.topk(top_k, dim=1, largest=False).indices
+                    tie_scores = pair_scores.gather(1, tie_idx).cpu().tolist()
+                    tie_idx = tie_idx.cpu().tolist()
                 pair_scores_top_k_values = pair_scores_top_k_values.cpu().tolist()
                 pair_scores_top_k_idx = pair_scores_top_k_idx.cpu().tolist()
 
                 for query_itr in range(len(query_embeddings)):
-                    for sub_corpus_id, score in zip(
-                        pair_scores_top_k_idx[query_itr], pair_scores_top_k_values[query_itr]
-                    ):
+                    if has_boundary_ties[query_itr]:
+                        sub_corpus_ids = tie_idx[query_itr]
+                        scores = tie_scores[query_itr]
+                    else:
+                        sub_corpus_ids = pair_scores_top_k_idx[query_itr]
+                        scores = pair_scores_top_k_values[query_itr]
+
+                    query_hits = queries_result_list[name][query_itr]
+                    for sub_corpus_id, score in zip(sub_corpus_ids, scores):
                         corpus_id = self.corpus_ids[corpus_start_idx + sub_corpus_id]
                         # NOTE: TREC/BEIR/MTEB skips cases where the corpus_id is the same as the query_id, e.g.:
                         # if corpus_id == self.queries_ids[query_itr]:
                         #     continue
                         # This is not done here, as this might be unexpected behaviour if the user just uses
                         # sets of integers from 0 as query_ids and corpus_ids.
-                        if len(queries_result_list[name][query_itr]) < max_k:
-                            # heaqp tracks the quantity of the first element in the tuple
-                            heapq.heappush(queries_result_list[name][query_itr], (score, corpus_id))
-                        else:
-                            heapq.heappushpop(queries_result_list[name][query_itr], (score, corpus_id))
+                        query_hits.append((score, corpus_id))
+                    query_hits.sort(key=lambda x: (-x[0], x[1]))
+                    del query_hits[max_k:]
 
         for name in queries_result_list:
             for query_itr in range(len(queries_result_list[name])):
@@ -391,8 +441,8 @@ class InformationRetrievalEvaluator(BaseEvaluator):
                         query_text = self.queries[query_itr]
                         results = queries_result_list[name][query_itr]
 
-                        # Sort results by score in descending order
-                        results = sorted(results, key=lambda x: x["score"], reverse=True)
+                        # Sort results by descending score, breaking ties by ascending corpus_id
+                        results = sorted(results, key=lambda x: (-x["score"], x["corpus_id"]))
 
                         prediction = {
                             "query_id": query_id,
@@ -421,7 +471,7 @@ class InformationRetrievalEvaluator(BaseEvaluator):
     def embed_inputs(
         self,
         model: SentenceTransformer,
-        sentences: str | list[str] | np.ndarray,
+        sentences: SingleInput | Sequence[SingleInput] | np.ndarray,
         encode_fn_name: str | None = None,
         prompt_name: str | None = None,
         prompt: str | None = None,
@@ -457,8 +507,8 @@ class InformationRetrievalEvaluator(BaseEvaluator):
         for query_itr in range(len(queries_result_list)):
             query_id = self.queries_ids[query_itr]
 
-            # Sort scores
-            top_hits = sorted(queries_result_list[query_itr], key=lambda x: x["score"], reverse=True)
+            # Sort scores in descending order, breaking ties by ascending corpus_id
+            top_hits = sorted(queries_result_list[query_itr], key=lambda x: (-x["score"], x["corpus_id"]))
             query_relevant_docs = self.relevant_docs[query_id]
 
             # Accuracy@k - We count the result correct, if at least one relevant doc is across the top-k documents

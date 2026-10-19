@@ -4,7 +4,7 @@ import json
 import os
 import warnings
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 try:
     from typing import Self
@@ -17,6 +17,9 @@ from safetensors.torch import load_model as load_safetensors_model
 from safetensors.torch import save_model as save_safetensors_model
 
 from sentence_transformers.util import load_dir_path, load_file_path
+
+if TYPE_CHECKING:
+    from sentence_transformers.base.model import BaseModel
 
 
 class Module(ABC, torch.nn.Module):
@@ -129,6 +132,7 @@ class Module(ABC, torch.nn.Module):
         cache_folder: str | None = None,
         revision: str | None = None,
         local_files_only: bool = False,
+        init_defaults: dict[str, Any] | None = None,
         **kwargs,
     ) -> Self:
         """
@@ -139,13 +143,16 @@ class Module(ABC, torch.nn.Module):
             subfolder (str, optional): The subfolder within the model directory to load from, e.g. ``"1_Pooling"``.
                 Defaults to ``""``.
             token (bool | str | None, optional): The token to use for authentication when loading from Hugging Face.
-                If None, tries to use a token saved using ``huggingface-cli login`` or the ``HF_TOKEN`` environment variable.
+                If None, tries to use a token saved using ``hf auth login`` or the ``HF_TOKEN`` environment variable.
                 Defaults to None.
             cache_folder (str | None, optional): The folder to use for caching the model files.
                 If None, uses the default cache folder for Hugging Face, ``~/.cache/huggingface``. Defaults to None.
             revision (str | None, optional): The revision of the model to load.
                 If None, uses the latest revision. Defaults to None.
             local_files_only (bool, optional): Whether to only load local files. Defaults to False.
+            init_defaults (dict[str, Any] | None, optional): Extra ``__init__`` defaults injected by the loading
+                model (see ``BaseModel._get_module_init_defaults``). Only fills keys the saved config omitted:
+                the saved config always wins. Defaults to None.
             **kwargs: Additional module-specific arguments used in an overridden ``load`` method, such as ``trust_remote_code``,
                 ``model_kwargs``, ``processor_kwargs``, ``config_kwargs``, ``backend``, etc.
 
@@ -160,6 +167,9 @@ class Module(ABC, torch.nn.Module):
             revision=revision,
             local_files_only=local_files_only,
         )
+        # The saved config has priority over init_defaults.
+        for key, value in (init_defaults or {}).items():
+            config.setdefault(key, value)
         return cls(**config)
 
     @classmethod
@@ -185,7 +195,7 @@ class Module(ABC, torch.nn.Module):
                 If None, uses the default configuration file name defined in the ``config_file_name`` class variable.
                 Defaults to None.
             token (bool | str | None, optional): The token to use for authentication when loading from Hugging Face.
-                If None, tries to use a token saved using ``huggingface-cli login`` or the ``HF_TOKEN`` environment variable.
+                If None, tries to use a token saved using ``hf auth login`` or the ``HF_TOKEN`` environment variable.
                 Defaults to None.
             cache_folder (str | None, optional): The folder to use for caching the model files.
                 If None, uses the default cache folder for Hugging Face, ``~/.cache/huggingface``. Defaults to None.
@@ -239,7 +249,7 @@ class Module(ABC, torch.nn.Module):
             subfolder (str, optional): The subfolder within the model directory to load from, e.g. ``"1_Pooling"``.
                 Defaults to ``""``.
             token (bool | str | None, optional): The token to use for authentication when loading from Hugging Face.
-                If None, tries to use a token saved using ``huggingface-cli login`` or the ``HF_TOKEN`` environment variable.
+                If None, tries to use a token saved using ``hf auth login`` or the ``HF_TOKEN`` environment variable.
                 Defaults to None.
             cache_folder (str | None, optional): The folder to use for caching the model files.
                 If None, uses the default cache folder for Hugging Face, ``~/.cache/huggingface``. Defaults to None.
@@ -277,7 +287,7 @@ class Module(ABC, torch.nn.Module):
             subfolder (str, optional): The subfolder within the model directory to load from, e.g. ``"1_Pooling"``.
                 Defaults to ``""``.
             token (bool | str | None, optional): The token to use for authentication when loading from Hugging Face.
-                If None, tries to use a token saved using ``huggingface-cli login`` or the ``HF_TOKEN`` environment variable.
+                If None, tries to use a token saved using ``hf auth login`` or the ``HF_TOKEN`` environment variable.
                 Defaults to None.
             cache_folder (str | None, optional): The folder to use for caching the model files.
                 If None, uses the default cache folder for Hugging Face, ``~/.cache/huggingface``. Defaults to None.
@@ -319,7 +329,7 @@ class Module(ABC, torch.nn.Module):
             subfolder (str, optional): The subfolder within the model directory to load from, e.g. ``"2_Dense"``.
                 Defaults to ``""``.
             token (bool | str | None, optional): The token to use for authentication when loading from Hugging Face.
-                If None, tries to use a token saved using ``huggingface-cli login`` or the ``HF_TOKEN`` environment variable.
+                If None, tries to use a token saved using ``hf auth login`` or the ``HF_TOKEN`` environment variable.
                 Defaults to None.
             cache_folder (str | None, optional): The folder to use for caching the model files.
                 If None, uses the default cache folder for Hugging Face, ``~/.cache/huggingface``. Defaults to None.
@@ -375,6 +385,22 @@ class Module(ABC, torch.nn.Module):
             model.load_state_dict(weights)
             return model
         return weights
+
+    def on_model_ready(self, model: BaseModel) -> None:
+        """
+        Hook called once the owning model is fully constructed, with every module, the tokenizer or
+        processor, and any legacy checkpoint fixups in place. Override it to resolve model-dependent
+        state, e.g. :class:`~sentence_transformers.multi_vector_encoder.modules.MultiVectorMask`
+        resolves its skiplist words against the model's tokenizer here. The default is a no-op.
+
+        The hook fires during model construction, so a module appended to an already-built model
+        (e.g. ``model.append(module)``) does not receive it. Call it yourself in that case, or set
+        the module's model-dependent state directly. Saving and reloading also runs it, so the state
+        is present again after a round trip.
+
+        Args:
+            model: The fully constructed model this module is part of.
+        """
 
     @abstractmethod
     def save(self, output_path: str, *args, safe_serialization: bool = True, **kwargs) -> None:
