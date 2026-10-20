@@ -58,6 +58,7 @@ from sentence_transformers.util.misc import ORIGINAL_TRANSFORMER_MODELS
 
 if TYPE_CHECKING:
     from accelerate.hooks import ModelHook
+    from mergekit.merge_methods import BatchOptions
     from transformers import PretrainedConfig
 
 logger = transformers_logging.get_logger(__name__)
@@ -833,87 +834,97 @@ class BaseModel(nn.Sequential, PeftAdapterMixin, ABC):
     @classmethod
     def merge(
         cls,
-        models: Sequence[str],
-        weights: Sequence[float] | None = None,
+        models: Sequence[str | Path | Self],
         method: str = "linear",
-        base_model: str | None = None,
-        output_path: str | None = None,
-        dtype: str = "float16",
-        device: str = "cpu",
-        densities: Sequence[float] | None = None,
-        mergekit_options: dict[str, Any] | None = None,
+        *,
+        base_model: str | Path | Self | None = None,
+        parameters: dict[str, Any] | None = None,
+        dtype: str | torch.dtype | None = torch.float32,
+        out_dtype: str | torch.dtype | None = None,
+        device: str | torch.device = "cpu",
+        batch_options: BatchOptions | None = None,
         **load_kwargs: Any,
     ) -> Self:
-        """Merge multiple models of this class into a new one via mergekit.
+        """Merge compatible models using mergekit's in-memory API.
 
-        Requires ``pip install sentence-transformers[merge]``. The transformer
-        body is merged with the chosen mergekit method; ST-specific weight
-        modules (``Dense``, ``LayerNorm``, ``WeightedLayerPooling``) currently
-        always fall back to a linear weighted average regardless of ``method``
-        (a warning is logged). Stateless modules (``Pooling``, ``Normalize``,
-        ...) must match across inputs and are copied from the first model.
+        Requires ``mergekit>=0.1.5``, available through the ``merge`` extra.
+        All models, including an optional base, must have matching module configurations,
+        tokenizer vocabularies, state keys, and tied weights. Models should be fine-tunes
+        of a common ancestor. The chosen method applies to every floating-point tensor,
+        including projection and classification heads.
 
-        All inputs must share the same ``modules.json`` structure.
+        Compatibility is checked before merging. For example, different pooling modes,
+        transformer configurations, or token-to-ID mappings are rejected even if weight
+        shapes match. Saved transformer metadata and dtype declarations may differ, and
+        model-level prompts may differ because the first model supplies the output's
+        prompts, but successful validation does not guarantee improved task performance.
+
+        All input weights and the merged result are held in memory. The inputs are left
+        unchanged. Configuration, prompts, and processors are inherited from the first
+        model, and a fresh model card is generated when saving.
 
         Args:
-            models: Two or more model paths or HF IDs. Two-model methods
-                (``slerp``, ``nuslerp``, ``nearswap``) require two distinct entries.
-            weights: Per-model weights. If ``None``, defaults to ``[1/n]*n`` for
-                blend methods (``linear``, ``slerp``) and ``[1.0]*n`` for
-                delta-based methods (``task_arithmetic``, ``ties``, ``dare_*``,
-                ``breadcrumbs``, ``della``). For ``slerp``, ``weights[1]`` is
-                used as the interpolation factor ``t``.
-            method: A mergekit merge method (``linear``, ``slerp``, ``ties``,
-                ``dare_ties``, ``dare_linear``, ``task_arithmetic``, ...). See
-                :data:`sentence_transformers.base.merging.SUPPORTED_METHODS`.
-            base_model: Required for delta-based methods. For ``slerp``,
-                defaults to ``models[0]``; if explicitly given, must be one of
-                ``models``.
-            output_path: Output directory for the merged model.
-            dtype: ``"float16"``, ``"bfloat16"``, or ``"float32"``. Prefer
-                ``bfloat16`` for delta methods to avoid truncating per-tensor deltas.
-            device: ``"cpu"`` or ``"cuda"`` for mergekit. ST-side state-dict
-                merging always runs on CPU.
-            densities: Per-model density for ``ties``/``dare_*``/``breadcrumbs``/
-                ``della``. Defaults to ``1.0`` each.
-            mergekit_options: Additional ``mergekit.options.MergeOptions`` overrides.
-            **load_kwargs: Forwarded to ``cls(...)`` when reloading the result.
+            models: Two or more model instances, local paths, or Hugging Face model IDs.
+            method: A registered mergekit method. Supported built-in options are
+                ``arcee_fusion``, ``breadcrumbs``, ``breadcrumbs_ties``, ``dare_linear``,
+                ``dare_ties``, ``della``, ``della_linear``, ``karcher``, ``linear``,
+                ``model_stock``, ``multislerp``, ``nearswap``, ``nuslerp``, ``ram``,
+                ``ramplus_tl``, ``sce``, ``slerp``, ``task_arithmetic``, and ``ties``.
+                See `mergekit's merge methods documentation
+                <https://github.com/arcee-ai/mergekit/blob/main/docs/merge_methods.md>`_
+                for descriptions and method-specific parameters. Defaults to ``linear``.
+            base_model: Reference model for methods operating on task vectors. It can
+                be one of the inputs or a separate model with the same architecture.
+                SLERP defaults to the first input as its base.
+            parameters: Mergekit parameters, such as ``{"weight": [0.6, 0.4]}`` for
+                linear merging or ``{"t": 0.4}`` for SLERP. Weight defaults to 1 for
+                methods accepting it, and SLERP defaults to ``t=0.5``. Other defaults
+                come from mergekit. Per-input maps use the indices in ``models``.
+                A separate base has index ``len(models)``. For task-vector methods,
+                weight sequences cover only non-base inputs, in their original order.
+            dtype: Dtype of floating-point inputs passed to the merge method, as a torch
+                dtype or its name. Defaults to float32. With None, mergekit promotes
+                the input dtypes separately for each tensor. Method-specific internal
+                computations may use a different precision.
+            out_dtype: Optional dtype to cast merged floating-point tensors to. With
+                None, preserve the method's output dtypes. For example, keep dtype at
+                float32 and set out_dtype to float16 to cast only after merging.
+            device: Device on which to merge and return the result. Defaults to CPU.
+            batch_options: Optional ``mergekit.merge_methods.BatchOptions`` controlling
+                tensor packing through ``max_bytes`` and ``max_groups``. This does not
+                limit total memory usage. With None, mergekit's defaults apply.
+            **load_kwargs: Arguments passed to ``cls(...)`` when loading paths or IDs.
 
         Returns:
-            A new instance of ``cls`` loaded from ``output_path``.
+            A new model in evaluation mode. Call ``merged.save_pretrained(path)`` or
+                ``merged.push_to_hub(repo_id)`` to save it.
 
-        Example:
-            ::
+        Example::
 
-                from sentence_transformers import SentenceTransformer
+            from sentence_transformers import SentenceTransformer
 
-                merged = SentenceTransformer.merge(
-                    models=[
-                        "sentence-transformers/all-MiniLM-L6-v2",
-                        "sentence-transformers/paraphrase-MiniLM-L6-v2",
-                    ],
-                    weights=[0.6, 0.4],
-                    method="linear",
-                    output_path="merged-minilm/",
-                )
-                emb = merged.encode(["Hello, world!"])
+            merged = SentenceTransformer.merge(
+                models=[
+                    "sentence-transformers/all-MiniLM-L6-v2",
+                    "sentence-transformers/multi-qa-MiniLM-L6-cos-v1",
+                ],
+                parameters={"weight": [0.6, 0.4]},
+            )
+            merged.save_pretrained("merged-MiniLM-L6")
+            embeddings = merged.encode(["Hello, world!"])
         """
         from sentence_transformers.base.merging import merge_models
-
-        if output_path is None:
-            raise ValueError("`output_path` is required for `merge`.")
 
         return merge_models(
             cls=cls,
             models=models,
-            weights=weights,
             method=method,
             base_model=base_model,
-            output_path=output_path,
+            parameters=parameters,
             dtype=dtype,
+            out_dtype=out_dtype,
             device=device,
-            densities=densities,
-            mergekit_options=mergekit_options,
+            batch_options=batch_options,
             **load_kwargs,
         )
 

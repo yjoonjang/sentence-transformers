@@ -1,19 +1,10 @@
-"""Merge two or more Sentence Transformers into a single model.
+"""Merge compatible fine-tunes with mergekit's public state-dict API.
 
-`Model merging <https://github.com/arcee-ai/mergekit>`_ combines the weights of
-multiple fine-tuned checkpoints into one model that often outperforms each
-individual input on downstream tasks - without any extra training. This script
-demonstrates how to call ``SentenceTransformer.merge`` for a few common merge
-methods.
+The selected method applies to every weight-bearing module. Configuration,
+prompts, and processors come from the first input. All input models and the
+merged result are held in memory. Evaluate the result on your target tasks.
 
-Requires ``mergekit``: install with ``pip install sentence-transformers[merge]``.
-
-All input models must share the same ``modules.json`` structure: same module
-classes in the same order, same pooling mode, same embedding dimension, etc.
-The transformer body is merged via mergekit; ``Pooling``/``Normalize`` are
-copied from the first model after a config equality check; and weight-bearing
-ST modules (``Dense``, ``LayerNorm``, ``WeightedLayerPooling``) are merged
-state-dict-wise with linear weight averaging.
+Requires mergekit>=0.1.5 via ``pip install sentence-transformers[merge]``.
 """
 
 from __future__ import annotations
@@ -24,47 +15,46 @@ from sentence_transformers import SentenceTransformer
 def main() -> None:
     inputs = [
         "sentence-transformers/all-MiniLM-L6-v2",
-        "sentence-transformers/paraphrase-MiniLM-L6-v2",
+        "sentence-transformers/multi-qa-MiniLM-L6-cos-v1",
     ]
     sentences = [
         "Model merging combines the weights of fine-tuned checkpoints.",
-        "It usually outperforms each individual model on downstream tasks.",
+        "Evaluate merged models on the tasks that matter to your application.",
     ]
 
-    # 1. Linear merge - simplest method, weighted average of all input weights.
+    # Linear merging takes a weighted average of corresponding tensors.
     linear_merged = SentenceTransformer.merge(
         models=inputs,
-        weights=[0.6, 0.4],
+        parameters={"weight": [0.6, 0.4]},
         method="linear",
-        output_path="merged-models/linear",
-        dtype="float16",
+        dtype="float32",
         device="cpu",
     )
+    linear_merged.save_pretrained("merged-linear")
     print("Linear merge:", linear_merged.encode(sentences).shape)
 
-    # 2. SLERP - spherical linear interpolation between exactly two models.
+    # SLERP interpolates between exactly two models. t=0.5 selects the midpoint.
     slerp_merged = SentenceTransformer.merge(
         models=inputs,
-        weights=[0.5, 0.5],
+        parameters={"t": 0.5},
         method="slerp",
-        output_path="merged-models/slerp",
-        dtype="float16",
+        dtype="float32",
         device="cpu",
     )
+    slerp_merged.save_pretrained("merged-slerp")
     print("SLERP merge:", slerp_merged.encode(sentences).shape)
 
-    # 3. TIES - delta-based method that requires a base model.
-    #    Each input contributes only its top-density delta from the base.
+    # TIES keeps the largest 70% of changes from the base and resolves sign conflicts.
+    # Here the first input is the base, so only the second contributes a task vector.
     ties_merged = SentenceTransformer.merge(
         models=inputs,
-        weights=[0.6, 0.4],
-        densities=[0.7, 0.7],
+        parameters={"density": 0.7},
         method="ties",
-        base_model="sentence-transformers/all-MiniLM-L6-v2",
-        output_path="merged-models/ties",
-        dtype="float16",
+        base_model=inputs[0],
+        dtype="float32",
         device="cpu",
     )
+    ties_merged.save_pretrained("merged-ties")
     print("TIES merge:", ties_merged.encode(sentences).shape)
 
 

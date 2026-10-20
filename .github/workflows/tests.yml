@@ -77,6 +77,12 @@ jobs:
       - name: Install model2vec
         run: uv pip install model2vec --system
 
+      - name: Install merge dependencies
+        if: matrix.python-version == '3.12' && runner.os == 'Linux'
+        run: |
+          uv pip install '.[merge]' --system
+          python -c "from mergekit.merge_methods import merge_state_dicts"
+
       - name: Run unit tests
         run: |
           python -m pytest --durations 20 -sv tests/
