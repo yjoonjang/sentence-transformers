@@ -395,11 +395,11 @@ def test_transformer_models(request, fixture_name, method, tmp_path):
     assert torch.isfinite(output).all()
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason="mergekit magnitude pruning rounds tiny tensors to zero")
 def test_ties_single_element_bias():
-    merge_methods.merge_state_dicts(
+    merged = merge_methods.merge_state_dicts(
         [{"bias": torch.tensor([0.0])}, {"bias": torch.tensor([1.0])}],
         "ties",
         base=0,
         parameters={"weight": 1.0, "density": 0.5},
     )
+    torch.testing.assert_close(merged["bias"], torch.tensor([1.0]))

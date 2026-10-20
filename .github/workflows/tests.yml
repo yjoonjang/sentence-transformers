@@ -72,16 +72,10 @@ jobs:
             echo -e "kenlm\nlibrosa\nnumba\nllvmlite" >> excludes.txt
           fi
       - name: Install dependencies
-        run: uv pip install '.[train]' --group test --excludes excludes.txt --system
+        run: uv pip install '.[train,merge]' --group test --excludes excludes.txt --system
 
       - name: Install model2vec
         run: uv pip install model2vec --system
-
-      - name: Install merge dependencies
-        if: matrix.python-version == '3.12' && runner.os == 'Linux'
-        run: |
-          uv pip install '.[merge]' --system
-          python -c "from mergekit.merge_methods import merge_state_dicts"
 
       - name: Run unit tests
         run: |
