@@ -260,6 +260,61 @@ def test_incompatible_models(model, problem):
 
 
 @pytest.mark.parametrize(
+    "activation,other_activation",
+    [
+        (torch.nn.LeakyReLU(0.1), torch.nn.LeakyReLU(0.9)),
+        (torch.nn.GELU("none"), torch.nn.GELU("tanh")),
+        (torch.nn.LayerNorm(2, eps=1e-5), torch.nn.LayerNorm(2, eps=1e-3)),
+    ],
+)
+def test_incompatible_torch_module_settings(model, activation, other_activation):
+    model[1].activation_function = activation
+    other = deepcopy(model)
+    other[1].activation_function = other_activation
+
+    with pytest.raises(ValueError, match="different configuration"):
+        SentenceTransformer.merge([model, other], parameters={"weight": [0, 1]})
+
+
+@pytest.mark.parametrize(
+    "activation",
+    [torch.nn.LeakyReLU(0.1), torch.nn.GELU("tanh"), torch.nn.LayerNorm(2, eps=1e-3)],
+)
+def test_matching_torch_module_settings(model, activation):
+    model[1].activation_function = activation
+    merged = SentenceTransformer.merge([model, deepcopy(model)])
+    torch.testing.assert_close(merged.encode(["hello world"]), model.encode(["hello world"]))
+
+
+@pytest.mark.parametrize("lora_alpha", [1, 10])
+def test_peft_adapters_rejected(stsb_bert_tiny_model, lora_alpha):
+    peft = pytest.importorskip("peft")
+    model = stsb_bert_tiny_model
+    other = deepcopy(model)
+    model.add_adapter(peft.LoraConfig(r=1, lora_alpha=1, target_modules=["query"]))
+    other.add_adapter(peft.LoraConfig(r=1, lora_alpha=lora_alpha, target_modules=["query"]))
+
+    with pytest.raises(ValueError, match="PEFT adapters"):
+        SentenceTransformer.merge([model, other], parameters={"weight": [0, 1]})
+
+
+@pytest.mark.parametrize("position", ["first", "second", "base"])
+def test_peft_adapter_on_single_input_or_base_rejected(stsb_bert_tiny_model, position):
+    peft = pytest.importorskip("peft")
+    model = stsb_bert_tiny_model
+    adapted = deepcopy(model)
+    adapted.add_adapter(peft.LoraConfig(r=1, lora_alpha=1, target_modules=["query"]))
+    models = [adapted, model] if position == "first" else [model, adapted]
+    kwargs = {}
+    if position == "base":
+        models = [model, model]
+        kwargs = {"method": "task_arithmetic", "base_model": adapted}
+
+    with pytest.raises(ValueError, match="PEFT adapters"):
+        SentenceTransformer.merge(models, **kwargs)
+
+
+@pytest.mark.parametrize(
     "kwargs,exception",
     [
         ({"parameters": {"weight": [1]}}, ValueError),

@@ -83,6 +83,8 @@ Use models with matching architectures, module configurations, tokenizer vocabul
 
 Validation checks these structural requirements, but does not verify common training ancestry or tokenizer preprocessing rules. Inputs should be fine-tunes of a common ancestor, and their tokenization and prompt conventions should be suitable for your task. Quantized models are not supported.
 
+Models with attached PEFT adapters are also rejected. Merge the adapters into the base weights and unload them before calling `merge`.
+
 ## Memory and Precision
 
 Merging runs on CPU in float32 by default. All input models, an optional separate base, and the merged result are held in memory, along with temporary working tensors. Account for this when merging large models.

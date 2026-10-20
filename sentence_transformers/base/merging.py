@@ -24,9 +24,10 @@ if TYPE_CHECKING:
 def _validate_models(models: Sequence[BaseModel]) -> None:
     """Check input compatibility before merging, using the first model as reference.
 
-    Require torch, no quantized modules, matching module names/types and configurations,
-    and matching tokenizer vocabularies and special tokens where exposed. Transformer
-    metadata, private config fields, dtypes, and model-level prompts may differ.
+    Require torch, no quantized modules or PEFT adapters, matching module names/types,
+    configurations and extra_repr settings, and matching tokenizer vocabularies and
+    special tokens where exposed. Transformer metadata, private config fields, dtypes,
+    and model-level prompts may differ.
     Accept legacy MLMTransformer wrappers and ignore derived SPLADE pooling dimensions.
     State keys, tied weights, shapes, and buffers are checked later. This does not
     verify tokenizer preprocessing, common training ancestry, or merge quality.
@@ -39,6 +40,11 @@ def _validate_models(models: Sequence[BaseModel]) -> None:
             raise ValueError("Model merging requires the torch backend.")
 
         modules = dict(model.named_modules())
+        if any(getattr(module, "peft_config", None) for module in modules.values()):
+            raise ValueError(
+                "Merging models with PEFT adapters is not supported. "
+                "Merge the adapters into the base weights and unload them first."
+            )
         if modules.keys() != reference.keys():
             raise ValueError(f"Model {index} has a different module structure from model 0.")
 
@@ -48,6 +54,8 @@ def _validate_models(models: Sequence[BaseModel]) -> None:
                 raise ValueError(f"Module {name!r} has a different type in model {index}.")
             if getattr(module, "is_quantized", False):
                 raise ValueError("Merging quantized models is not supported. Load unquantized models first.")
+            if module.extra_repr() != other.extra_repr():
+                raise ValueError(f"Module {name!r} has a different configuration in model {index}.")
 
             if isinstance(module, Module):
                 configs = [item.get_config_dict() for item in (module, other)]
