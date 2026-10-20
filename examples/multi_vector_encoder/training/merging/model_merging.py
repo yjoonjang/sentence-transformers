@@ -1,4 +1,4 @@
-"""Merge LateOn and LateOn-regularized, including their projection weights.
+"""Merge compatible LateOn and LateOn-regularized models, including their projection weights.
 
 Both models share an architecture, tokenizer, and query/document length settings.
 Evaluate the merged model on your target retrieval tasks.

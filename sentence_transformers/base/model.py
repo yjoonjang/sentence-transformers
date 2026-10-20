@@ -897,7 +897,7 @@ class BaseModel(nn.Sequential, PeftAdapterMixin, ABC):
 
         Returns:
             A new model in evaluation mode. Call ``merged.save_pretrained(path)`` or
-                ``merged.push_to_hub(repo_id)`` to save it.
+            ``merged.push_to_hub(repo_id)`` to save it.
 
         Example::
 

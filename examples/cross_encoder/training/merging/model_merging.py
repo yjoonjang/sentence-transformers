@@ -1,4 +1,4 @@
-"""Merge two CrossEncoder rerankers into one model.
+"""Merge two compatible CrossEncoder rerankers into one model.
 
 Both inputs must share the same architecture (e.g. both
 ``XLMRobertaForSequenceClassification``) and tokenizer, typically the case

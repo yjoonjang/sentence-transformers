@@ -1,4 +1,4 @@
-"""Merge two SparseEncoder (SPLADE-style) models into one.
+"""Merge two compatible SparseEncoder (SPLADE-style) models into one.
 
 Both inputs must share the same architecture and tokenizer, typically the
 case when merging fine-tunes of the same base sparse encoder.

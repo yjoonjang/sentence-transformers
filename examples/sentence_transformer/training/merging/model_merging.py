@@ -1,4 +1,4 @@
-"""Merge compatible fine-tunes with mergekit's public state-dict API.
+"""Merge compatible Sentence Transformers with mergekit's public state-dict API.
 
 The selected method applies to every weight-bearing module. Configuration,
 prompts, and processors come from the first input. All input models and the
